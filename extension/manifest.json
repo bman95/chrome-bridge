@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Bridge",
+  "version": "1.0.0",
+  "description": "Relays raw CDP between your real Chrome profile and a Python script over Native Messaging, via chrome.debugger.",
+  "permissions": ["debugger", "tabs", "storage", "nativeMessaging", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "sw.js" },
+  "options_page": "options.html"
+}

@@ -1,0 +1,23 @@
+[project]
+name = "chrome-bridge"
+version = "0.1.0"
+description = "Drive your real, everyday Chrome from Python scripts via chrome.debugger + Native Messaging"
+requires-python = ">=3.10"
+dependencies = [
+    "typer",
+]
+
+[project.scripts]
+chrome-bridge = "chrome_bridge.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

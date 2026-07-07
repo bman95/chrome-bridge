@@ -1,0 +1,115 @@
+"""Chrome Native Messaging frame codec.
+
+A frame is one JSON object serialised to UTF-8 and prefixed with its byte
+length as a **4-byte little-endian unsigned int** (``struct "<I"``). This is the
+exact wire format Chrome uses on the host's stdin/stdout, and the same format
+``extension/sw.js`` documents in its WIRE PROTOCOL block.
+
+The functions here operate on arbitrary binary streams (``read``/``readinto``
+and ``write``/``flush``) so they work equally against ``sys.stdin.buffer`` /
+``sys.stdout.buffer`` (the extension side) and a socket file object (the client
+side), and can be unit-tested against :class:`io.BytesIO`.
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+from typing import Any, BinaryIO
+
+# 4-byte little-endian unsigned int length prefix.
+_LEN = struct.Struct("<I")
+LENGTH_PREFIX_BYTES = _LEN.size
+
+# Chrome's Native Messaging caps a single *host -> extension* message at 1 MB.
+# This limit is enforced on the WRITE side (encode_frame): a host->extension
+# frame over it is rejected before any byte is written, so the relay can drop it
+# and keep going without ever sending Chrome a frame it would reject (which would
+# desync). See docs/design.md "Top risks #1".
+MAX_MESSAGE_BYTES = 1024 * 1024
+
+# A generous upper bound on the size of a frame we are willing to READ into
+# memory from either pipe (the extension->host direction Chrome allows far above
+# 1 MB; the client socket is local and unbounded). This is a denial-of-service /
+# runaway-allocation guard, NOT the Chrome 1 MB cap: a frame between
+# MAX_MESSAGE_BYTES and MAX_READ_BYTES is read fine and then dropped on write if
+# it is bound for the extension. A length prefix above MAX_READ_BYTES is treated
+# as a stream corruption (we refuse to allocate it) and ends that direction.
+MAX_READ_BYTES = 64 * 1024 * 1024
+
+
+class FrameError(Exception):
+    """A frame could not be read or written (oversize, truncated, or invalid)."""
+
+
+def _read_exactly(stream: BinaryIO, n: int) -> bytes | None:
+    """Read exactly ``n`` bytes, or ``None`` on a clean EOF before any byte.
+
+    A partial read (EOF after some but not all of ``n`` bytes) is a truncated
+    frame and raises :class:`FrameError`; a clean EOF at a frame boundary
+    (0 bytes available) returns ``None`` so callers can stop looping.
+    """
+    chunks: list[bytes] = []
+    remaining = n
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            if not chunks:
+                return None
+            raise FrameError(
+                f"truncated frame: wanted {n} bytes, got {n - remaining}"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def read_frame(stream: BinaryIO) -> dict[str, Any] | None:
+    """Read one frame from ``stream``; return its decoded object, or ``None`` at EOF.
+
+    EOF *between* frames (the peer closed the connection cleanly) returns
+    ``None``. EOF *within* a frame, a length prefix above the read guard, or
+    invalid JSON raises :class:`FrameError`. A frame that is merely above the
+    1 MB Chrome cap is read normally here; it is the *write* side that rejects
+    it for the host->extension direction.
+    """
+    header = _read_exactly(stream, LENGTH_PREFIX_BYTES)
+    if header is None:
+        return None
+    (length,) = _LEN.unpack(header)
+    if length > MAX_READ_BYTES:
+        # We have already consumed the prefix; the stream is now unaligned and
+        # such a size is a runaway/corruption, so surface a hard error.
+        raise FrameError(
+            f"frame length {length} exceeds {MAX_READ_BYTES}-byte read guard"
+        )
+    # _read_exactly returns exactly `length` bytes or raises on a short read;
+    # for length>0 it can only return None at a clean boundary, which here means
+    # the prefix promised a body that never arrived — a truncated frame.
+    body = _read_exactly(stream, length)
+    if body is None:
+        raise FrameError("truncated frame body")
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FrameError(f"invalid frame JSON: {exc}") from exc
+
+
+def encode_frame(obj: Any) -> bytes:
+    """Serialise ``obj`` to a length-prefixed frame; raise if it exceeds the cap.
+
+    The cap is checked *before* anything is written, so an oversize frame never
+    half-emits and desynchronises the stream.
+    """
+    body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    if len(body) > MAX_MESSAGE_BYTES:
+        raise FrameError(
+            f"frame body {len(body)} bytes exceeds {MAX_MESSAGE_BYTES}-byte cap"
+        )
+    return _LEN.pack(len(body)) + body
+
+
+def write_frame(stream: BinaryIO, obj: Any) -> None:
+    """Encode ``obj`` and write it to ``stream`` as a single frame, then flush."""
+    stream.write(encode_frame(obj))
+    stream.flush()

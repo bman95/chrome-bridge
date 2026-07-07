@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Chrome Bridge — Profile Setup</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; max-width: 32rem; margin: 2rem; }
+      label { display: block; margin-bottom: 0.5rem; font-weight: 600; }
+      input { font: inherit; padding: 0.4rem; width: 100%; box-sizing: border-box; }
+      button { font: inherit; padding: 0.4rem 1rem; margin-top: 0.75rem; }
+      p.hint { color: #666; }
+      p.status { font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <h2>Chrome Bridge</h2>
+    <p class="hint">
+      This Chrome profile needs a name so its native host can be told apart
+      from other profiles running the same extension. Use the same name you
+      passed to <code>chrome-bridge init --profile &lt;name&gt;</code>.
+    </p>
+    <label for="profile-name">Profile name</label>
+    <input id="profile-name" type="text" placeholder="e.g. personal" />
+    <button id="save">Save</button>
+    <p class="status" id="status"></p>
+    <script src="options.js"></script>
+  </body>
+</html>

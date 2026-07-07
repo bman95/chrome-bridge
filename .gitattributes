@@ -1,0 +1,4 @@
+# Windows batch files must use CRLF or cmd.exe mis-parses them (a lone-LF
+# `setlocal`/label line can split mid-token). Force CRLF on checkout regardless
+# of the user's core.autocrlf setting.
+*.bat text eol=crlf

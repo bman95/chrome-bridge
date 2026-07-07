@@ -1,0 +1,7 @@
+{
+  "name": "com.chromebridge.bridge.PROFILE_NAME_PLACEHOLDER",
+  "description": "Chrome Bridge Native Messaging host for profile PROFILE_NAME_PLACEHOLDER",
+  "path": "PATH_PLACEHOLDER",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://EXTENSION_ID_PLACEHOLDER/"]
+}
