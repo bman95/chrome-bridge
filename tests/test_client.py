@@ -709,28 +709,67 @@ def test_attached_tab_detach_raises_without_reopen(bridge):
         cdp.close()
 
 
-def test_detach_on_attached_session_sends_close_and_drops_socket(bridge):
+def test_detach_on_attached_session_sends_detach_op(bridge):
     bridge.on("attach", _ok_attach())
     bridge.set_default(_cdp_result({}))
     cdp = _client(bridge)
     cdp.attach()
     cdp.detach()
     ops = [f.get("op") for f in bridge.received]
-    assert "close" in ops
+    assert "detach" in ops
+    assert "close" not in ops
     assert not cdp.is_alive()
 
 
-def test_detach_on_owned_session_skips_close_op(bridge):
-    # detach() must leave a bridge-created tab open: the "close" op would
-    # remove it, so no close op may be sent — only the socket is torn down.
+def test_detach_on_owned_session_sends_detach_never_close(bridge):
+    # detach() must leave even a bridge-created tab open: it sends the
+    # "detach" op (detach + clear the server-side reference, never remove),
+    # NOT the "close" op which would remove a bridge-created tab. Clearing
+    # the reference matters: stale server state would make the next
+    # session's "attach" teardown remove this tab.
     bridge.on("open", _ok_open())
     bridge.set_default(_cdp_result({}))
     cdp = _client(bridge)
     cdp.open("https://x", timeout=0.2)
     cdp.detach()
     ops = [f.get("op") for f in bridge.received]
+    assert "detach" in ops
     assert "close" not in ops
     assert not cdp.is_alive()
+
+
+def test_detach_without_tab_just_drops_socket(bridge):
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    cdp.detach()
+    assert bridge.received == []  # no tab: nothing to send
+    assert not cdp.is_alive()
+
+
+def test_attach_after_open_clears_reattach_url(bridge):
+    # attach() after a prior open() must drop the recorded URL: once the
+    # session rides a user tab, a detach must surface DetachedError, never
+    # silently re-open the stale bridge URL.
+    bridge.on("open", _ok_open())
+    bridge.on("attach", _ok_attach(tab_id=21))
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://x", timeout=0.2)
+        cdp.attach()
+        assert cdp._current_url is None
+        assert cdp._tab_owned is False
+        bridge.send_event({"event": True, "type": "detached", "reason": "gone"})
+        deadline = time.monotonic() + 2
+        while not cdp._detached.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        open_ops_before = sum(1 for f in bridge.received if f.get("op") == "open")
+        with pytest.raises(DetachedError, match="no URL to re-attach"):
+            cdp.banner_present(".x")
+        open_ops_after = sum(1 for f in bridge.received if f.get("op") == "open")
+        assert open_ops_after == open_ops_before  # no silent re-open
+    finally:
+        cdp.close()
 
 
 def test_navigate_after_attach_navigates_in_place(bridge):

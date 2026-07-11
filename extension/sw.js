@@ -17,7 +17,7 @@
 //
 // ---- Python -> extension (requests) ----------------------------------
 // Every request carries a mandatory caller-chosen correlation id `id` (number
-// or string) that is echoed back on exactly one reply. Four ops:
+// or string) that is echoed back on exactly one reply. Five ops:
 //
 //   { "id": <id>, "op": "open",  "url": <string> }
 //       Create a background tab (active:false — no focus steal) at `url`
@@ -42,12 +42,19 @@
 //       Detach the debugger. Remove the tab only if it was bridge-created
 //       ("open"); a tab joined via "attach" is left open for the user.
 //
+//   { "id": <id>, "op": "detach" }
+//       Detach the debugger and clear the tab reference, ALWAYS leaving the
+//       tab open — even a bridge-created one. Idempotent: ok:true when no
+//       tab is attached. Callers that hand a tab to the user (the one-shot
+//       CLI) end with this so no stale attachment/ownership survives into
+//       the next session's "attach" teardown.
+//
 // ---- extension -> Python --------------------------------------------
 // Replies (exactly one per request, correlated by `id`):
 //
 //   { "id": <id>, "ok": true,  "tabId": <number> }   // reply to "open"/"attach"
 //   { "id": <id>, "ok": true,  "result": <object> }  // reply to "cdp"
-//   { "id": <id>, "ok": true }                        // reply to "close"
+//   { "id": <id>, "ok": true }                        // reply to "close"/"detach"
 //   { "id": <id>, "ok": false, "error": <string> }   // any op failed
 //
 // Unsolicited events (no `id`; `event:true` discriminator):
@@ -194,14 +201,27 @@ async function onPythonMessage(msg) {
       dbgTabOwned = true;
       reply(msg.id, { ok: true, tabId: dbgTabId });
     } else if (msg.op === "attach") {
-      // Single-tab invariant, same as "open": tear down any prior bridge tab
-      // (removed only if bridge-created) before attaching to a new one.
-      if (dbgTabId !== null) await closeTab();
+      // Query FIRST so a failed attach ("no active tab") does not destroy the
+      // prior session, and so removing a prior owned tab cannot shift which
+      // tab is active before we read it.
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab || tab.id === undefined) {
+        // NOTE: the CLI's nav fallback matches this exact string
+        // (src/chrome_bridge/cli.py) — keep it stable.
         reply(msg.id, { ok: false, error: "no active tab" });
         return;
       }
+      if (tab.id === dbgTabId) {
+        // Already attached to this very tab (e.g. the user focused a
+        // bridge-created one). Hand it over: it is the user's tab now, so
+        // teardown must never remove it.
+        dbgTabOwned = false;
+        reply(msg.id, { ok: true, tabId: dbgTabId });
+        return;
+      }
+      // Single-tab invariant, same as "open": tear down any prior bridge tab
+      // (removed only if bridge-created) before attaching to the new one.
+      if (dbgTabId !== null) await closeTab();
       // If attach fails (contention, restricted chrome:// page, crash) the
       // outer catch replies ok:false. The tab is the USER's — never remove it.
       await chrome.debugger.attach({ tabId: tab.id }, CDP_PROTOCOL_VERSION);
@@ -221,6 +241,22 @@ async function onPythonMessage(msg) {
       reply(msg.id, { ok: true, result: res });
     } else if (msg.op === "close") {
       await closeTab();
+      reply(msg.id, { ok: true });
+    } else if (msg.op === "detach") {
+      // Release the tab WITHOUT removing it, whatever its ownership. Clearing
+      // the reference here matters as much as the detach itself: stale
+      // dbgTabId/dbgTabOwned state would make the NEXT session's "attach"
+      // teardown remove a tab a prior session promised to leave open.
+      const tabId = dbgTabId;
+      dbgTabId = null;
+      dbgTabOwned = false;
+      if (tabId !== null) {
+        try {
+          await chrome.debugger.detach({ tabId });
+        } catch (e) {
+          /* already detached */
+        }
+      }
       reply(msg.id, { ok: true });
     } else {
       reply(msg.id, { ok: false, error: "unknown op: " + String(msg.op) });

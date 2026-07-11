@@ -162,11 +162,12 @@ def test_nav_attaches_and_navigates_active_tab(fake_bridge):
     ops = [f.get("op") for f in fake_bridge.received]
     methods = [f.get("method") for f in fake_bridge.received if f.get("op") == "cdp"]
     # Attached to the active tab (no fresh bridge tab), navigated it in place,
-    # and detached on exit — "close" on an attached tab leaves it open.
+    # and released it on exit via "detach" — which never removes a tab.
     assert "attach" in ops
     assert "open" not in ops
     assert "Page.navigate" in methods
-    assert "close" in ops
+    assert "detach" in ops
+    assert "close" not in ops
 
 
 def test_nav_opens_fresh_tab_when_no_active_tab_and_leaves_it_open(fake_bridge):
@@ -190,9 +191,27 @@ def test_nav_opens_fresh_tab_when_no_active_tab_and_leaves_it_open(fake_bridge):
     assert result.exit_code == 0, result.output
     ops = [f.get("op") for f in fake_bridge.received]
     assert "open" in ops
-    # The fresh tab must be left open: the "close" op would remove a
-    # bridge-created tab, so nav's exit must not send it.
+    # The fresh tab must be left open: exit goes through "detach" (never
+    # removes a tab, clears the server-side reference), not "close" (which
+    # would remove a bridge-created tab).
+    assert "detach" in ops
     assert "close" not in ops
+
+
+def test_nav_surfaces_non_no_active_tab_attach_errors(fake_bridge):
+    # Only the "no active tab" failure falls back to opening a fresh tab;
+    # any other attach failure (contention, restricted page) must surface.
+    fake_bridge.on(
+        "attach",
+        lambda f: {"ok": False, "error": "Another debugger is already attached"},
+    )
+    fake_bridge.set_default(lambda frame: {"ok": True, "result": {}})
+    result = runner.invoke(
+        cli_mod.app, ["nav", "https://example.com/x", *_hostport(fake_bridge)]
+    )
+    assert result.exit_code != 0
+    ops = [f.get("op") for f in fake_bridge.received]
+    assert "open" not in ops  # no silent fresh tab on a non-empty failure
 
 
 def test_html_prints_active_tab_content_and_detaches(fake_bridge):
@@ -273,53 +292,141 @@ def test_eval_goes_through_public_attached_path(fake_bridge):
     assert "close" in ops
 
 
-def test_nav_then_html_two_command_workflow():
-    # The end-to-end two-command flow: `nav <url>` navigates the active tab and
-    # leaves it open; a following `html` attaches to that same still-open tab
-    # and reads its content. Each CLI invocation dials its own connection, so
-    # each gets its own FakeBridge; the shared `page` dict stands in for the
-    # tab that persists between the two commands.
-    page: dict[str, str | None] = {"url": None}
+class FakeSwState:
+    """Stateful stand-in for sw.js's tab bookkeeping, shared across CLI runs.
 
-    b1 = FakeBridge()
-    b1.start()
-    try:
-        b1.on("attach", _attach_ok())
+    Each CLI invocation dials its own connection (its own FakeBridge), but the
+    real extension's `dbgTabId`/`dbgTabOwned` and the tabs themselves persist
+    between commands. This model implements the WIRE PROTOCOL's op semantics
+    over that persistent state so the tests catch cross-command hazards (e.g.
+    stale ownership making a later "attach" remove a tab an earlier command
+    promised to leave open).
+    """
 
-        def nav_default(frame):
+    def __init__(self, active_url: str | None = None) -> None:
+        self.tabs: dict[int, str] = {}
+        self._next_id = 100
+        self.active: int | None = None
+        self.attached: int | None = None
+        self.owned = False
+        if active_url is not None:
+            self.active = self._create(active_url)
+
+    def _create(self, url: str) -> int:
+        tab_id = self._next_id
+        self._next_id += 1
+        self.tabs[tab_id] = url
+        return tab_id
+
+    def _teardown(self) -> None:
+        # closeTab(): detach, remove only if bridge-created.
+        tab_id, owned = self.attached, self.owned
+        self.attached, self.owned = None, False
+        if tab_id is not None and owned:
+            self.tabs.pop(tab_id, None)
+            if self.active == tab_id:
+                self.active = None
+
+    def handlers_on(self, bridge: FakeBridge) -> None:
+        def on_open(frame):
+            self._teardown()
+            tab_id = self._create(frame["url"])
+            self.attached, self.owned = tab_id, True
+            # A window's sole tab is active; keep the model simple: the
+            # newest tab becomes active when nothing else is.
+            if self.active is None:
+                self.active = tab_id
+            bridge.send_event(
+                {"event": True, "type": "cdp", "method": "Page.loadEventFired", "params": {}}
+            )
+            return {"ok": True, "tabId": tab_id}
+
+        def on_attach(frame):
+            if self.active is None:
+                return {"ok": False, "error": "no active tab"}
+            if self.active == self.attached:
+                self.owned = False
+                return {"ok": True, "tabId": self.attached}
+            self._teardown()
+            self.attached, self.owned = self.active, False
+            return {"ok": True, "tabId": self.attached}
+
+        def on_close(frame):
+            self._teardown()
+            return {"ok": True}
+
+        def on_detach(frame):
+            self.attached, self.owned = None, False
+            return {"ok": True}
+
+        def on_cdp(frame):
+            if self.attached is None:
+                return {"ok": False, "error": "no attached tab"}
             if frame.get("method") == "Page.navigate":
-                page["url"] = frame["params"]["url"]
-                b1.send_event(
+                self.tabs[self.attached] = frame["params"]["url"]
+                bridge.send_event(
                     {"event": True, "type": "cdp", "method": "Page.loadEventFired", "params": {}}
                 )
-            return {"ok": True, "result": {}}
-
-        b1.set_default(nav_default)
-        result = runner.invoke(
-            cli_mod.app, ["nav", "https://example.com/x", *_hostport(b1)]
-        )
-        assert result.exit_code == 0, result.output
-        assert page["url"] == "https://example.com/x"
-    finally:
-        b1.close()
-
-    b2 = FakeBridge()
-    b2.start()
-    try:
-        b2.on("attach", _attach_ok())
-
-        def html_default(frame):
+                return {"ok": True, "result": {"frameId": "f1"}}
             if frame.get("method") == "Runtime.evaluate":
-                value = f"<body>content of {page['url']}</body>"
+                value = f"<body>content of {self.tabs[self.attached]}</body>"
                 return {"ok": True, "result": {"result": {"value": value}}}
             return {"ok": True, "result": {}}
 
-        b2.set_default(html_default)
-        result = runner.invoke(cli_mod.app, ["html", *_hostport(b2)])
-        assert result.exit_code == 0, result.output
-        assert "content of https://example.com/x" in result.output
+        bridge.on("open", on_open)
+        bridge.on("attach", on_attach)
+        bridge.on("close", on_close)
+        bridge.on("detach", on_detach)
+        bridge.set_default(on_cdp)
+
+
+def _run_against_state(state: FakeSwState, args: list[str]):
+    b = FakeBridge()
+    b.start()
+    state.handlers_on(b)
+    try:
+        return runner.invoke(cli_mod.app, [*args, *_hostport(b)])
     finally:
-        b2.close()
+        b.close()
+
+
+def test_nav_then_html_two_command_workflow():
+    # The end-to-end two-command flow: `nav <url>` navigates the user's active
+    # tab and leaves it open; a following `html` attaches to that SAME
+    # still-open tab and reads its content.
+    state = FakeSwState(active_url="about:blank")
+    user_tab = state.active
+
+    result = _run_against_state(state, ["nav", "https://example.com/x"])
+    assert result.exit_code == 0, result.output
+    assert state.tabs.get(user_tab) == "https://example.com/x"  # navigated in place
+    assert state.attached is None  # released on exit
+    assert user_tab in state.tabs  # tab left open
+
+    result = _run_against_state(state, ["html"])
+    assert result.exit_code == 0, result.output
+    assert "content of https://example.com/x" in result.output
+    assert user_tab in state.tabs  # still open after html detached
+
+
+def test_nav_fallback_then_html_leaves_fresh_tab_open():
+    # No active tab at all: nav opens a fresh one, hands it to the user, and
+    # a following html must attach to it WITHOUT the extension's single-tab
+    # teardown removing it (stale bridge-created ownership would do exactly
+    # that if nav's exit failed to clear the server-side reference).
+    state = FakeSwState(active_url=None)
+
+    result = _run_against_state(state, ["nav", "https://example.com/x"])
+    assert result.exit_code == 0, result.output
+    assert len(state.tabs) == 1
+    fresh_tab = next(iter(state.tabs))
+    assert state.tabs[fresh_tab] == "https://example.com/x"
+    assert state.attached is None  # no stale attachment/ownership left behind
+
+    result = _run_against_state(state, ["html"])
+    assert result.exit_code == 0, result.output
+    assert "content of https://example.com/x" in result.output
+    assert fresh_tab in state.tabs  # the fresh tab survived the second command
 
 
 # --------------------------------------------------------------------------- #

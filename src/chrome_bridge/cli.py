@@ -182,6 +182,10 @@ def nav(
         try:
             cdp.attach()
         except BridgeError as exc:
+            # The "no active tab" literal is the stable error extension/sw.js
+            # replies when its active-tab query comes back empty. Any other
+            # attach failure (contention, restricted page) surfaces as-is —
+            # a fresh tab is opened only when there is no tab at all.
             if "no active tab" not in str(exc):
                 raise
             # Nothing to attach to at all: fall back to opening a fresh tab
