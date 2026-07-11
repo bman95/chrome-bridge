@@ -66,6 +66,18 @@ def test_status_rejects_out_of_range_port(port):
     assert "invalid port" in result.output
 
 
+def test_status_rejects_profile_with_legacy_invalid_port(registry_path):
+    # A pre-validation registry can hold an out-of-range port; resolving it
+    # must reject cleanly instead of crashing in socket.connect.
+    registry_path.write_text(
+        json.dumps({"profiles": {"personal": {"port": 70000}}}), encoding="utf-8"
+    )
+    result = runner.invoke(cli_mod.app, ["status", "--profile", "personal"])
+    assert result.exit_code == 2
+    assert "invalid port" in result.output
+    assert "--port" in result.output  # actionable remediation hint
+
+
 def test_status_unreachable_port_exits_nonzero():
     # Bind + free a port so nothing is listening.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -204,6 +216,40 @@ def test_init_rerun_rejects_legacy_out_of_range_port(registry_path, mocked_insta
     assert "--port" in result.output  # actionable remediation hint
     assert not list(tmp_path.glob("*.bat"))
     assert not mocked_install
+
+
+def test_init_rerun_rejects_legacy_string_port(registry_path, mocked_install, monkeypatch, tmp_path):
+    """A non-int port in a hand-edited/legacy registry must reject cleanly,
+    not crash with a TypeError inside validate_port."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    registry_path.write_text(
+        json.dumps({"profiles": {"personal": {"port": "8765"}}}), encoding="utf-8"
+    )
+    result = runner.invoke(cli_mod.app, ["init", "--profile", "personal"])
+    assert result.exit_code == 1
+    assert "invalid port" in result.output
+    assert "--port" in result.output
+    assert not list(tmp_path.glob("*.bat"))
+    assert not mocked_install
+
+
+def test_init_rerun_overwrite_keeps_stored_port(registry_path, mocked_install, monkeypatch, tmp_path):
+    """The overwrite-accept re-run path: validation now runs before the
+    confirm, and the stored port is kept when --port is absent."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    profiles_mod.add_profile("personal", 8770, path=registry_path)
+    result = runner.invoke(
+        cli_mod.app,
+        ["init", "--profile", "personal"],
+        input="y\nDefault\nabc123extensionid\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "Using port 8770" in result.output
+    cfg = profiles_mod.get_profile("personal", path=registry_path)
+    assert cfg.port == 8770
+    assert cfg.extension_id == "abc123extensionid"
+    assert "personal" in mocked_install
+    assert (tmp_path / "run_nmh_personal.bat").exists()
 
 
 def test_init_rerun_rejects_legacy_duplicate_port(registry_path, mocked_install, monkeypatch, tmp_path):

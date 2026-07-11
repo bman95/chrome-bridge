@@ -131,6 +131,12 @@ def test_validate_port_rejects_out_of_range(port):
         profiles.validate_port(port)
 
 
+@pytest.mark.parametrize("port", ["8765", None, 8765.5, True])
+def test_validate_port_rejects_non_int(port):
+    with pytest.raises(profiles.ProfileError, match="invalid port"):
+        profiles.validate_port(port)
+
+
 @pytest.mark.parametrize("port", [1, 8765, 65535])
 def test_validate_port_accepts_valid(port):
     profiles.validate_port(port)  # must not raise

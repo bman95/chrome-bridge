@@ -152,8 +152,9 @@ def init(
         # Registry changed while init was waiting on the prompts above.
         typer.echo(str(exc), err=True)
         typer.echo(
-            "the registry changed while init was running; the launcher and "
-            "manifest were written but the profile was not saved — re-run init.",
+            "the registry changed while init was running; the launcher, manifest, "
+            "and native-host registration were already written, but the profile "
+            "was not saved — re-run init.",
             err=True,
         )
         raise typer.Exit(code=1) from exc
@@ -173,7 +174,18 @@ def _resolve_host_port(profile: Optional[str], host: Optional[str], port: Option
                 raise typer.Exit(code=2) from exc
         return host or "127.0.0.1", port if port is not None else profiles_mod.DEFAULT_BASE_PORT
     if profile is not None:
-        return "127.0.0.1", profiles_mod.resolve_port(profile)
+        resolved = profiles_mod.resolve_port(profile)
+        try:
+            profiles_mod.validate_port(resolved)
+        except profiles_mod.ProfileError as exc:
+            typer.echo(str(exc), err=True)
+            typer.echo(
+                f"profile {profile!r} has an invalid registered port; re-run "
+                f"`chrome-bridge init --profile {profile} --port <n>` to fix it.",
+                err=True,
+            )
+            raise typer.Exit(code=2) from exc
+        return "127.0.0.1", resolved
     typer.echo("Pass --profile <name> (or --host/--port for advanced use).", err=True)
     raise typer.Exit(code=2)
 

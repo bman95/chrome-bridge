@@ -55,8 +55,12 @@ def validate_profile_name(name: str) -> None:
 
 
 def validate_port(port: int) -> None:
-    if not 1 <= port <= MAX_PORT:
-        raise ProfileError(f"invalid port {port}: must be between 1 and {MAX_PORT}")
+    # isinstance guard: a legacy/hand-edited registry can hold a non-int port
+    # (e.g. "8765"), which must reject cleanly, not raise TypeError on `<=`.
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= MAX_PORT:
+        raise ProfileError(
+            f"invalid port {port!r}: must be an integer between 1 and {MAX_PORT}"
+        )
 
 
 def default_registry_path() -> Path:
