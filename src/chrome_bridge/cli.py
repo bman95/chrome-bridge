@@ -90,10 +90,7 @@ def init(
             )
         raise typer.Exit(code=1) from exc
 
-    conflict = next(
-        (n for n, cfg in registered.items() if n != profile and cfg.port == chosen_port),
-        None,
-    )
+    conflict = profiles_mod.find_port_conflict(profile, chosen_port, registered)
     if conflict is not None:
         typer.echo(
             f"port {chosen_port} is already used by profile {conflict!r}; "

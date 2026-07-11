@@ -63,6 +63,35 @@ def validate_port(port: int) -> None:
         )
 
 
+def _coerce_port(value: object) -> int | None:
+    """Best-effort int view of a stored registry port, for comparisons.
+
+    Legacy/hand-edited registries can hold non-int ports (e.g. ``"8765"``);
+    comparing those raw would silently defeat duplicate detection and gap
+    allocation. Returns None when the value has no integer interpretation.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 10)
+        except ValueError:
+            return None
+    return None
+
+
+def find_port_conflict(
+    name: str, port: int, profiles_by_name: dict[str, ProfileConfig]
+) -> str | None:
+    """Name of a profile other than ``name`` already holding ``port``, if any."""
+    for other_name, other in profiles_by_name.items():
+        if other_name != name and _coerce_port(other.port) == port:
+            return other_name
+    return None
+
+
 def default_registry_path() -> Path:
     return Path.home() / ".config" / "chrome-bridge" / "profiles.json"
 
@@ -114,7 +143,11 @@ def resolve_port(name: str, path: Path | None = None) -> int:
 def allocate_port(path: Path | None = None, *, base: int = DEFAULT_BASE_PORT) -> int:
     """Pick the lowest port >= ``base`` not used by any registered profile."""
     validate_port(base)
-    used = {cfg.port for cfg in list_profiles(path).values()}
+    used = {
+        coerced
+        for cfg in list_profiles(path).values()
+        if (coerced := _coerce_port(cfg.port)) is not None
+    }
     port = base
     while port in used:
         port += 1
@@ -137,9 +170,9 @@ def add_profile(
     validate_profile_name(name)
     validate_port(port)
     registry = load_registry(path)
-    for other_name, other in registry.profiles.items():
-        if other_name != name and other.port == port:
-            raise ProfileError(f"port {port} is already used by profile {other_name!r}")
+    conflict = find_port_conflict(name, port, registry.profiles)
+    if conflict is not None:
+        raise ProfileError(f"port {port} is already used by profile {conflict!r}")
     cfg = ProfileConfig(
         name=name,
         port=port,

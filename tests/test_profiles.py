@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from chrome_bridge import profiles
@@ -87,6 +89,23 @@ def test_allocate_port_raises_when_range_exhausted(registry_path):
 def test_allocate_port_rejects_out_of_range_base(registry_path):
     with pytest.raises(profiles.ProfileError, match="invalid port"):
         profiles.allocate_port(registry_path, base=0)
+
+
+def test_allocate_port_treats_legacy_string_port_as_used(registry_path):
+    """A legacy/hand-edited registry can hold string ports; the allocator must
+    not reissue them to a second profile."""
+    registry_path.write_text(
+        json.dumps({"profiles": {"legacy": {"port": "8765"}}}), encoding="utf-8"
+    )
+    assert profiles.allocate_port(registry_path) == 8766
+
+
+def test_add_profile_rejects_port_stored_as_legacy_string(registry_path):
+    registry_path.write_text(
+        json.dumps({"profiles": {"legacy": {"port": "8765"}}}), encoding="utf-8"
+    )
+    with pytest.raises(profiles.ProfileError, match="already used"):
+        profiles.add_profile("new", 8765, path=registry_path)
 
 
 def test_add_profile_overwrites_existing_entry(registry_path):
