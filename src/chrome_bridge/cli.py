@@ -174,11 +174,24 @@ def nav(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: navigate the profile's tab to URL."""
+    """One-shot: navigate the active tab to URL, leaving the tab open."""
     h, p = _resolve_host_port(profile, host, port)
-    with ChromeBridge(host=h, port=p) as cdp:
-        cdp.navigate(url)
+    cdp = ChromeBridge(host=h, port=p)
+    cdp.connect()
+    try:
+        try:
+            cdp.attach()
+        except BridgeError as exc:
+            if "no active tab" not in str(exc):
+                raise
+            # Nothing to attach to at all: fall back to opening a fresh tab
+            # (open() itself navigates); detach() below still leaves it open.
+            cdp.open(url)
+        else:
+            cdp.navigate(url)
         typer.echo(f"navigated to {url}")
+    finally:
+        cdp.detach()  # leave the tab open on exit
 
 
 @app.command()
@@ -188,9 +201,10 @@ def html(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: print the outerHTML of the first element matching SELECTOR."""
+    """One-shot: print the active tab's outerHTML of the first SELECTOR match."""
     h, p = _resolve_host_port(profile, host, port)
     with ChromeBridge(host=h, port=p) as cdp:
+        cdp.attach()  # act on the active tab; exit detaches without closing it
         typer.echo(cdp.outer_html(selector))
 
 
@@ -201,9 +215,10 @@ def click(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: click the first element matching SELECTOR."""
+    """One-shot: click the first SELECTOR match in the active tab."""
     h, p = _resolve_host_port(profile, host, port)
     with ChromeBridge(host=h, port=p) as cdp:
+        cdp.attach()  # act on the active tab; exit detaches without closing it
         cdp.click_selector(selector)
         typer.echo(f"clicked {selector}")
 
@@ -216,9 +231,10 @@ def fill(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: fill SELECTOR's value with TEXT."""
+    """One-shot: fill SELECTOR's value with TEXT in the active tab."""
     h, p = _resolve_host_port(profile, host, port)
     with ChromeBridge(host=h, port=p) as cdp:
+        cdp.attach()  # act on the active tab; exit detaches without closing it
         ok = cdp.fill(selector, text)
         typer.echo("filled" if ok else "no matching element")
         if not ok:
@@ -232,11 +248,11 @@ def eval_(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: evaluate a JS EXPRESSION in the page and print the result."""
+    """One-shot: evaluate a JS EXPRESSION in the active tab and print the result."""
     h, p = _resolve_host_port(profile, host, port)
     with ChromeBridge(host=h, port=p) as cdp:
-        value = cdp._evaluate(expression)
-        typer.echo(value)
+        cdp.attach()  # act on the active tab; exit detaches without closing it
+        typer.echo(cdp.evaluate(expression))
 
 
 if __name__ == "__main__":
