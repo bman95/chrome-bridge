@@ -98,6 +98,13 @@ let port = null;
 // onDisconnect used to null the healthy connection's global `port`.
 let connectPromise = null;
 let dbgTabId = null;
+// Host name of the identity that opened the current tab (set alongside
+// dbgTabId on a successful "open"; meaningful only while dbgTabId !== null).
+// Lets the profile-rename path detect a tab that predates the rename even
+// when the live port already matches the new identity — a reconnect alarm can
+// dial the new name in the gap between the storage write committing and the
+// onChanged handler running, while the old identity's tab is still held.
+let dbgTabOwner = null;
 
 async function nativeHostName() {
   const { bridgeProfileName } = await chrome.storage.local.get("bridgeProfileName");
@@ -236,6 +243,7 @@ async function onPythonMessage(msg, fromPort) {
         return;
       }
       dbgTabId = tab.id;
+      dbgTabOwner = fromPort.bridgeHostName;
       reply(msg.id, { ok: true, tabId: dbgTabId });
     } else if (msg.op === "cdp") {
       if (dbgTabId === null) {
@@ -349,8 +357,14 @@ async function reconnectWithNewIdentity() {
     // Name was cleared: tear down below; connect() will warn and stand down.
   }
   if (port) {
-    // Identity already matches: keep the healthy session (tab included).
-    if (wanted !== null && port.bridgeHostName === wanted) return;
+    // Identity already matches: keep the healthy connection. But the held tab
+    // may still predate the rename (port dropped, tab kept for same-identity
+    // resume, then a reconnect-alarm dial landed the NEW name before this
+    // handler ran) — only a tab opened under the wanted identity may survive.
+    if (wanted !== null && port.bridgeHostName === wanted) {
+      if (dbgTabId !== null && dbgTabOwner !== wanted) await closeTab();
+      return;
+    }
     // Deliberate replacement: disconnect() does not fire our own onDisconnect
     // listener, and even if the host's exit raced us here, that listener only
     // acts when the global still points at its port.
