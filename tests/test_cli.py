@@ -203,6 +203,23 @@ def test_init_rejects_port_used_by_other_profile(registry_path, mocked_install, 
     assert not mocked_install
 
 
+def test_init_rejects_port_matching_legacy_string_port(registry_path, mocked_install, monkeypatch, tmp_path):
+    """A profile whose port was stored as a legacy string ("8765") still owns
+    that port: `init --port 8765` on another profile must be rejected as a
+    conflict. A raw ``cfg.port == chosen_port`` check would miss it (str != int),
+    so this guards init's use of ``find_port_conflict``."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    registry_path.write_text(
+        json.dumps({"profiles": {"other": {"port": "8765"}}}), encoding="utf-8"
+    )
+    result = runner.invoke(cli_mod.app, ["init", "--profile", "personal", "--port", "8765"])
+    assert result.exit_code == 1
+    assert "already used by profile 'other'" in result.output
+    assert set(profiles_mod.list_profiles(registry_path)) == {"other"}
+    assert not list(tmp_path.glob("*.bat"))
+    assert not mocked_install
+
+
 def test_init_rerun_rejects_legacy_out_of_range_port(registry_path, mocked_install, monkeypatch, tmp_path):
     """A pre-validation registry can hold an invalid port; re-running init on
     that profile without --port must fail cleanly before any prompt or write."""
