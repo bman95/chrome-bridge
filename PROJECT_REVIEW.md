@@ -2,6 +2,8 @@
 
 Reviewed on 2026-07-11.
 
+Reviewer model: OpenAI Codex (GPT-5).
+
 ## Findings
 
 ### 1. High: `status` disrupts the bridge it checks
