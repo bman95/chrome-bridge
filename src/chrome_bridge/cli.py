@@ -37,11 +37,37 @@ def profiles_list() -> None:
 
 @profiles_app.command("rm")
 def profiles_rm(name: str) -> None:
-    """Remove a profile's registry entry (does not touch Chrome or the registry key)."""
-    if profiles_mod.remove_profile(name):
+    """Remove a profile: its registry entry, its generated launcher/manifest
+    files, and (on Windows) its native-messaging host registry key.
+
+    Reports exactly what was removed and what was already absent. Exits non-zero
+    only when no registry entry existed for the name.
+    """
+    removed_entry = profiles_mod.remove_profile(name)
+    if removed_entry:
         typer.echo(f"Removed profile {name!r} from the registry.")
     else:
-        typer.echo(f"No profile named {name!r}.")
+        typer.echo(f"No profile named {name!r} in the registry.")
+
+    # Native-host registry key: Windows only; gracefully skipped elsewhere.
+    if sys.platform == "win32":
+        install_mod.unregister_native_host(name)
+        typer.echo(f"Unregistered native-host key for {name!r} (removed if present).")
+    else:
+        typer.echo("Skipped native-host registry key (Windows-only).")
+
+    # Generated launcher + manifest files.
+    for path in (
+        install_mod.launcher_path(_PROJECT_ROOT, name),
+        install_mod.manifest_path(_PROJECT_ROOT, name),
+    ):
+        if path.exists():
+            path.unlink()
+            typer.echo(f"Deleted {path.name}.")
+        else:
+            typer.echo(f"No {path.name} to delete.")
+
+    if not removed_entry:
         raise typer.Exit(code=1)
 
 
@@ -141,7 +167,6 @@ def init(
         profiles_mod.add_profile(
             profile,
             chosen_port,
-            chrome_user_data_dir=None,
             chrome_profile_directory=chrome_profile_dir,
             extension_id=extension_id,
         )
@@ -163,13 +188,19 @@ def init(
 
 def _resolve_host_port(profile: Optional[str], host: Optional[str], port: Optional[int]) -> tuple[str, int]:
     if host is not None or port is not None:
-        if port is not None:
-            try:
-                profiles_mod.validate_port(port)
-            except profiles_mod.ProfileError as exc:
-                typer.echo(str(exc), err=True)
-                raise typer.Exit(code=2) from exc
-        return host or "127.0.0.1", port if port is not None else profiles_mod.DEFAULT_BASE_PORT
+        if port is None:
+            typer.echo(
+                "--host requires --port; there is no default port for an "
+                "explicit host. Pass --port <n>, or use --profile <name>.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        try:
+            profiles_mod.validate_port(port)
+        except profiles_mod.ProfileError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=2) from exc
+        return host or "127.0.0.1", port
     if profile is not None:
         resolved = profiles_mod.resolve_port(profile)
         try:
