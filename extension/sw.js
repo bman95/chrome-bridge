@@ -45,9 +45,12 @@
 //   { "id": <id>, "op": "detach" }
 //       Detach the debugger and clear the tab reference, ALWAYS leaving the
 //       tab open — even a bridge-created one. Idempotent: ok:true when no
-//       tab is attached. Callers that hand a tab to the user (the one-shot
-//       CLI) end with this so no stale attachment/ownership survives into
-//       the next session's "attach" teardown.
+//       tab is attached. The one-shot `nav` ends with this because its
+//       no-active-tab fallback creates a bridge-owned tab that "close" would
+//       remove: ending with "detach" leaves it open and clears the reference
+//       so no stale attachment/ownership survives into the next session's
+//       "attach" teardown. (Read one-shots that only ever "attach" an unowned
+//       tab end with "close", which is equivalent for a tab it doesn't own.)
 //
 // ---- extension -> Python --------------------------------------------
 // Replies (exactly one per request, correlated by `id`):

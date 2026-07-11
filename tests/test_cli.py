@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from chrome_bridge import cli as cli_mod
 from chrome_bridge import profiles as profiles_mod
+from chrome_bridge.bridge.client import BridgeError
 
 from test_client import FakeBridge
 
@@ -290,6 +291,23 @@ def test_eval_goes_through_public_attached_path(fake_bridge):
     # Attach FIRST — eval must no longer bypass the attached path.
     assert ops[0] == "attach"
     assert "close" in ops
+
+
+def test_read_one_shot_reports_attach_failure_cleanly(fake_bridge):
+    # A read one-shot's attach can fail in ordinary situations (restricted
+    # chrome:// page, DevTools contention). It must exit nonzero with a clean
+    # message, NOT dump a raw BridgeError traceback like an uncaught exception.
+    fake_bridge.on(
+        "attach",
+        lambda f: {"ok": False, "error": "Cannot attach to this target"},
+    )
+    fake_bridge.set_default(lambda frame: {"ok": True, "result": {}})
+    result = runner.invoke(cli_mod.app, ["html", *_hostport(fake_bridge)])
+    assert result.exit_code == 1
+    # Handled cleanly: the exit came from typer.Exit (SystemExit), not an
+    # uncaught BridgeError bubbling out as a traceback.
+    assert not isinstance(result.exception, BridgeError)
+    assert "bridge error" in result.output
 
 
 class FakeSwState:
