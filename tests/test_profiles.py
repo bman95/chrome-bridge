@@ -84,6 +84,11 @@ def test_allocate_port_raises_when_range_exhausted(registry_path):
         profiles.allocate_port(registry_path, base=profiles.MAX_PORT)
 
 
+def test_allocate_port_rejects_out_of_range_base(registry_path):
+    with pytest.raises(profiles.ProfileError, match="invalid port"):
+        profiles.allocate_port(registry_path, base=0)
+
+
 def test_add_profile_overwrites_existing_entry(registry_path):
     profiles.add_profile("personal", 8765, path=registry_path)
     profiles.add_profile("personal", 9999, path=registry_path)

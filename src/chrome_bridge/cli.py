@@ -63,27 +63,45 @@ def init(
 
     try:
         profiles_mod.validate_profile_name(profile)
-        if port is not None:
-            profiles_mod.validate_port(port)
     except profiles_mod.ProfileError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
 
     registered = profiles_mod.list_profiles()
-    if port is not None:
-        conflict = next(
-            (n for n, cfg in registered.items() if n != profile and cfg.port == port),
-            None,
-        )
-        if conflict is not None:
+    existing = registered.get(profile)
+
+    # Validate the port that will actually be used — whether it came from
+    # --port, a (possibly legacy, pre-validation) registry entry, or the
+    # allocator — before any prompt or write.
+    try:
+        if port is not None:
+            chosen_port = port
+        elif existing is not None:
+            chosen_port = existing.port
+        else:
+            chosen_port = profiles_mod.allocate_port()
+        profiles_mod.validate_port(chosen_port)
+    except profiles_mod.ProfileError as exc:
+        typer.echo(str(exc), err=True)
+        if port is None and existing is not None:
             typer.echo(
-                f"port {port} is already used by profile {conflict!r}; "
-                "pick another port or remove that profile first.",
+                f"re-run with --port <n> to assign {profile!r} a valid port.",
                 err=True,
             )
-            raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
 
-    existing = registered.get(profile)
+    conflict = next(
+        (n for n, cfg in registered.items() if n != profile and cfg.port == chosen_port),
+        None,
+    )
+    if conflict is not None:
+        typer.echo(
+            f"port {chosen_port} is already used by profile {conflict!r}; "
+            "pick another port or remove that profile first.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     if existing is not None:
         overwrite = typer.confirm(
             f"Profile {profile!r} is already registered (port {existing.port}). Overwrite?"
@@ -91,7 +109,6 @@ def init(
         if not overwrite:
             raise typer.Exit(code=0)
 
-    chosen_port = port or (existing.port if existing else profiles_mod.allocate_port())
     typer.echo(f"Using port {chosen_port} for profile {profile!r}.")
 
     chrome_profile_dir = typer.prompt(
@@ -123,13 +140,23 @@ def init(
     install_mod.patch_allowed_origins(manifest, extension_id)
     typer.echo(f"Patched allowed_origins in {manifest}.")
 
-    profiles_mod.add_profile(
-        profile,
-        chosen_port,
-        chrome_user_data_dir=None,
-        chrome_profile_directory=chrome_profile_dir,
-        extension_id=extension_id,
-    )
+    try:
+        profiles_mod.add_profile(
+            profile,
+            chosen_port,
+            chrome_user_data_dir=None,
+            chrome_profile_directory=chrome_profile_dir,
+            extension_id=extension_id,
+        )
+    except profiles_mod.ProfileError as exc:
+        # Registry changed while init was waiting on the prompts above.
+        typer.echo(str(exc), err=True)
+        typer.echo(
+            "the registry changed while init was running; the launcher and "
+            "manifest were written but the profile was not saved — re-run init.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
     typer.echo(f"Saved profile {profile!r} to the registry.")
     typer.echo("")
     typer.echo("Reload the extension in chrome://extensions, then verify with:")
@@ -138,7 +165,13 @@ def init(
 
 def _resolve_host_port(profile: Optional[str], host: Optional[str], port: Optional[int]) -> tuple[str, int]:
     if host is not None or port is not None:
-        return host or "127.0.0.1", port or profiles_mod.DEFAULT_BASE_PORT
+        if port is not None:
+            try:
+                profiles_mod.validate_port(port)
+            except profiles_mod.ProfileError as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(code=2) from exc
+        return host or "127.0.0.1", port if port is not None else profiles_mod.DEFAULT_BASE_PORT
     if profile is not None:
         return "127.0.0.1", profiles_mod.resolve_port(profile)
     typer.echo("Pass --profile <name> (or --host/--port for advanced use).", err=True)

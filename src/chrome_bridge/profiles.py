@@ -109,6 +109,7 @@ def resolve_port(name: str, path: Path | None = None) -> int:
 
 def allocate_port(path: Path | None = None, *, base: int = DEFAULT_BASE_PORT) -> int:
     """Pick the lowest port >= ``base`` not used by any registered profile."""
+    validate_port(base)
     used = {cfg.port for cfg in list_profiles(path).values()}
     port = base
     while port in used:

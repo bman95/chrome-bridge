@@ -7,6 +7,7 @@ path injected through monkeypatched defaults.
 
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import threading
@@ -56,6 +57,13 @@ def test_profiles_rm_missing_exits_nonzero(registry_path):
 def test_status_requires_profile_or_host_port():
     result = runner.invoke(cli_mod.app, ["status"])
     assert result.exit_code == 2
+
+
+@pytest.mark.parametrize("port", ["0", "65536"])
+def test_status_rejects_out_of_range_port(port):
+    result = runner.invoke(cli_mod.app, ["status", "--port", port])
+    assert result.exit_code == 2
+    assert "invalid port" in result.output
 
 
 def test_status_unreachable_port_exits_nonzero():
@@ -164,10 +172,12 @@ def test_init_rejects_out_of_range_port(registry_path, mocked_install, monkeypat
     monkeypatch.setattr(sys, "platform", "win32")
     result = runner.invoke(cli_mod.app, ["init", "--profile", "personal", "--port", port])
     assert result.exit_code == 1
+    assert "invalid port" in result.output
     # Rejected before writing any launcher, manifest, or registry entry.
     assert not registry_path.exists()
     assert not list(tmp_path.glob("*.bat"))
     assert not list(tmp_path.glob("nmh-manifest.*"))
+    assert not mocked_install
 
 
 def test_init_rejects_port_used_by_other_profile(registry_path, mocked_install, monkeypatch, tmp_path):
@@ -175,8 +185,38 @@ def test_init_rejects_port_used_by_other_profile(registry_path, mocked_install, 
     profiles_mod.add_profile("other", 8765, path=registry_path)
     result = runner.invoke(cli_mod.app, ["init", "--profile", "personal", "--port", "8765"])
     assert result.exit_code == 1
+    assert "already used by profile 'other'" in result.output
     assert set(profiles_mod.list_profiles(registry_path)) == {"other"}
     assert not list(tmp_path.glob("*.bat"))
+    assert not mocked_install
+
+
+def test_init_rerun_rejects_legacy_out_of_range_port(registry_path, mocked_install, monkeypatch, tmp_path):
+    """A pre-validation registry can hold an invalid port; re-running init on
+    that profile without --port must fail cleanly before any prompt or write."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    registry_path.write_text(
+        json.dumps({"profiles": {"personal": {"port": 70000}}}), encoding="utf-8"
+    )
+    result = runner.invoke(cli_mod.app, ["init", "--profile", "personal"])
+    assert result.exit_code == 1
+    assert "invalid port 70000" in result.output
+    assert "--port" in result.output  # actionable remediation hint
+    assert not list(tmp_path.glob("*.bat"))
+    assert not mocked_install
+
+
+def test_init_rerun_rejects_legacy_duplicate_port(registry_path, mocked_install, monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "platform", "win32")
+    registry_path.write_text(
+        json.dumps({"profiles": {"a": {"port": 8765}, "b": {"port": 8765}}}),
+        encoding="utf-8",
+    )
+    result = runner.invoke(cli_mod.app, ["init", "--profile", "a"])
+    assert result.exit_code == 1
+    assert "already used by profile 'b'" in result.output
+    assert not list(tmp_path.glob("*.bat"))
+    assert not mocked_install
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="init only automates Windows")
