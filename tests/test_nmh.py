@@ -221,6 +221,99 @@ def test_serve_session_drops_oversize_client_frame_and_keeps_relaying():
         s.close()
 
 
+def test_serve_session_sanitises_surrogate_frame_and_keeps_relaying():
+    # A frame carrying an unpaired-surrogate escape is valid JSON (WTF-16 page
+    # text is a legitimate source), but its decoded str cannot round-trip
+    # through UTF-8. Re-encoding must sanitise to U+FFFD and keep the session
+    # alive — a bare UnicodeEncodeError (a ValueError) in the pump would be
+    # mistaken for a closed destination and tear the whole session down.
+    ext_peer, ext_host = _make_socketpair()
+    client_peer, client_host = _make_socketpair()
+
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    client_in = client_host.makefile("rb")
+    client_out = client_host.makefile("wb")
+    ext_peer_r = ext_peer.makefile("rb")
+    client_peer_w = client_peer.makefile("wb")
+
+    relayed: list[dict] = []
+
+    def extension_behaviour():
+        relayed.append(read_frame(ext_peer_r))
+        relayed.append(read_frame(ext_peer_r))
+        ext_peer.shutdown(socket.SHUT_WR)
+
+    def client_behaviour():
+        # Raw bytes so the surrogate escape reaches the relay unmodified.
+        body = b'{"id":1,"text":"a\\ud800b"}'
+        client_peer.sendall(struct.pack("<I", len(body)) + body)
+        write_frame(client_peer_w, {"id": 2, "ok": True})
+
+    te = threading.Thread(target=extension_behaviour, daemon=True)
+    tc = threading.Thread(target=client_behaviour, daemon=True)
+    tc.start()
+    te.start()
+
+    nmh._serve_session(ext_in, ext_out, client_in, client_out, client_host)
+    te.join(timeout=5.0)
+    tc.join(timeout=5.0)
+
+    assert relayed == [{"id": 1, "text": "a�b"}, {"id": 2, "ok": True}]
+
+    for s in (ext_host, client_host, client_peer):
+        s.close()
+
+
+def test_serve_session_relays_large_extension_reply_to_client():
+    # Chrome's 1 MB cap is host->extension only: a reply over 1 MB read from the
+    # extension (e.g. outer_html of a heavy page) must relay INTACT to the
+    # client instead of being silently dropped (which used to surface as a
+    # confusing 20 s BridgeTimeoutError).
+    ext_peer, ext_host = _make_socketpair()
+    client_peer, client_host = _make_socketpair()
+
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    client_in = client_host.makefile("rb")
+    client_out = client_host.makefile("wb")
+    ext_peer_w = ext_peer.makefile("wb")
+    client_peer_r = client_peer.makefile("rb")
+
+    # Non-ASCII payload on purpose: the relay re-encodes (read_frame ->
+    # write_frame), and an ensure_ascii serialisation would inflate this ~3x,
+    # so the test also guards against re-encode amplification.
+    big_reply = {
+        "id": 1,
+        "ok": True,
+        "result": "é" * (MAX_MESSAGE_BYTES // 2) + "x" * 100,  # body > 1 MB
+    }
+    received: list[dict] = []
+
+    def extension_behaviour():
+        # The extension->host direction has no 1 MB cap, so the peer writes the
+        # oversize reply uncapped, then closes to end the session.
+        write_frame(ext_peer_w, big_reply, max_bytes=None)
+        ext_peer.shutdown(socket.SHUT_WR)
+
+    def client_behaviour():
+        received.append(read_frame(client_peer_r))
+
+    te = threading.Thread(target=extension_behaviour, daemon=True)
+    tc = threading.Thread(target=client_behaviour, daemon=True)
+    tc.start()
+    te.start()
+
+    nmh._serve_session(ext_in, ext_out, client_in, client_out, client_host)
+    te.join(timeout=5.0)
+    tc.join(timeout=5.0)
+
+    assert received == [big_reply]
+
+    for s in (ext_host, client_host, client_peer):
+        s.close()
+
+
 def test_accept_client_binds_loopback_and_accepts():
     # Bind on an ephemeral port to avoid colliding with a real bridge.
     host, port = "127.0.0.1", _free_port()

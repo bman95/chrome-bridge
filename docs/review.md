@@ -18,6 +18,8 @@ security posture worth tightening before using it for anything logged-in.
 
 ### 1. The 1 MB cap is enforced on the wrong direction, and the design doc misdiagnoses the risk
 
+> **Resolved** in PR #10 (issue #1): the cap is now per-direction, and the docs were corrected. The description below is kept as the point-in-time finding.
+
 Chrome's Native Messaging limits are asymmetric: messages *from* the host to the
 extension are capped at 1 MB, but messages *to* the host are allowed up to 4 GB.
 A large `outer_html` reply flows extension → host → client, which never crosses

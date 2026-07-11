@@ -82,7 +82,7 @@ your REAL everyday Chrome (running normally, one profile per script target)
 |---|---|
 | Navigate | `Page.enable` → `Page.navigate {url}` → await `Page.loadEventFired` |
 | Wait for a selector | poll `Runtime.evaluate {expression:"document.querySelector(...)!==null"}` |
-| Read HTML | `Runtime.evaluate` reading a container subtree's `outerHTML` (see 1 MB risk below) |
+| Read HTML | `Runtime.evaluate` reading a container subtree's `outerHTML` (replies flow extension→host→client under the relay's 64 MB read guard — see risk #1 below) |
 | Click | element center via `getBoundingClientRect`, then real `Input.dispatchMouseEvent` (mousePressed/mouseReleased) — never synthetic `el.click()` |
 | Fill | set `.value` + dispatch `input`/`change` events |
 | Detect an element | `Runtime.evaluate {expression:"!!document.querySelector(...)"}` |
@@ -110,10 +110,18 @@ already carry.
 
 ## Top risks
 
-1. **Native-messaging 1 MB host→extension cap vs. a large page's `outerHTML`.**
-   `ChromeBridge.outer_html()` defaults to `body`, but you should pass a
-   narrower, site-specific container selector on heavy pages to stay under
-   the cap. Handle chunking/narrowing from day one in your own scripts.
+1. **Native-messaging caps a single host→extension message at 1 MB — that
+   direction only.** The cap applies to the command frames the host relays
+   *to* the extension (which are small), not to extension replies:
+   extension→host messages are allowed far above 1 MB by Chrome, and a large
+   reply (e.g. `outer_html` of a heavy page) relays intact to the client,
+   bounded only by the relay's 64 MB read guard. A client→extension frame
+   over the cap is dropped by the relay without desyncing the stream (Chrome
+   would kill the host on an oversize frame), surfacing as a per-op timeout;
+   the bundled `ChromeBridge` client rejects such a frame at send time instead
+   (fail-fast `BridgeError`), so the relay drop only covers raw clients. Keep
+   command payloads (e.g. large `fill` values or injected scripts) under
+   1 MB.
 2. **MV3 service-worker eviction mid-job** (workers die ~30s idle).
    Mitigated by a `chrome.alarms` keepalive + `ChromeBridge.reconnect()`
    rebuilding the dead loopback connection and re-attaching idempotently
