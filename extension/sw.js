@@ -192,8 +192,9 @@ async function onPythonMessage(msg, fromPort) {
   // Staleness gate: ops carry side effects on shared session state (dbgTabId,
   // tabs, the debugger attachment), not just replies. A request from a port
   // that has been replaced (profile rename) or dropped must not touch the
-  // successor's session, so bail at entry — and re-check after every await
-  // below that precedes a mutation, since a replacement can land mid-op.
+  // successor's session, so bail at entry — and, since a replacement can land
+  // mid-op, re-check after the awaits below before mutating shared state (or,
+  // in the attach path, roll back the op's own freshly created tab).
   if (port !== fromPort) return;
   try {
     if (msg.op === "open") {
@@ -354,6 +355,12 @@ async function reconnectWithNewIdentity() {
     // acts when the global still points at its port.
     port.disconnect();
     port = null;
+    // The old identity's session dies with its port. Reap its attached tab so
+    // the new identity does not inherit it: otherwise the onEvent/onDetach
+    // relays (keyed on the global port + dbgTabId) would feed the old tab's
+    // CDP traffic to the new host, and a premature `cdp` op from the new
+    // client would silently target the old session's tab.
+    await closeTab();
   }
   await connect();
 }
