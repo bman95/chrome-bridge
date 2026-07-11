@@ -349,19 +349,23 @@ async function reconnectWithNewIdentity() {
     // Name was cleared: tear down below; connect() will warn and stand down.
   }
   if (port) {
+    // Identity already matches: keep the healthy session (tab included).
     if (wanted !== null && port.bridgeHostName === wanted) return;
     // Deliberate replacement: disconnect() does not fire our own onDisconnect
     // listener, and even if the host's exit raced us here, that listener only
     // acts when the global still points at its port.
     port.disconnect();
     port = null;
-    // The old identity's session dies with its port. Reap its attached tab so
-    // the new identity does not inherit it: otherwise the onEvent/onDetach
-    // relays (keyed on the global port + dbgTabId) would feed the old tab's
-    // CDP traffic to the new host, and a premature `cdp` op from the new
-    // client would silently target the old session's tab.
-    await closeTab();
   }
+  // The old identity's session is dead on any actual identity change — whether
+  // we just disconnected its port or the port was already down (host died and
+  // the rename landed inside the reconnect-alarm window; a mere port drop
+  // deliberately keeps the tab for same-identity resume). Reap the tab so the
+  // new identity does not inherit it: otherwise the onEvent/onDetach relays
+  // (keyed on the global port + dbgTabId) would feed the old tab's CDP traffic
+  // to the new host, and a premature `cdp` op from the new client would
+  // silently target the old session's tab.
+  await closeTab();
   await connect();
 }
 
