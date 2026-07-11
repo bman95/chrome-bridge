@@ -46,7 +46,7 @@ import sys
 import threading
 from typing import BinaryIO
 
-from .frames import MAX_MESSAGE_BYTES, FrameError, read_frame, write_frame
+from .frames import MAX_MESSAGE_BYTES, MAX_READ_BYTES, FrameError, read_frame, write_frame
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +95,10 @@ def _pump(
     ``max_write_bytes`` is the per-direction write cap forwarded to
     ``write_frame``. Chrome's 1 MB Native-Messaging cap applies only to
     host->extension messages, so the client->ext pump keeps the default cap
-    while the ext->client pump passes ``None`` (the loopback socket has no such
-    limit; oversize reads are already bounded by the 64 MB read guard).
+    while the ext->client pump uses ``MAX_READ_BYTES`` (the loopback socket has
+    no Chrome cap, but the relay must never emit a frame the peer's own codec
+    rejects as over its read guard — that would desync the client, not just
+    drop one reply).
 
     Setting ``on_close`` on exit lets the peer pump and the main thread unwind:
     the first direction to end tears the whole session down so neither side is
@@ -117,14 +119,15 @@ def _pump(
             try:
                 write_frame(dst, frame, max_bytes=max_write_bytes)
             except FrameError as exc:
-                # A client -> extension frame over Chrome's 1 MB host->extension
-                # cap: it was read fine (under the larger read guard) but cannot
-                # be sent to Chrome. Drop just this frame and keep relaying; the
-                # dst stream stays aligned because encode_frame checks the cap
-                # before any byte is written. The client's per-id timeout (see
-                # sw.js WIRE PROTOCOL) covers the missing reply. Only the
-                # client->ext direction carries a cap: extension replies (e.g.
-                # a large outer_html) relay to the client uncapped.
+                # A frame over this direction's write cap: a client->ext frame
+                # over Chrome's 1 MB host->extension cap (it was read fine under
+                # the larger read guard but cannot be sent to Chrome), or an
+                # ext->client frame whose re-encoding outgrew the client's read
+                # guard. Drop just this frame and keep relaying; the dst stream
+                # stays aligned because encode_frame checks the cap before any
+                # byte is written. The client's per-id timeout (see sw.js WIRE
+                # PROTOCOL) covers the missing reply. Extension replies (e.g. a
+                # large outer_html) relay to the client up to the read guard.
                 logger.warning("%s: dropping oversize frame: %s", name, exc)
                 continue
             except (OSError, ValueError) as exc:
@@ -190,9 +193,12 @@ def _serve_session(
         kwargs={
             "name": "ext->client",
             "on_close": closed,
-            # Writes go to the local client socket: no Chrome cap. Large
-            # extension replies (bounded by the 64 MB read guard) relay intact.
-            "max_write_bytes": None,
+            # Writes go to the local client socket: no Chrome cap, so large
+            # extension replies relay intact. Capped at the client's own read
+            # guard rather than None: emitting a frame over MAX_READ_BYTES
+            # would make the client's read_frame raise and tear the session
+            # down, which is worse than dropping the one reply.
+            "max_write_bytes": MAX_READ_BYTES,
         },
         daemon=True,
     )
@@ -221,9 +227,11 @@ def _run_echo(ext_in: BinaryIO, ext_out: BinaryIO) -> None:
     """Write every extension frame straight back (install smoke test).
 
     Unlike the relay's drop-and-continue, echo just stops on any send failure:
-    it only reflects extension->host frames (already under Chrome's cap), so an
-    oversize write is not expected, and the mode exists purely for a quick
-    connectNative round-trip rather than resilient long-running operation.
+    it reflects extension->host frames (which Chrome does NOT cap at 1 MB) back
+    into the genuinely capped host->extension direction, so a >1 MB inbound
+    frame cannot be echoed and simply ends the smoke test. The mode exists
+    purely for a quick connectNative round-trip rather than resilient
+    long-running operation, and real smoke-test frames are tiny.
     """
     while True:
         try:

@@ -117,9 +117,11 @@ already carry.
    reply (e.g. `outer_html` of a heavy page) relays intact to the client,
    bounded only by the relay's 64 MB read guard. A client→extension frame
    over the cap is dropped by the relay without desyncing the stream (Chrome
-   would kill the host on an oversize frame), surfacing as a per-op timeout —
-   so keep command payloads (e.g. large `fill` values or injected scripts)
-   under 1 MB.
+   would kill the host on an oversize frame), surfacing as a per-op timeout;
+   the bundled `ChromeBridge` client rejects such a frame at send time instead
+   (fail-fast `BridgeError`), so the relay drop only covers raw clients. Keep
+   command payloads (e.g. large `fill` values or injected scripts) under
+   1 MB.
 2. **MV3 service-worker eviction mid-job** (workers die ~30s idle).
    Mitigated by a `chrome.alarms` keepalive + `ChromeBridge.reconnect()`
    rebuilding the dead loopback connection and re-attaching idempotently

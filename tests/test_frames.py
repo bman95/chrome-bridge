@@ -128,3 +128,24 @@ def test_write_frame_uncapped_round_trips_large_frame():
 def test_encode_frame_honours_custom_cap():
     with pytest.raises(FrameError, match="exceeds"):
         encode_frame({"x": "y" * 100}, max_bytes=10)
+
+
+def test_encode_frame_emits_compact_utf8():
+    # ensure_ascii would inflate non-ASCII into \uXXXX escapes (up to ~3x),
+    # shrinking the usable 1 MB budget and letting a relayed frame outgrow the
+    # peer's read guard. The codec must emit raw UTF-8 instead.
+    msg = {"title": "Café — 90 m² · €1.200", "cjk": "漢字", "emoji": "😀"}
+    raw = encode_frame(msg)
+    assert b"\\u" not in raw
+    body = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    assert raw[4:] == body
+
+
+def test_relayed_nonascii_frame_does_not_inflate():
+    # The relay is read-then-re-encode, not byte forwarding: a decoded frame
+    # must re-encode to its inbound size, or a frame under the 64 MB read guard
+    # could be re-emitted over it and desync the client.
+    big = {"html": "é" * (MAX_MESSAGE_BYTES // 2)}  # ~1 MB of 2-byte UTF-8
+    wire = encode_frame(big, max_bytes=None)
+    decoded = read_frame(io.BytesIO(wire))
+    assert len(encode_frame(decoded, max_bytes=None)) == len(wire)

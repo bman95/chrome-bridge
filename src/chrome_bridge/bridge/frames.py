@@ -28,9 +28,10 @@ LENGTH_PREFIX_BYTES = _LEN.size
 # ``max_bytes`` parameter, which defaults to this cap: an oversize frame is
 # rejected before any byte is written, so the relay can drop it and keep going
 # without ever sending Chrome a frame it would reject (which would desync).
-# Writers whose destination is not the extension (e.g. the ext->client pump in
-# nmh.py) pass ``max_bytes=None`` to lift the cap. See docs/design.md
-# "Top risks #1".
+# Writers whose destination is not the extension lift the cap: the ext->client
+# pump in nmh.py passes ``max_bytes=MAX_READ_BYTES`` (the peer's read guard,
+# so the relay never emits a frame the client's own codec rejects). See
+# docs/design.md "Top risks #1".
 MAX_MESSAGE_BYTES = 1024 * 1024
 
 # A generous upper bound on the size of a frame we are willing to READ into
@@ -109,8 +110,13 @@ def encode_frame(obj: Any, *, max_bytes: int | None = MAX_MESSAGE_BYTES) -> byte
     when the destination is not the extension (the cap is direction-specific).
     The cap is checked *before* anything is written, so an oversize frame never
     half-emits and desynchronises the stream.
+
+    Serialisation is compact UTF-8 (``ensure_ascii=False``): a relayed frame
+    re-encodes to roughly its inbound size instead of inflating non-ASCII text
+    into ``\\uXXXX`` escapes (up to ~3x), which would both shrink the usable
+    1 MB budget and let a re-encoded frame outgrow the peer's read guard.
     """
-    body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if max_bytes is not None and len(body) > max_bytes:
         raise FrameError(
             f"frame body {len(body)} bytes exceeds {max_bytes}-byte cap"

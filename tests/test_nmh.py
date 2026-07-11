@@ -236,7 +236,14 @@ def test_serve_session_relays_large_extension_reply_to_client():
     ext_peer_w = ext_peer.makefile("wb")
     client_peer_r = client_peer.makefile("rb")
 
-    big_reply = {"id": 1, "ok": True, "result": "x" * (MAX_MESSAGE_BYTES + 100)}
+    # Non-ASCII payload on purpose: the relay re-encodes (read_frame ->
+    # write_frame), and an ensure_ascii serialisation would inflate this ~3x,
+    # so the test also guards against re-encode amplification.
+    big_reply = {
+        "id": 1,
+        "ok": True,
+        "result": "é" * (MAX_MESSAGE_BYTES // 2) + "x" * 100,  # body > 1 MB
+    }
     received: list[dict] = []
 
     def extension_behaviour():
