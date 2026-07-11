@@ -150,6 +150,9 @@ async function dial() {
   // Each listener captures ITS port (p) and acts on the global only when the
   // global still refers to it — a stale port's callbacks must never touch a
   // healthy successor connection.
+  // Remember which host this port dialed so the profile-rename path can tell
+  // whether an in-flight dial already landed on the wanted identity.
+  p.bridgeHostName = hostName;
   p.onMessage.addListener((msg) => onPythonMessage(msg, p));
   p.onDisconnect.addListener(() => {
     // chrome.runtime.lastError is set here when the host died/was missing
@@ -186,11 +189,18 @@ async function onPythonMessage(msg, fromPort) {
   const reply = (id, payload) => {
     if (port === fromPort) fromPort.postMessage({ id, ...payload });
   };
+  // Staleness gate: ops carry side effects on shared session state (dbgTabId,
+  // tabs, the debugger attachment), not just replies. A request from a port
+  // that has been replaced (profile rename) or dropped must not touch the
+  // successor's session, so bail at entry — and re-check after every await
+  // below that precedes a mutation, since a replacement can land mid-op.
+  if (port !== fromPort) return;
   try {
     if (msg.op === "open") {
       // Enforce the single-tab invariant: tear down any prior tab so a re-open
       // (e.g. after a dropped detach) cannot orphan it.
       if (dbgTabId !== null) await closeTab();
+      if (port !== fromPort) return; // replaced while closing the old tab
       // active:false opens the tab in the current window without focusing it,
       // sharing the real profile's cookies/login state. We deliberately use
       // tabs.create over windows.create: it satisfies "no focus steal" without
@@ -207,6 +217,22 @@ async function onPythonMessage(msg, fromPort) {
           /* already gone */
         }
         throw e;
+      }
+      if (port !== fromPort) {
+        // Port was replaced while we were creating/attaching: this session is
+        // dead. Tear down the just-created tab and walk away without touching
+        // dbgTabId — it may already belong to the successor's session.
+        try {
+          await chrome.debugger.detach({ tabId: tab.id });
+        } catch (_) {
+          /* already detached */
+        }
+        try {
+          await chrome.tabs.remove(tab.id);
+        } catch (_) {
+          /* already removed */
+        }
+        return;
       }
       dbgTabId = tab.id;
       reply(msg.id, { ok: true, tabId: dbgTabId });
@@ -310,7 +336,19 @@ async function reconnectWithNewIdentity() {
   // single-flight guard means a fresh connect() below cannot piggyback on the
   // stale attempt — connectPromise is cleared once it settles.)
   if (connectPromise) await connectPromise;
+  // The settled dial may instead have read the NEW name (the storage write
+  // commits before onChanged fires). Tearing that healthy connection down and
+  // immediately re-dialing the SAME host name would race the dying host for
+  // its loopback port (EADDRINUSE, then up to a minute on the reconnect
+  // alarm) — so skip the teardown when the identity already matches.
+  let wanted = null;
+  try {
+    wanted = await nativeHostName();
+  } catch (e) {
+    // Name was cleared: tear down below; connect() will warn and stand down.
+  }
   if (port) {
+    if (wanted !== null && port.bridgeHostName === wanted) return;
     // Deliberate replacement: disconnect() does not fire our own onDisconnect
     // listener, and even if the host's exit raced us here, that listener only
     // acts when the global still points at its port.
