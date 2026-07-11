@@ -90,7 +90,21 @@ const KEEPALIVE_ALARM = "ka";
 const RECONNECT_ALARM = "reconnect";
 
 let port = null;
+// Single-flight guard for connect(): the promise of the dial currently in
+// progress, or null when none is. Multiple spin-up triggers (top-level call,
+// onInstalled, onStartup, alarms) routinely overlap; they must share one dial
+// rather than each calling connectNative — a second connectNative would spawn
+// a second native host process that immediately dies on EADDRINUSE, and its
+// onDisconnect used to null the healthy connection's global `port`.
+let connectPromise = null;
 let dbgTabId = null;
+// Host name of the identity that opened the current tab (set alongside
+// dbgTabId on a successful "open"; meaningful only while dbgTabId !== null).
+// Lets the profile-rename path detect a tab that predates the rename even
+// when the live port already matches the new identity — a reconnect alarm can
+// dial the new name in the gap between the storage write committing and the
+// onChanged handler running, while the old identity's tab is still held.
+let dbgTabOwner = null;
 
 async function nativeHostName() {
   const { bridgeProfileName } = await chrome.storage.local.get("bridgeProfileName");
@@ -102,8 +116,25 @@ async function nativeHostName() {
   return `${NATIVE_HOST_PREFIX}.${bridgeProfileName}`;
 }
 
-async function connect() {
-  if (port) return;
+// Single-flight: concurrent calls while a connection is up return immediately;
+// concurrent calls while a dial is in flight all share that dial's promise. A
+// second connectNative is never issued while a connection is up or being
+// established.
+function connect() {
+  if (port) return Promise.resolve();
+  if (!connectPromise) {
+    connectPromise = dial().finally(() => {
+      connectPromise = null;
+    });
+  }
+  return connectPromise;
+}
+
+// The actual dial. Never called directly — only via connect(), which
+// guarantees at most one invocation is in flight at a time. Never rejects:
+// every failure path is handled (warn or schedule a retry) so callers can
+// fire-and-forget.
+async function dial() {
   let hostName;
   try {
     hostName = await nativeHostName();
@@ -113,25 +144,36 @@ async function connect() {
     console.warn("chrome-bridge:", e.message);
     return;
   }
+  let p;
   try {
-    port = chrome.runtime.connectNative(hostName);
+    p = chrome.runtime.connectNative(hostName);
   } catch (e) {
     // Host not registered / not launchable; nothing to relay to. Schedule a
     // retry so a transient launch failure (e.g. uv still warming the venv)
     // self-heals rather than wedging until the periodic keepalive alarm.
-    port = null;
     scheduleReconnect();
     return;
   }
-  port.onMessage.addListener(onPythonMessage);
-  port.onDisconnect.addListener(() => {
+  // Each listener captures ITS port (p) and acts on the global only when the
+  // global still refers to it — a stale port's callbacks must never touch a
+  // healthy successor connection.
+  // Remember which host this port dialed so the profile-rename path can tell
+  // whether an in-flight dial already landed on the wanted identity.
+  p.bridgeHostName = hostName;
+  p.onMessage.addListener((msg) => onPythonMessage(msg, p));
+  p.onDisconnect.addListener(() => {
     // chrome.runtime.lastError is set here when the host died/was missing
     // (e.g. the worker was evicted and the native host Chrome spawned exited).
     // Drop the reference and schedule a near-term re-dial so the bridge comes
-    // back without waiting for the next periodic keepalive tick.
-    port = null;
-    scheduleReconnect();
+    // back without waiting for the next periodic keepalive tick. Only this
+    // port's owner may clear the global: if `port` already points elsewhere
+    // (we were deliberately replaced, e.g. profile rename), leave it alone.
+    if (port === p) {
+      port = null;
+      scheduleReconnect();
+    }
   });
+  port = p;
 }
 
 // Schedule a single delayed reconnect. chrome.alarms enforces a 1-minute floor
@@ -146,12 +188,27 @@ function scheduleReconnect() {
   }
 }
 
-async function onPythonMessage(msg) {
+async function onPythonMessage(msg, fromPort) {
+  // Route replies to the port the request arrived on — and only while that
+  // port is still the live one. A request that was in flight when its port got
+  // replaced (profile rename) or dropped must not leak a reply to a successor
+  // connection, where it would corrupt the new host's id space.
+  const reply = (id, payload) => {
+    if (port === fromPort) fromPort.postMessage({ id, ...payload });
+  };
+  // Staleness gate: ops carry side effects on shared session state (dbgTabId,
+  // tabs, the debugger attachment), not just replies. A request from a port
+  // that has been replaced (profile rename) or dropped must not touch the
+  // successor's session, so bail at entry — and, since a replacement can land
+  // mid-op, re-check after the awaits below before mutating shared state (or,
+  // in the attach path, roll back the op's own freshly created tab).
+  if (port !== fromPort) return;
   try {
     if (msg.op === "open") {
       // Enforce the single-tab invariant: tear down any prior tab so a re-open
       // (e.g. after a dropped detach) cannot orphan it.
       if (dbgTabId !== null) await closeTab();
+      if (port !== fromPort) return; // replaced while closing the old tab
       // active:false opens the tab in the current window without focusing it,
       // sharing the real profile's cookies/login state. We deliberately use
       // tabs.create over windows.create: it satisfies "no focus steal" without
@@ -169,7 +226,24 @@ async function onPythonMessage(msg) {
         }
         throw e;
       }
+      if (port !== fromPort) {
+        // Port was replaced while we were creating/attaching: this session is
+        // dead. Tear down the just-created tab and walk away without touching
+        // dbgTabId — it may already belong to the successor's session.
+        try {
+          await chrome.debugger.detach({ tabId: tab.id });
+        } catch (_) {
+          /* already detached */
+        }
+        try {
+          await chrome.tabs.remove(tab.id);
+        } catch (_) {
+          /* already removed */
+        }
+        return;
+      }
       dbgTabId = tab.id;
+      dbgTabOwner = fromPort.bridgeHostName;
       reply(msg.id, { ok: true, tabId: dbgTabId });
     } else if (msg.op === "cdp") {
       if (dbgTabId === null) {
@@ -230,10 +304,6 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   }
 });
 
-function reply(id, payload) {
-  if (port) port.postMessage({ id, ...payload });
-}
-
 // Keepalive. MV3 service workers are evicted after ~30 s idle. The PRIMARY
 // keepalive is the open native-messaging port: while `connectNative` is
 // connected, message traffic on it resets the idle timer, so an active job
@@ -258,8 +328,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // Re-dial on every worker spin-up trigger: browser launch (onStartup), the
 // extension being (re)loaded/updated (onInstalled), and the top-level call for
-// a plain eviction-respawn. connect() is idempotent, so overlapping triggers
-// are harmless.
+// a plain eviction-respawn. These routinely overlap (e.g. onInstalled and the
+// top-level call both fire on an extension load); connect()'s single-flight
+// guard collapses them onto one dial, so exactly one native host is spawned.
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 connect();
@@ -267,12 +338,53 @@ connect();
 // If the user (re)configures the profile name from the options page while
 // this worker is alive, reconnect under the new identity immediately rather
 // than waiting for the next spin-up trigger.
+async function reconnectWithNewIdentity() {
+  // Let any in-flight dial settle first: it may have read the OLD profile name
+  // before the storage write landed, so whatever it produced must be torn down
+  // and re-dialed under the now-current name. (dial() never rejects, and the
+  // single-flight guard means a fresh connect() below cannot piggyback on the
+  // stale attempt — connectPromise is cleared once it settles.)
+  if (connectPromise) await connectPromise;
+  // The settled dial may instead have read the NEW name (the storage write
+  // commits before onChanged fires). Tearing that healthy connection down and
+  // immediately re-dialing the SAME host name would race the dying host for
+  // its loopback port (EADDRINUSE, then up to a minute on the reconnect
+  // alarm) — so skip the teardown when the identity already matches.
+  let wanted = null;
+  try {
+    wanted = await nativeHostName();
+  } catch (e) {
+    // Name was cleared: tear down below; connect() will warn and stand down.
+  }
+  if (port) {
+    // Identity already matches: keep the healthy connection. But the held tab
+    // may still predate the rename (port dropped, tab kept for same-identity
+    // resume, then a reconnect-alarm dial landed the NEW name before this
+    // handler ran) — only a tab opened under the wanted identity may survive.
+    if (wanted !== null && port.bridgeHostName === wanted) {
+      if (dbgTabId !== null && dbgTabOwner !== wanted) await closeTab();
+      return;
+    }
+    // Deliberate replacement: disconnect() does not fire our own onDisconnect
+    // listener, and even if the host's exit raced us here, that listener only
+    // acts when the global still points at its port.
+    port.disconnect();
+    port = null;
+  }
+  // The old identity's session is dead on any actual identity change — whether
+  // we just disconnected its port or the port was already down (host died and
+  // the rename landed inside the reconnect-alarm window; a mere port drop
+  // deliberately keeps the tab for same-identity resume). Reap the tab so the
+  // new identity does not inherit it: otherwise the onEvent/onDetach relays
+  // (keyed on the global port + dbgTabId) would feed the old tab's CDP traffic
+  // to the new host, and a premature `cdp` op from the new client would
+  // silently target the old session's tab.
+  await closeTab();
+  await connect();
+}
+
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && "bridgeProfileName" in changes) {
-    if (port) {
-      port.disconnect();
-      port = null;
-    }
-    connect();
+    reconnectWithNewIdentity();
   }
 });
