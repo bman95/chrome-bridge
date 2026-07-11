@@ -105,3 +105,26 @@ def test_write_frame_oversize_does_not_emit_partial():
     with pytest.raises(FrameError):
         write_frame(buf, {"html": "x" * (MAX_MESSAGE_BYTES + 1)})
     assert buf.getvalue() == b""  # nothing written -> stream stays aligned
+
+
+def test_encode_frame_uncapped_allows_body_over_chrome_cap():
+    # The 1 MB cap is host->extension only; max_bytes=None lifts it for writers
+    # whose destination is not the extension (the ext->client relay direction).
+    huge = {"html": "x" * (MAX_MESSAGE_BYTES + 1)}
+    raw = encode_frame(huge, max_bytes=None)
+    (length,) = struct.unpack("<I", raw[:4])
+    assert length == len(raw) - 4
+    assert json.loads(raw[4:].decode("utf-8")) == huge
+
+
+def test_write_frame_uncapped_round_trips_large_frame():
+    buf = io.BytesIO()
+    huge = {"html": "x" * (MAX_MESSAGE_BYTES + 1)}
+    write_frame(buf, huge, max_bytes=None)
+    buf.seek(0)
+    assert read_frame(buf) == huge
+
+
+def test_encode_frame_honours_custom_cap():
+    with pytest.raises(FrameError, match="exceeds"):
+        encode_frame({"x": "y" * 100}, max_bytes=10)

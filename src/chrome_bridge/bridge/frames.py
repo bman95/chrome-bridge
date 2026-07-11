@@ -22,19 +22,26 @@ _LEN = struct.Struct("<I")
 LENGTH_PREFIX_BYTES = _LEN.size
 
 # Chrome's Native Messaging caps a single *host -> extension* message at 1 MB.
-# This limit is enforced on the WRITE side (encode_frame): a host->extension
-# frame over it is rejected before any byte is written, so the relay can drop it
-# and keep going without ever sending Chrome a frame it would reject (which would
-# desync). See docs/design.md "Top risks #1".
+# The cap is direction-specific: it does NOT apply to extension -> host messages
+# (Chrome allows those to be far larger), nor to the host <-> client loopback
+# socket. It is enforced on the WRITE side (encode_frame / write_frame) via the
+# ``max_bytes`` parameter, which defaults to this cap: an oversize frame is
+# rejected before any byte is written, so the relay can drop it and keep going
+# without ever sending Chrome a frame it would reject (which would desync).
+# Writers whose destination is not the extension (e.g. the ext->client pump in
+# nmh.py) pass ``max_bytes=None`` to lift the cap. See docs/design.md
+# "Top risks #1".
 MAX_MESSAGE_BYTES = 1024 * 1024
 
 # A generous upper bound on the size of a frame we are willing to READ into
 # memory from either pipe (the extension->host direction Chrome allows far above
 # 1 MB; the client socket is local and unbounded). This is a denial-of-service /
 # runaway-allocation guard, NOT the Chrome 1 MB cap: a frame between
-# MAX_MESSAGE_BYTES and MAX_READ_BYTES is read fine and then dropped on write if
-# it is bound for the extension. A length prefix above MAX_READ_BYTES is treated
-# as a stream corruption (we refuse to allocate it) and ends that direction.
+# MAX_MESSAGE_BYTES and MAX_READ_BYTES is read fine and relayed intact when it
+# is bound for the client (e.g. a large outer_html reply); only a frame bound
+# for the *extension* is dropped on write. A length prefix above MAX_READ_BYTES
+# is treated as a stream corruption (we refuse to allocate it) and ends that
+# direction.
 MAX_READ_BYTES = 64 * 1024 * 1024
 
 
@@ -95,21 +102,29 @@ def read_frame(stream: BinaryIO) -> dict[str, Any] | None:
         raise FrameError(f"invalid frame JSON: {exc}") from exc
 
 
-def encode_frame(obj: Any) -> bytes:
-    """Serialise ``obj`` to a length-prefixed frame; raise if it exceeds the cap.
+def encode_frame(obj: Any, *, max_bytes: int | None = MAX_MESSAGE_BYTES) -> bytes:
+    """Serialise ``obj`` to a length-prefixed frame; raise if it exceeds ``max_bytes``.
 
+    ``max_bytes`` defaults to Chrome's 1 MB host->extension cap; pass ``None``
+    when the destination is not the extension (the cap is direction-specific).
     The cap is checked *before* anything is written, so an oversize frame never
     half-emits and desynchronises the stream.
     """
     body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-    if len(body) > MAX_MESSAGE_BYTES:
+    if max_bytes is not None and len(body) > max_bytes:
         raise FrameError(
-            f"frame body {len(body)} bytes exceeds {MAX_MESSAGE_BYTES}-byte cap"
+            f"frame body {len(body)} bytes exceeds {max_bytes}-byte cap"
         )
     return _LEN.pack(len(body)) + body
 
 
-def write_frame(stream: BinaryIO, obj: Any) -> None:
-    """Encode ``obj`` and write it to ``stream`` as a single frame, then flush."""
-    stream.write(encode_frame(obj))
+def write_frame(
+    stream: BinaryIO, obj: Any, *, max_bytes: int | None = MAX_MESSAGE_BYTES
+) -> None:
+    """Encode ``obj`` and write it to ``stream`` as a single frame, then flush.
+
+    ``max_bytes`` is forwarded to :func:`encode_frame`; pass ``None`` to lift
+    the 1 MB cap when the destination is not the extension.
+    """
+    stream.write(encode_frame(obj, max_bytes=max_bytes))
     stream.flush()

@@ -46,7 +46,7 @@ import sys
 import threading
 from typing import BinaryIO
 
-from .frames import FrameError, read_frame, write_frame
+from .frames import MAX_MESSAGE_BYTES, FrameError, read_frame, write_frame
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +82,21 @@ def _client_endpoint() -> tuple[str, int]:
     return host, port
 
 
-def _pump(src: BinaryIO, dst: BinaryIO, *, name: str, on_close: threading.Event) -> None:
+def _pump(
+    src: BinaryIO,
+    dst: BinaryIO,
+    *,
+    name: str,
+    on_close: threading.Event,
+    max_write_bytes: int | None = MAX_MESSAGE_BYTES,
+) -> None:
     """Relay frames from ``src`` to ``dst`` until either side closes or errors.
+
+    ``max_write_bytes`` is the per-direction write cap forwarded to
+    ``write_frame``. Chrome's 1 MB Native-Messaging cap applies only to
+    host->extension messages, so the client->ext pump keeps the default cap
+    while the ext->client pump passes ``None`` (the loopback socket has no such
+    limit; oversize reads are already bounded by the 64 MB read guard).
 
     Setting ``on_close`` on exit lets the peer pump and the main thread unwind:
     the first direction to end tears the whole session down so neither side is
@@ -102,16 +115,16 @@ def _pump(src: BinaryIO, dst: BinaryIO, *, name: str, on_close: threading.Event)
                 logger.debug("%s: peer closed", name)
                 break
             try:
-                write_frame(dst, frame)
+                write_frame(dst, frame, max_bytes=max_write_bytes)
             except FrameError as exc:
-                # An engine -> extension frame over Chrome's 1 MB host->extension
+                # A client -> extension frame over Chrome's 1 MB host->extension
                 # cap: it was read fine (under the larger read guard) but cannot
                 # be sent to Chrome. Drop just this frame and keep relaying; the
                 # dst stream stays aligned because encode_frame checks the cap
                 # before any byte is written. The client's per-id timeout (see
-                # sw.js WIRE PROTOCOL) covers the missing reply; callers should
-                # keep host->extension reads (e.g. outer_html) scoped to stay
-                # under the cap.
+                # sw.js WIRE PROTOCOL) covers the missing reply. Only the
+                # client->ext direction carries a cap: extension replies (e.g.
+                # a large outer_html) relay to the client uncapped.
                 logger.warning("%s: dropping oversize frame: %s", name, exc)
                 continue
             except (OSError, ValueError) as exc:
@@ -163,13 +176,24 @@ def _serve_session(
     t_up = threading.Thread(
         target=_pump,
         args=(client_in, ext_out),
-        kwargs={"name": "client->ext", "on_close": closed},
+        kwargs={
+            "name": "client->ext",
+            "on_close": closed,
+            # Writes go to Chrome: enforce the 1 MB host->extension cap.
+            "max_write_bytes": MAX_MESSAGE_BYTES,
+        },
         daemon=True,
     )
     t_down = threading.Thread(
         target=_pump,
         args=(ext_in, client_out),
-        kwargs={"name": "ext->client", "on_close": closed},
+        kwargs={
+            "name": "ext->client",
+            "on_close": closed,
+            # Writes go to the local client socket: no Chrome cap. Large
+            # extension replies (bounded by the 64 MB read guard) relay intact.
+            "max_write_bytes": None,
+        },
         daemon=True,
     )
     t_up.start()

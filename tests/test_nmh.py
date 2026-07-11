@@ -221,6 +221,48 @@ def test_serve_session_drops_oversize_client_frame_and_keeps_relaying():
         s.close()
 
 
+def test_serve_session_relays_large_extension_reply_to_client():
+    # Chrome's 1 MB cap is host->extension only: a reply over 1 MB read from the
+    # extension (e.g. outer_html of a heavy page) must relay INTACT to the
+    # client instead of being silently dropped (which used to surface as a
+    # confusing 20 s BridgeTimeoutError).
+    ext_peer, ext_host = _make_socketpair()
+    client_peer, client_host = _make_socketpair()
+
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    client_in = client_host.makefile("rb")
+    client_out = client_host.makefile("wb")
+    ext_peer_w = ext_peer.makefile("wb")
+    client_peer_r = client_peer.makefile("rb")
+
+    big_reply = {"id": 1, "ok": True, "result": "x" * (MAX_MESSAGE_BYTES + 100)}
+    received: list[dict] = []
+
+    def extension_behaviour():
+        # The extension->host direction has no 1 MB cap, so the peer writes the
+        # oversize reply uncapped, then closes to end the session.
+        write_frame(ext_peer_w, big_reply, max_bytes=None)
+        ext_peer.shutdown(socket.SHUT_WR)
+
+    def client_behaviour():
+        received.append(read_frame(client_peer_r))
+
+    te = threading.Thread(target=extension_behaviour, daemon=True)
+    tc = threading.Thread(target=client_behaviour, daemon=True)
+    tc.start()
+    te.start()
+
+    nmh._serve_session(ext_in, ext_out, client_in, client_out, client_host)
+    te.join(timeout=5.0)
+    tc.join(timeout=5.0)
+
+    assert received == [big_reply]
+
+    for s in (ext_host, client_host, client_peer):
+        s.close()
+
+
 def test_accept_client_binds_loopback_and_accepts():
     # Bind on an ephemeral port to avoid colliding with a real bridge.
     host, port = "127.0.0.1", _free_port()
