@@ -156,6 +156,29 @@ def test_init_rejects_invalid_profile_name(registry_path, mocked_install):
     assert result.exit_code == 1
 
 
+@pytest.mark.parametrize("port", ["0", "65536"])
+def test_init_rejects_out_of_range_port(registry_path, mocked_install, monkeypatch, tmp_path, port):
+    # init's platform gate reads sys.platform at call time; pretend win32 so
+    # the validation path (which fails before any platform-specific work)
+    # runs on every dev platform.
+    monkeypatch.setattr(sys, "platform", "win32")
+    result = runner.invoke(cli_mod.app, ["init", "--profile", "personal", "--port", port])
+    assert result.exit_code == 1
+    # Rejected before writing any launcher, manifest, or registry entry.
+    assert not registry_path.exists()
+    assert not list(tmp_path.glob("*.bat"))
+    assert not list(tmp_path.glob("nmh-manifest.*"))
+
+
+def test_init_rejects_port_used_by_other_profile(registry_path, mocked_install, monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "platform", "win32")
+    profiles_mod.add_profile("other", 8765, path=registry_path)
+    result = runner.invoke(cli_mod.app, ["init", "--profile", "personal", "--port", "8765"])
+    assert result.exit_code == 1
+    assert set(profiles_mod.list_profiles(registry_path)) == {"other"}
+    assert not list(tmp_path.glob("*.bat"))
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="init only automates Windows")
 def test_init_aborts_on_overwrite_decline(registry_path, mocked_install):
     profiles_mod.add_profile("personal", 8765, path=registry_path)

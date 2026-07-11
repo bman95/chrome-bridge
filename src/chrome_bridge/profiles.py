@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 DEFAULT_BASE_PORT = 8765
+MAX_PORT = 65535
 
 # Matches the same rule extension/options.js enforces client-side: the name
 # becomes part of a native-messaging host name and of generated filenames,
@@ -51,6 +52,11 @@ def validate_profile_name(name: str) -> None:
             f"invalid profile name {name!r}: use lowercase letters, digits, "
             "hyphens, or underscores, starting with a letter or digit"
         )
+
+
+def validate_port(port: int) -> None:
+    if not 1 <= port <= MAX_PORT:
+        raise ProfileError(f"invalid port {port}: must be between 1 and {MAX_PORT}")
 
 
 def default_registry_path() -> Path:
@@ -102,9 +108,14 @@ def resolve_port(name: str, path: Path | None = None) -> int:
 
 
 def allocate_port(path: Path | None = None, *, base: int = DEFAULT_BASE_PORT) -> int:
-    """Pick the next free port for a new profile: max(existing) + 1, or ``base``."""
-    existing = [cfg.port for cfg in list_profiles(path).values()]
-    return max(existing) + 1 if existing else base
+    """Pick the lowest port >= ``base`` not used by any registered profile."""
+    used = {cfg.port for cfg in list_profiles(path).values()}
+    port = base
+    while port in used:
+        port += 1
+    if port > MAX_PORT:
+        raise ProfileError(f"no free port available between {base} and {MAX_PORT}")
+    return port
 
 
 def add_profile(
@@ -119,7 +130,11 @@ def add_profile(
 ) -> ProfileConfig:
     """Add or overwrite a profile entry and persist the registry."""
     validate_profile_name(name)
+    validate_port(port)
     registry = load_registry(path)
+    for other_name, other in registry.profiles.items():
+        if other_name != name and other.port == port:
+            raise ProfileError(f"port {port} is already used by profile {other_name!r}")
     cfg = ProfileConfig(
         name=name,
         port=port,

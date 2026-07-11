@@ -63,11 +63,27 @@ def init(
 
     try:
         profiles_mod.validate_profile_name(profile)
+        if port is not None:
+            profiles_mod.validate_port(port)
     except profiles_mod.ProfileError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
 
-    existing = profiles_mod.list_profiles().get(profile)
+    registered = profiles_mod.list_profiles()
+    if port is not None:
+        conflict = next(
+            (n for n, cfg in registered.items() if n != profile and cfg.port == port),
+            None,
+        )
+        if conflict is not None:
+            typer.echo(
+                f"port {port} is already used by profile {conflict!r}; "
+                "pick another port or remove that profile first.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+    existing = registered.get(profile)
     if existing is not None:
         overwrite = typer.confirm(
             f"Profile {profile!r} is already registered (port {existing.port}). Overwrite?"
