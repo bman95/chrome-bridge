@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from chrome_bridge import profiles
@@ -59,10 +61,51 @@ def test_allocate_port_starts_at_base_when_empty(registry_path):
     assert profiles.allocate_port(registry_path) == profiles.DEFAULT_BASE_PORT
 
 
-def test_allocate_port_picks_max_plus_one(registry_path):
+def test_allocate_port_fills_gap_between_used_ports(registry_path):
     profiles.add_profile("a", 8765, path=registry_path)
     profiles.add_profile("b", 8770, path=registry_path)
-    assert profiles.allocate_port(registry_path) == 8771
+    assert profiles.allocate_port(registry_path) == 8766
+
+
+def test_allocate_port_skips_contiguously_used_ports(registry_path):
+    profiles.add_profile("a", 8765, path=registry_path)
+    profiles.add_profile("b", 8766, path=registry_path)
+    assert profiles.allocate_port(registry_path) == 8767
+
+
+def test_allocate_port_reuses_port_of_removed_profile(registry_path):
+    profiles.add_profile("a", 8765, path=registry_path)
+    profiles.add_profile("b", 8766, path=registry_path)
+    profiles.remove_profile("a", path=registry_path)
+    assert profiles.allocate_port(registry_path) == 8765
+
+
+def test_allocate_port_raises_when_range_exhausted(registry_path):
+    profiles.add_profile("a", profiles.MAX_PORT, path=registry_path)
+    with pytest.raises(profiles.ProfileError, match="no free port"):
+        profiles.allocate_port(registry_path, base=profiles.MAX_PORT)
+
+
+def test_allocate_port_rejects_out_of_range_base(registry_path):
+    with pytest.raises(profiles.ProfileError, match="invalid port"):
+        profiles.allocate_port(registry_path, base=0)
+
+
+def test_allocate_port_treats_legacy_string_port_as_used(registry_path):
+    """A legacy/hand-edited registry can hold string ports; the allocator must
+    not reissue them to a second profile."""
+    registry_path.write_text(
+        json.dumps({"profiles": {"legacy": {"port": "8765"}}}), encoding="utf-8"
+    )
+    assert profiles.allocate_port(registry_path) == 8766
+
+
+def test_add_profile_rejects_port_stored_as_legacy_string(registry_path):
+    registry_path.write_text(
+        json.dumps({"profiles": {"legacy": {"port": "8765"}}}), encoding="utf-8"
+    )
+    with pytest.raises(profiles.ProfileError, match="already used"):
+        profiles.add_profile("new", 8765, path=registry_path)
 
 
 def test_add_profile_overwrites_existing_entry(registry_path):
@@ -99,6 +142,42 @@ def test_validate_profile_name_accepts_valid(name):
 def test_add_profile_rejects_invalid_name(registry_path):
     with pytest.raises(profiles.ProfileError):
         profiles.add_profile("Not Valid", 8765, path=registry_path)
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536, 100000])
+def test_validate_port_rejects_out_of_range(port):
+    with pytest.raises(profiles.ProfileError, match="invalid port"):
+        profiles.validate_port(port)
+
+
+@pytest.mark.parametrize("port", ["8765", None, 8765.5, True])
+def test_validate_port_rejects_non_int(port):
+    with pytest.raises(profiles.ProfileError, match="invalid port"):
+        profiles.validate_port(port)
+
+
+@pytest.mark.parametrize("port", [1, 8765, 65535])
+def test_validate_port_accepts_valid(port):
+    profiles.validate_port(port)  # must not raise
+
+
+def test_add_profile_rejects_out_of_range_port(registry_path):
+    with pytest.raises(profiles.ProfileError, match="invalid port"):
+        profiles.add_profile("personal", 0, path=registry_path)
+    assert not registry_path.exists()
+
+
+def test_add_profile_rejects_port_used_by_other_profile(registry_path):
+    profiles.add_profile("a", 8765, path=registry_path)
+    with pytest.raises(profiles.ProfileError, match="already used"):
+        profiles.add_profile("b", 8765, path=registry_path)
+    assert set(profiles.list_profiles(registry_path)) == {"a"}
+
+
+def test_add_profile_allows_same_profile_keeping_its_port(registry_path):
+    profiles.add_profile("personal", 8765, path=registry_path)
+    profiles.add_profile("personal", 8765, path=registry_path)  # must not raise
+    assert profiles.resolve_port("personal", path=registry_path) == 8765
 
 
 def test_registry_file_is_well_formed_json(registry_path):
