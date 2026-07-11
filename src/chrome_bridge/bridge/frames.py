@@ -14,6 +14,7 @@ side), and can be unit-tested against :class:`io.BytesIO`.
 from __future__ import annotations
 
 import json
+import re
 import struct
 from typing import Any, BinaryIO
 
@@ -48,6 +49,13 @@ MAX_READ_BYTES = 64 * 1024 * 1024
 
 class FrameError(Exception):
     """A frame could not be read or written (oversize, truncated, or invalid)."""
+
+
+# Unpaired UTF-16 surrogates. json.loads happily decodes a ``\udXXX`` escape
+# into a lone surrogate (JS page text is WTF-16, so V8's JSON.stringify emits
+# such escapes for real-world DOM strings), but a str containing one cannot be
+# encoded as UTF-8. See encode_frame.
+_SURROGATES = re.compile(r"[\ud800-\udfff]")
 
 
 def _read_exactly(stream: BinaryIO, n: int) -> bytes | None:
@@ -115,8 +123,22 @@ def encode_frame(obj: Any, *, max_bytes: int | None = MAX_MESSAGE_BYTES) -> byte
     re-encodes to roughly its inbound size instead of inflating non-ASCII text
     into ``\\uXXXX`` escapes (up to ~3x), which would both shrink the usable
     1 MB budget and let a re-encoded frame outgrow the peer's read guard.
+
+    Two serialisation edge cases are handled so a relay never emits a frame the
+    peer would reject, and never dies on a `ValueError` its pump mistakes for a
+    closed destination: non-finite floats raise :class:`FrameError` (JSON has
+    no ``Infinity``/``NaN``; Chrome would kill the port on such a frame), and
+    unpaired surrogates — legitimate in scraped page text — are replaced with
+    U+FFFD (as Chromium itself does) rather than failing the whole frame.
     """
-    body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    try:
+        text = json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except ValueError as exc:
+        raise FrameError(f"frame not JSON-serialisable: {exc}") from exc
+    try:
+        body = text.encode("utf-8")
+    except UnicodeEncodeError:
+        body = _SURROGATES.sub("\ufffd", text).encode("utf-8")
     if max_bytes is not None and len(body) > max_bytes:
         raise FrameError(
             f"frame body {len(body)} bytes exceeds {max_bytes}-byte cap"

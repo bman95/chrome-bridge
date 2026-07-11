@@ -141,6 +141,27 @@ def test_encode_frame_emits_compact_utf8():
     assert raw[4:] == body
 
 
+def test_encode_frame_replaces_unpaired_surrogates():
+    # json.loads accepts a "\ud800" escape (real-world WTF-16 page text via
+    # V8's JSON.stringify), producing a str no UTF-8 encoder accepts. The codec
+    # substitutes U+FFFD (as Chromium does) instead of raising a ValueError a
+    # relay pump would mistake for a closed destination — which would kill the
+    # whole session over one bad code point.
+    decoded = json.loads('{"text": "a\\ud800b"}')
+    raw = encode_frame(decoded)
+    assert read_frame(io.BytesIO(raw)) == {"text": "a�b"}
+
+
+def test_encode_frame_rejects_non_finite_numbers():
+    # JSON has no Infinity/NaN; Chrome would kill the native port on such a
+    # frame. Python's json.loads accepts the literals, so a relayed frame can
+    # carry them — encode_frame must surface FrameError (dropped frame-aligned)
+    # rather than emit invalid JSON or leak a bare ValueError.
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(FrameError, match="serialisable"):
+            encode_frame({"v": bad})
+
+
 def test_relayed_nonascii_frame_does_not_inflate():
     # The relay is read-then-re-encode, not byte forwarding: a decoded frame
     # must re-encode to its inbound size, or a frame under the 64 MB read guard
