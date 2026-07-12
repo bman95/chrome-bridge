@@ -222,6 +222,12 @@ class _ExtensionRelay:
                         logger.debug("ext->client: dropping stale or unfenced reply")
                         continue
                     frame = {**frame, "id": fenced_id[2]}
+                elif frame.get("event") is True:
+                    if frame.get("sessionGeneration") != active_generation:
+                        logger.debug("ext->client: dropping stale or unfenced event")
+                        continue
+                    frame = dict(frame)
+                    frame.pop("sessionGeneration", None)
                 try:
                     write_frame(client_out, frame, max_bytes=MAX_READ_BYTES)
                 except FrameError as exc:
