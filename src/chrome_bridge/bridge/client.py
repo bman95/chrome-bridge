@@ -31,9 +31,10 @@ Responsibilities (the contract this module owns):
     then detaches but leaves that tab open (the one-shot CLI path).
   - :meth:`ChromeBridge.wait_selector`                   — poll ``querySelector !== null``.
   - :meth:`ChromeBridge.outer_html`                      — read a subtree's
-    ``outerHTML`` (not the whole document by default — 1 MB host->extension cap).
-    Pass a document-level selector (e.g. ``"html"``) when a caller needs the
-    full page.
+    ``outerHTML`` (not the whole document by default, to keep replies modest;
+    large replies relay fine under the bridge's 64 MB read guard). Pass a
+    document-level selector (e.g. ``"html"``) when a caller needs the full
+    page.
   - :meth:`ChromeBridge.click_text` / :meth:`ChromeBridge.click_selector`  — real
     ``Input.dispatchMouseEvent`` at the element centre.
   - :meth:`ChromeBridge.banner_present`                  — ``!!querySelector``.
@@ -84,16 +85,21 @@ DEFAULT_CONNECT_TIMEOUT = 8.0      # dial the loopback host
 DEFAULT_REATTACH_TIMEOUT = 5.0
 
 # Default CSS selector outer_html reads when the caller doesn't specify a
-# container: the document's <body>. Callers scraping a specific site should
-# pass a narrower, site-specific container selector to stay well under
-# Chrome's 1 MB host->extension frame cap (the documented #1 risk) — a full
-# page's outerHTML on a heavy site can blow that cap. When nothing matches,
-# outer_html falls back to `documentElement` in JS as a last resort.
+# container: the document's <body>. Chrome's 1 MB Native-Messaging cap applies
+# only host->extension (the small command frames), NOT to replies: a large
+# outerHTML flows extension->host->client bounded only by the relay's 64 MB
+# read guard (see docs/design.md "Top risks #1"). A narrower container is
+# still worth passing on heavy pages just to keep payloads small. When nothing
+# matches, outer_html falls back to `documentElement` in JS as a last resort.
 DEFAULT_CONTAINER_SELECTOR = "body"
 
 
 class BridgeError(RuntimeError):
     """The bridge transport failed (not connected, peer gone, or op error)."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class BridgeTimeoutError(BridgeError):
@@ -584,7 +590,8 @@ class ChromeBridge:
                 ) from exc
         if not reply.get("ok", False):
             raise BridgeError(
-                f"bridge op {payload.get('op')} failed: {reply.get('error', 'unknown')}"
+                f"bridge op {payload.get('op')} failed: {reply.get('error', 'unknown')}",
+                code=reply.get("errorCode"),
             )
         return reply
 
@@ -831,9 +838,11 @@ class ChromeBridge:
     ) -> str:
         """Return the ``outerHTML`` of the first element matching ``container``.
 
-        Pass a narrower, site-specific ``container`` selector to stay under
-        Chrome's 1 MB host->extension frame cap (the documented #1 risk) if the
-        default ``body`` proves too large. ``container`` may be a
+        Replies are not subject to Chrome's 1 MB host->extension cap (that cap
+        covers only the small command frames); a large ``outerHTML`` relays
+        intact up to the bridge's 64 MB read guard. A narrower, site-specific
+        ``container`` selector is still worthwhile on heavy pages to keep
+        payloads small. ``container`` may be a
         comma-separated selector list (tried left to right by
         ``querySelector``); the document element is the last-resort fallback so
         a present-but-unmatched container still yields *some* HTML rather than
@@ -1235,3 +1244,4 @@ class ChromeBridge:
             load_timeout = max(0.0, min(DEFAULT_REATTACH_TIMEOUT, timeout))
         log.info("chrome-bridge: re-attaching to %s after detach", self._current_url)
         self.open(self._current_url, timeout=load_timeout)
+
