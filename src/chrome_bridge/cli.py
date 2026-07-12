@@ -37,11 +37,46 @@ def profiles_list() -> None:
 
 @profiles_app.command("rm")
 def profiles_rm(name: str) -> None:
-    """Remove a profile's registry entry (does not touch Chrome or the registry key)."""
-    if profiles_mod.remove_profile(name):
+    """Remove a profile: its registry entry, its generated launcher/manifest
+    files, and (on Windows) its native-messaging host registry key.
+
+    Reports exactly what was removed and what was already absent. Exits non-zero
+    only when no registry entry existed for the name.
+    """
+    try:
+        profiles_mod.validate_profile_name(name)
+    except profiles_mod.ProfileError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+    removed_entry = profiles_mod.remove_profile(name)
+    if removed_entry:
         typer.echo(f"Removed profile {name!r} from the registry.")
     else:
-        typer.echo(f"No profile named {name!r}.")
+        typer.echo(f"No profile named {name!r} in the registry.")
+
+    # Native-host registry key: Windows only; gracefully skipped elsewhere.
+    if sys.platform == "win32":
+        removed_key = install_mod.unregister_native_host(name)
+        if removed_key:
+            typer.echo(f"Removed native-host key for {name!r}.")
+        else:
+            typer.echo(f"No native-host key for {name!r} to remove.")
+    else:
+        typer.echo("Skipped native-host registry key (Windows-only).")
+
+    # Generated launcher + manifest files.
+    for path in (
+        install_mod.launcher_path(_PROJECT_ROOT, name),
+        install_mod.manifest_path(_PROJECT_ROOT, name),
+    ):
+        if path.exists():
+            path.unlink()
+            typer.echo(f"Deleted {path.name}.")
+        else:
+            typer.echo(f"No {path.name} to delete.")
+
+    if not removed_entry:
         raise typer.Exit(code=1)
 
 
@@ -67,7 +102,38 @@ def init(
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
 
-    existing = profiles_mod.list_profiles().get(profile)
+    registered = profiles_mod.list_profiles()
+    existing = registered.get(profile)
+
+    # Validate the port that will actually be used — whether it came from
+    # --port, a (possibly legacy, pre-validation) registry entry, or the
+    # allocator — before any prompt or write.
+    try:
+        if port is not None:
+            chosen_port = port
+        elif existing is not None:
+            chosen_port = existing.port
+        else:
+            chosen_port = profiles_mod.allocate_port()
+        profiles_mod.validate_port(chosen_port)
+    except profiles_mod.ProfileError as exc:
+        typer.echo(str(exc), err=True)
+        if port is None and existing is not None:
+            typer.echo(
+                f"re-run with --port <n> to assign {profile!r} a valid port.",
+                err=True,
+            )
+        raise typer.Exit(code=1) from exc
+
+    conflict = profiles_mod.find_port_conflict(profile, chosen_port, registered)
+    if conflict is not None:
+        typer.echo(
+            f"port {chosen_port} is already used by profile {conflict!r}; "
+            "pick another port or remove that profile first.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     if existing is not None:
         overwrite = typer.confirm(
             f"Profile {profile!r} is already registered (port {existing.port}). Overwrite?"
@@ -75,7 +141,6 @@ def init(
         if not overwrite:
             raise typer.Exit(code=0)
 
-    chosen_port = port or (existing.port if existing else profiles_mod.allocate_port())
     typer.echo(f"Using port {chosen_port} for profile {profile!r}.")
 
     chrome_profile_dir = typer.prompt(
@@ -107,13 +172,23 @@ def init(
     install_mod.patch_allowed_origins(manifest, extension_id)
     typer.echo(f"Patched allowed_origins in {manifest}.")
 
-    profiles_mod.add_profile(
-        profile,
-        chosen_port,
-        chrome_user_data_dir=None,
-        chrome_profile_directory=chrome_profile_dir,
-        extension_id=extension_id,
-    )
+    try:
+        profiles_mod.add_profile(
+            profile,
+            chosen_port,
+            chrome_profile_directory=chrome_profile_dir,
+            extension_id=extension_id,
+        )
+    except profiles_mod.ProfileError as exc:
+        # Registry changed while init was waiting on the prompts above.
+        typer.echo(str(exc), err=True)
+        typer.echo(
+            "the registry changed while init was running; the launcher, manifest, "
+            "and native-host registration were already written, but the profile "
+            "was not saved — re-run init.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
     typer.echo(f"Saved profile {profile!r} to the registry.")
     typer.echo("")
     typer.echo("Reload the extension in chrome://extensions, then verify with:")
@@ -122,9 +197,32 @@ def init(
 
 def _resolve_host_port(profile: Optional[str], host: Optional[str], port: Optional[int]) -> tuple[str, int]:
     if host is not None or port is not None:
-        return host or "127.0.0.1", port or profiles_mod.DEFAULT_BASE_PORT
+        if port is None:
+            typer.echo(
+                "--host requires --port; there is no default port for an "
+                "explicit host. Pass --port <n>, or use --profile <name>.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        try:
+            profiles_mod.validate_port(port)
+        except profiles_mod.ProfileError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=2) from exc
+        return host or "127.0.0.1", port
     if profile is not None:
-        return "127.0.0.1", profiles_mod.resolve_port(profile)
+        resolved = profiles_mod.resolve_port(profile)
+        try:
+            profiles_mod.validate_port(resolved)
+        except profiles_mod.ProfileError as exc:
+            typer.echo(str(exc), err=True)
+            typer.echo(
+                f"profile {profile!r} has an invalid registered port; re-run "
+                f"`chrome-bridge init --profile {profile} --port <n>` to fix it.",
+                err=True,
+            )
+            raise typer.Exit(code=2) from exc
+        return "127.0.0.1", resolved
     typer.echo("Pass --profile <name> (or --host/--port for advanced use).", err=True)
     raise typer.Exit(code=2)
 
@@ -182,11 +280,10 @@ def nav(
         try:
             cdp.attach()
         except BridgeError as exc:
-            # The "no active tab" literal is the stable error extension/sw.js
-            # replies when its active-tab query comes back empty. Any other
+            # The structured error code distinguishes an empty window. Any other
             # attach failure (contention, restricted page) surfaces as-is —
             # a fresh tab is opened only when there is no tab at all.
-            if "no active tab" not in str(exc):
+            if exc.code != "no_active_tab":
                 raise
             # Nothing to attach to at all: fall back to opening a fresh tab
             # (open() itself navigates); detach() below still leaves it open.
@@ -280,3 +377,4 @@ def eval_(
 
 if __name__ == "__main__":
     app()
+
