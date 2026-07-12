@@ -48,14 +48,12 @@ for display only, which OS Chrome profile it corresponds to):
   "profiles": {
     "personal": {
       "port": 8765,
-      "chrome_user_data_dir": null,
       "chrome_profile_directory": "Default",
       "extension_id": "abcdefghijklmnopabcdefghijklmnop",
       "registered_at": null
     },
     "work": {
       "port": 8766,
-      "chrome_user_data_dir": null,
       "chrome_profile_directory": "Profile 1",
       "extension_id": "abcdefghijklmnopabcdefghijklmnop",
       "registered_at": null

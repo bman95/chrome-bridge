@@ -28,6 +28,15 @@ def registry_path(tmp_path, monkeypatch):
     return path
 
 
+@pytest.fixture(autouse=True)
+def isolated_profile_cleanup(monkeypatch, tmp_path):
+    """No profiles-rm test may touch checkout files or the real HKCU key."""
+    monkeypatch.setattr(cli_mod, "_PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        cli_mod.install_mod, "unregister_native_host", lambda _name: False
+    )
+
+
 def test_profiles_list_empty(registry_path):
     result = runner.invoke(cli_mod.app, ["profiles", "list"])
     assert result.exit_code == 0
@@ -54,9 +63,80 @@ def test_profiles_rm_missing_exits_nonzero(registry_path):
     assert result.exit_code == 1
 
 
+def test_profiles_rm_cleans_key_and_files(registry_path, monkeypatch, tmp_path):
+    """On Windows, rm also unregisters the native-host key and deletes the
+    generated launcher/manifest, reporting each removal."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cli_mod, "_PROJECT_ROOT", tmp_path)
+    unregistered = []
+    monkeypatch.setattr(
+        cli_mod.install_mod,
+        "unregister_native_host",
+        lambda name: unregistered.append(name) or True,
+    )
+    profiles_mod.add_profile("personal", 8765, path=registry_path)
+    launcher = tmp_path / "run_nmh_personal.bat"
+    manifest = tmp_path / "nmh-manifest.personal.local.json"
+    launcher.write_text("bat", encoding="utf-8")
+    manifest.write_text("{}", encoding="utf-8")
+
+    result = runner.invoke(cli_mod.app, ["profiles", "rm", "personal"])
+    assert result.exit_code == 0, result.output
+    assert unregistered == ["personal"]
+    assert not launcher.exists()
+    assert not manifest.exists()
+    assert profiles_mod.list_profiles(registry_path) == {}
+    assert "Removed profile 'personal' from the registry." in result.output
+    assert "Removed native-host key for 'personal'." in result.output
+    assert "Deleted run_nmh_personal.bat." in result.output
+    assert "Deleted nmh-manifest.personal.local.json." in result.output
+
+
+def test_profiles_rm_reports_absent_artifacts(registry_path, monkeypatch, tmp_path):
+    """Off Windows the registry-key step is skipped; missing launcher/manifest
+    files are reported as already absent rather than silently ignored."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(cli_mod, "_PROJECT_ROOT", tmp_path)
+    profiles_mod.add_profile("personal", 8765, path=registry_path)
+
+    result = runner.invoke(cli_mod.app, ["profiles", "rm", "personal"])
+    assert result.exit_code == 0, result.output
+    assert "Skipped native-host registry key (Windows-only)." in result.output
+    assert "No run_nmh_personal.bat to delete." in result.output
+    assert "No nmh-manifest.personal.local.json to delete." in result.output
+
+
+def test_profiles_rm_reports_absent_windows_key(registry_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    profiles_mod.add_profile("personal", 8765, path=registry_path)
+    result = runner.invoke(cli_mod.app, ["profiles", "rm", "personal"])
+    assert result.exit_code == 0
+    assert "No native-host key for 'personal' to remove." in result.output
+
+
+def test_profiles_rm_rejects_invalid_name_before_cleanup(registry_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    calls = []
+    monkeypatch.setattr(
+        cli_mod.install_mod,
+        "unregister_native_host",
+        lambda name: calls.append(name) or True,
+    )
+    result = runner.invoke(cli_mod.app, ["profiles", "rm", "../personal"])
+    assert result.exit_code == 1
+    assert calls == []
+
+
 def test_status_requires_profile_or_host_port():
     result = runner.invoke(cli_mod.app, ["status"])
     assert result.exit_code == 2
+
+
+def test_status_host_without_port_errors():
+    # --host alone must not silently fall back to DEFAULT_BASE_PORT; it errors.
+    result = runner.invoke(cli_mod.app, ["status", "--host", "127.0.0.1"])
+    assert result.exit_code == 2
+    assert "--port" in result.output
 
 
 @pytest.mark.parametrize("port", ["0", "65536"])

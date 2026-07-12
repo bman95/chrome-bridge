@@ -111,8 +111,8 @@ def register_native_host(profile: str, manifest_file: Path) -> None:
         winreg.SetValueEx(key, "", 0, winreg.REG_SZ, str(manifest_file))
 
 
-def unregister_native_host(profile: str) -> None:
-    """Delete the HKCU registry key for ``profile``'s native host, if present."""
+def unregister_native_host(profile: str) -> bool:
+    """Delete the HKCU native-host key; return whether it existed."""
     if sys.platform != "win32":
         raise RuntimeError("native host registration is only implemented for Windows")
     import winreg
@@ -121,7 +121,8 @@ def unregister_native_host(profile: str) -> None:
     try:
         winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_path)
     except FileNotFoundError:
-        pass
+        return False
+    return True
 
 
 def patch_allowed_origins(manifest_file: Path, extension_id: str) -> None:

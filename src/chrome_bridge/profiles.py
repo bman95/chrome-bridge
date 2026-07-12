@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 DEFAULT_BASE_PORT = 8765
@@ -35,7 +35,6 @@ class ProfileError(ValueError):
 class ProfileConfig:
     name: str
     port: int
-    chrome_user_data_dir: str | None = None
     chrome_profile_directory: str | None = None
     extension_id: str | None = None
     registered_at: str | None = None
@@ -102,8 +101,11 @@ def load_registry(path: Path | None = None) -> _Registry:
     if not p.exists():
         return _Registry()
     data = json.loads(p.read_text(encoding="utf-8"))
+    # Ignore unknown keys so a registry written by an older version (which
+    # persisted now-removed fields such as ``chrome_user_data_dir``) still loads.
+    known = {f.name for f in fields(ProfileConfig)} - {"name"}
     profiles = {
-        name: ProfileConfig(name=name, **cfg)
+        name: ProfileConfig(name=name, **{k: v for k, v in cfg.items() if k in known})
         for name, cfg in data.get("profiles", {}).items()
     }
     return _Registry(profiles=profiles)
@@ -160,7 +162,6 @@ def add_profile(
     name: str,
     port: int,
     *,
-    chrome_user_data_dir: str | None = None,
     chrome_profile_directory: str | None = None,
     extension_id: str | None = None,
     registered_at: str | None = None,
@@ -176,7 +177,6 @@ def add_profile(
     cfg = ProfileConfig(
         name=name,
         port=port,
-        chrome_user_data_dir=chrome_user_data_dir,
         chrome_profile_directory=chrome_profile_directory,
         extension_id=extension_id,
         registered_at=registered_at,

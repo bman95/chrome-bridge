@@ -29,7 +29,6 @@ def test_add_profile_persists_across_loads(registry_path):
     profiles.add_profile(
         "work",
         8766,
-        chrome_user_data_dir=r"C:\Users\bfrias\AppData\Local\Google\Chrome\User Data",
         chrome_profile_directory="Profile 1",
         extension_id="abcdefghijklmnopabcdefghijklmnop",
         registered_at="2026-07-07T10:00:00Z",
@@ -40,6 +39,31 @@ def test_add_profile_persists_across_loads(registry_path):
     cfg = reloaded["work"]
     assert cfg.chrome_profile_directory == "Profile 1"
     assert cfg.extension_id == "abcdefghijklmnopabcdefghijklmnop"
+
+
+def test_load_registry_ignores_unknown_keys(registry_path):
+    """A registry written by an older version can carry now-removed fields
+    (e.g. ``chrome_user_data_dir``); loading it must ignore them, not crash."""
+    registry_path.write_text(
+        json.dumps(
+            {
+                "profiles": {
+                    "personal": {
+                        "port": 8765,
+                        "chrome_user_data_dir": "C:\\legacy\\path",
+                        "chrome_profile_directory": "Default",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    reloaded = profiles.list_profiles(registry_path)
+    assert set(reloaded) == {"personal"}
+    cfg = reloaded["personal"]
+    assert cfg.port == 8765
+    assert cfg.chrome_profile_directory == "Default"
+    assert not hasattr(cfg, "chrome_user_data_dir")
 
 
 def test_resolve_port_returns_registered_port(registry_path):
