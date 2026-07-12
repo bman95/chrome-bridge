@@ -113,7 +113,13 @@ def test_serve_session_relays_both_directions():
         write_frame(ext_peer_w, {"id": first["id"], "ok": True, "tabId": 7})
         write_frame(
             ext_peer_w,
-            {"event": True, "type": "cdp", "method": "X", "params": {}},
+            {
+                "event": True,
+                "type": "cdp",
+                "method": "X",
+                "params": {},
+                "sessionGeneration": 1,
+            },
         )
         relayed.extend([first, second])
         # Half-close the write side so the host's ext_in sees a clean EOF and the
@@ -507,8 +513,34 @@ def test_late_reply_from_previous_session_is_not_delivered_to_next_client(monkey
     # The stale reply arrives first and reuses the caller-visible id. Fencing
     # must discard it; only the reply for session B reaches B.
     write_frame(ext_peer_w, {"id": old_wire_request["id"], "ok": True, "value": "old"})
+    write_frame(
+        ext_peer_w,
+        {
+            "event": True,
+            "type": "cdp",
+            "method": "Old.event",
+            "params": {},
+            "sessionGeneration": old_wire_request["id"][1],
+        },
+    )
     write_frame(ext_peer_w, {"id": new_wire_request["id"], "ok": True, "value": "new"})
     assert read_frame(second_r) == {"id": 1, "ok": True, "value": "new"}
+    write_frame(
+        ext_peer_w,
+        {
+            "event": True,
+            "type": "cdp",
+            "method": "New.event",
+            "params": {},
+            "sessionGeneration": new_wire_request["id"][1],
+        },
+    )
+    assert read_frame(second_r) == {
+        "event": True,
+        "type": "cdp",
+        "method": "New.event",
+        "params": {},
+    }
 
     second.shutdown(socket.SHUT_RDWR)
     second_r.close()
