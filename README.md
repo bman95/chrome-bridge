@@ -68,6 +68,12 @@ chrome-bridge fill <selector> <text> --profile <name>
 chrome-bridge eval "<js expression>" --profile <name>
 ```
 
+The one-shot commands act on the **active tab** of that profile's Chrome
+window — the page you are currently looking at. They attach, act, print, and
+detach again, leaving the tab open. `nav` navigates the active tab in place
+(opening a fresh tab only if there is no tab to attach to) and likewise leaves
+it open on exit.
+
 ## Setting up a profile
 
 `chrome-bridge init --profile <name>` will:
@@ -117,3 +123,5 @@ Environment variables (all optional):
 Profile-to-port mapping lives in `~/.config/chrome-bridge/profiles.json`,
 managed by `chrome-bridge init`/`profiles rm` — you shouldn't need to edit it
 by hand.
+
+
