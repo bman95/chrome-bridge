@@ -73,6 +73,33 @@ const tests = String.raw`
   assert.deepEqual(removed, [2]);
   const event = replies.find((msg) => msg.event && msg.type === "detached");
   assert.equal(event.sessionGeneration, 3);
+
+  // Exercise dial()'s real listener-level requestChain. A postMessage failure
+  // makes the first handler reject; the chain must recover and process the
+  // following request instead of remaining permanently rejected.
+  let receive;
+  let throwOnce = true;
+  const chainedReplies = [];
+  const nativePort = {
+    onMessage: { addListener: (fn) => { receive = fn; } },
+    onDisconnect: { addListener: () => {} },
+    postMessage: (msg) => {
+      if (throwOnce) {
+        throwOnce = false;
+        throw new Error("simulated disconnected reply");
+      }
+      chainedReplies.push(msg);
+    },
+  };
+  chrome.storage.local.get = async () => ({ bridgeProfileName: "personal" });
+  chrome.runtime.connectNative = () => nativePort;
+  port = null;
+  await dial();
+  receive({ id: id(4, 1), op: "unknown-first" });
+  await new Promise((resolve) => setImmediate(resolve));
+  receive({ id: id(4, 2), op: "unknown-second" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(chainedReplies.at(-1).id[2], 2);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
