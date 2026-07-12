@@ -102,7 +102,7 @@ let dbgTabId = null;
 // Generation injected into request ids by nmh.py. Events have no correlation
 // id, so carry this explicitly to prevent a late event from an old loopback
 // client session leaking into its successor.
-let relaySessionGeneration = null;
+let dbgTabSessionGeneration = null;
 // Host name of the identity that opened the current tab (set alongside
 // dbgTabId on a successful "open"; meaningful only while dbgTabId !== null).
 // Lets the profile-rename path detect a tab that predates the rename even
@@ -208,13 +208,11 @@ async function onPythonMessage(msg, fromPort) {
   // mid-op, re-check after the awaits below before mutating shared state (or,
   // in the attach path, roll back the op's own freshly created tab).
   if (port !== fromPort) return;
-  if (
+  const requestGeneration = (
     Array.isArray(msg.id) &&
     msg.id.length === 3 &&
     msg.id[0] === RELAY_SESSION_ID_MARKER
-  ) {
-    relaySessionGeneration = msg.id[1];
-  }
+  ) ? msg.id[1] : null;
   try {
     if (msg.op === "open") {
       // Enforce the single-tab invariant: tear down any prior tab so a re-open
@@ -256,10 +254,15 @@ async function onPythonMessage(msg, fromPort) {
       }
       dbgTabId = tab.id;
       dbgTabOwner = fromPort.bridgeHostName;
+      dbgTabSessionGeneration = requestGeneration;
       reply(msg.id, { ok: true, tabId: dbgTabId });
     } else if (msg.op === "cdp") {
       if (dbgTabId === null) {
         reply(msg.id, { ok: false, error: "no attached tab" });
+        return;
+      }
+      if (requestGeneration !== dbgTabSessionGeneration) {
+        reply(msg.id, { ok: false, error: "stale client session; open a tab first" });
         return;
       }
       const res = await chrome.debugger.sendCommand(
@@ -269,6 +272,10 @@ async function onPythonMessage(msg, fromPort) {
       );
       reply(msg.id, { ok: true, result: res });
     } else if (msg.op === "close") {
+      if (requestGeneration !== dbgTabSessionGeneration) {
+        reply(msg.id, { ok: false, error: "stale client session" });
+        return;
+      }
       await closeTab();
       reply(msg.id, { ok: true });
     } else {
@@ -282,6 +289,7 @@ async function onPythonMessage(msg, fromPort) {
 async function closeTab() {
   const tabId = dbgTabId;
   dbgTabId = null;
+  dbgTabSessionGeneration = null;
   if (tabId === null) return;
   // Detach first, then remove. Swallow per-step errors so a half-gone tab
   // (e.g. already closed by the user) still fully tears down.
@@ -305,7 +313,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       type: "cdp",
       method,
       params,
-      sessionGeneration: relaySessionGeneration,
+      sessionGeneration: dbgTabSessionGeneration,
     });
   }
 });
@@ -314,13 +322,15 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId === dbgTabId) {
     const tabId = dbgTabId;
+    const sessionGeneration = dbgTabSessionGeneration;
     dbgTabId = null;
+    dbgTabSessionGeneration = null;
     if (port)
       port.postMessage({
         event: true,
         type: "detached",
         reason,
-        sessionGeneration: relaySessionGeneration,
+        sessionGeneration,
       });
     // If the tab still exists (detach was NOT caused by tab closure — e.g. the
     // user opened DevTools), reap it so it doesn't linger as an orphan.
