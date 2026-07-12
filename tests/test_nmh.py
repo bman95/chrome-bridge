@@ -78,6 +78,14 @@ def _make_socketpair() -> tuple[socket.socket, socket.socket]:
     return client, server
 
 
+def _serve_session(
+    ext_in, ext_out, client_in, client_out, client_sock=None
+):
+    """Run one session with the same process-wide extension relay as main()."""
+    relay = nmh._ExtensionRelay(ext_in)
+    nmh._serve_session(relay, ext_out, client_in, client_out, client_sock)
+
+
 def test_serve_session_relays_both_directions():
     # Real sockets for BOTH sides so neither stream hits a premature EOF (as a
     # BytesIO would), mirroring production where the extension pipe stays open
@@ -123,7 +131,7 @@ def test_serve_session_relays_both_directions():
     te.start()
 
     started = time.monotonic()
-    nmh._serve_session(ext_in, ext_out, client_in, client_out, client_host)
+    _serve_session(ext_in, ext_out, client_in, client_out, client_host)
     elapsed = time.monotonic() - started
     te.join(timeout=5.0)
     tc.join(timeout=5.0)
@@ -156,7 +164,7 @@ def test_serve_session_returns_when_client_closes_first():
     done = threading.Event()
 
     def run():
-        nmh._serve_session(ext_in, ext_out, client_in, client_out, client_host)
+        _serve_session(ext_in, ext_out, client_in, client_out, client_host)
         done.set()
 
     t = threading.Thread(target=run, daemon=True)
@@ -207,7 +215,7 @@ def test_serve_session_drops_oversize_client_frame_and_keeps_relaying():
     te.start()
 
     started = time.monotonic()
-    nmh._serve_session(ext_in, ext_out, client_in, client_out, client_host)
+    _serve_session(ext_in, ext_out, client_in, client_out, client_host)
     elapsed = time.monotonic() - started
     te.join(timeout=5.0)
     tc.join(timeout=5.0)
@@ -255,7 +263,7 @@ def test_serve_session_sanitises_surrogate_frame_and_keeps_relaying():
     tc.start()
     te.start()
 
-    nmh._serve_session(ext_in, ext_out, client_in, client_out, client_host)
+    _serve_session(ext_in, ext_out, client_in, client_out, client_host)
     te.join(timeout=5.0)
     tc.join(timeout=5.0)
 
@@ -304,7 +312,7 @@ def test_serve_session_relays_large_extension_reply_to_client():
     tc.start()
     te.start()
 
-    nmh._serve_session(ext_in, ext_out, client_in, client_out, client_host)
+    _serve_session(ext_in, ext_out, client_in, client_out, client_host)
     te.join(timeout=5.0)
     tc.join(timeout=5.0)
 
@@ -320,8 +328,10 @@ def test_accept_client_binds_loopback_and_accepts():
 
     result: dict[str, object] = {}
 
+    listener = nmh._bind_listener(host, port)
+
     def server_thread():
-        client, rfile, wfile = nmh._accept_client(host, port)
+        client, rfile, wfile = nmh._accept_client(listener)
         result["client"] = client
         result["rfile"] = rfile
         result["wfile"] = wfile
@@ -337,6 +347,7 @@ def test_accept_client_binds_loopback_and_accepts():
     assert "client" in result
     client.close()
     result["client"].close()  # type: ignore[union-attr]
+    listener.close()
 
 
 def _free_port() -> int:
@@ -368,7 +379,7 @@ def test_accept_client_bind_collision_raises():
     holder.listen(1)
     try:
         with pytest.raises(OSError):
-            nmh._accept_client("127.0.0.1", port)
+            nmh._bind_listener("127.0.0.1", port)
     finally:
         holder.close()
 
@@ -386,6 +397,65 @@ def test_main_returns_1_on_bind_collision(monkeypatch):
         assert nmh.main([]) == 1
     finally:
         holder.close()
+
+
+def test_main_serves_two_sequential_clients_and_exits_on_extension_eof(monkeypatch):
+    host, port = "127.0.0.1", _free_port()
+    ext_peer, ext_host = _make_socketpair()
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    ext_peer_r = ext_peer.makefile("rb")
+    ext_peer_w = ext_peer.makefile("wb")
+    monkeypatch.setenv("CBR_BRIDGE_HOST", host)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
+
+    result: list[int] = []
+    server = threading.Thread(target=lambda: result.append(nmh.main([])), daemon=True)
+    server.start()
+
+    for request_id in (1, 2):
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _connect_with_retry(client, (host, port))
+        client_r = client.makefile("rb")
+        client_w = client.makefile("wb")
+        write_frame(client_w, {"id": request_id, "op": "cdp"})
+        assert read_frame(ext_peer_r) == {"id": request_id, "op": "cdp"}
+        write_frame(ext_peer_w, {"id": request_id, "ok": True})
+        assert read_frame(client_r) == {"id": request_id, "ok": True}
+        client.shutdown(socket.SHUT_RDWR)
+        client_r.close()
+        client_w.close()
+        client.close()
+
+    ext_peer.shutdown(socket.SHUT_WR)
+    server.join(timeout=5.0)
+    assert result == [0]
+
+    ext_peer_r.close()
+    ext_peer_w.close()
+    ext_peer.close()
+    ext_host.close()
+
+
+def test_main_exits_promptly_on_extension_eof_without_client(monkeypatch):
+    host, port = "127.0.0.1", _free_port()
+    ext_peer, ext_host = _make_socketpair()
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    monkeypatch.setenv("CBR_BRIDGE_HOST", host)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
+
+    result: list[int] = []
+    server = threading.Thread(target=lambda: result.append(nmh.main([])), daemon=True)
+    server.start()
+    ext_peer.shutdown(socket.SHUT_WR)
+    server.join(timeout=2.0)
+
+    assert result == [0]
+    ext_peer.close()
+    ext_host.close()
 
 
 def test_log_level_falls_back_to_info_on_garbage(monkeypatch):
