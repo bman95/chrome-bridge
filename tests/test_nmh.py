@@ -106,24 +106,31 @@ def test_serve_session_relays_both_directions():
     relayed: list[dict] = []
 
     def extension_behaviour():
-        # Send two requests, collect the reply + event, then close to end it.
-        write_frame(ext_peer_w, {"id": 1, "op": "open", "url": "u"})
-        write_frame(ext_peer_w, {"id": 2, "op": "close"})
-        relayed.append(read_frame(ext_peer_r))
-        relayed.append(read_frame(ext_peer_r))
+        # Read the two client requests. Their ids are fenced on the wire; echo
+        # those ids back and the relay restores the caller-visible ids.
+        first = read_frame(ext_peer_r)
+        second = read_frame(ext_peer_r)
+        write_frame(ext_peer_w, {"id": first["id"], "ok": True, "tabId": 7})
+        write_frame(
+            ext_peer_w,
+            {"event": True, "type": "cdp", "method": "X", "params": {}},
+        )
+        relayed.extend([first, second])
         # Half-close the write side so the host's ext_in sees a clean EOF and the
         # relay unwinds. (A plain socket.close() leaves the open makefile handles
         # holding the fd, so EOF can lag.)
         ext_peer.shutdown(socket.SHUT_WR)
 
     def client_behaviour():
-        got = [read_frame(client_peer_r), read_frame(client_peer_r)]
-        assert got == [{"id": 1, "op": "open", "url": "u"}, {"id": 2, "op": "close"}]
-        write_frame(client_peer_w, {"id": 1, "ok": True, "tabId": 7})
-        write_frame(
-            client_peer_w,
-            {"event": True, "type": "cdp", "method": "X", "params": {}},
-        )
+        write_frame(client_peer_w, {"id": 1, "op": "open", "url": "u"})
+        write_frame(client_peer_w, {"id": 2, "op": "close"})
+        assert read_frame(client_peer_r) == {"id": 1, "ok": True, "tabId": 7}
+        assert read_frame(client_peer_r) == {
+            "event": True,
+            "type": "cdp",
+            "method": "X",
+            "params": {},
+        }
 
     te = threading.Thread(target=extension_behaviour, daemon=True)
     tc = threading.Thread(target=client_behaviour, daemon=True)
@@ -139,10 +146,7 @@ def test_serve_session_relays_both_directions():
     # Extension-first teardown must return promptly — it must NOT block on a join
     # of the client->ext pump whose recv() the live client peer keeps parked.
     assert elapsed < 2.0, f"_serve_session lingered {elapsed:.2f}s on ext-first close"
-    assert relayed == [
-        {"id": 1, "ok": True, "tabId": 7},
-        {"event": True, "type": "cdp", "method": "X", "params": {}},
-    ]
+    assert [frame["id"][2] for frame in relayed] == [1, 2]
 
     for s in (ext_host, client_host, client_peer):
         s.close()
@@ -223,7 +227,9 @@ def test_serve_session_drops_oversize_client_frame_and_keeps_relaying():
     # Only the small frame made it through; the oversize one was dropped, and
     # the relay stayed up long enough to deliver it.
     assert elapsed < 2.0, f"_serve_session lingered {elapsed:.2f}s on ext-first close"
-    assert relayed == [{"id": 2, "ok": True}]
+    assert relayed[0]["id"][:2] == [nmh._SESSION_ID_MARKER, 1]
+    assert relayed[0]["id"][2] == 2
+    assert relayed[0]["ok"] is True
 
     for s in (ext_host, client_host, client_peer):
         s.close()
@@ -267,7 +273,9 @@ def test_serve_session_sanitises_surrogate_frame_and_keeps_relaying():
     te.join(timeout=5.0)
     tc.join(timeout=5.0)
 
-    assert relayed == [{"id": 1, "text": "a�b"}, {"id": 2, "ok": True}]
+    assert [frame["id"][2] for frame in relayed] == [1, 2]
+    assert relayed[0]["text"] == "a�b"
+    assert relayed[1]["ok"] is True
 
     for s in (ext_host, client_host, client_peer):
         s.close()
@@ -301,7 +309,11 @@ def test_serve_session_relays_large_extension_reply_to_client():
     def extension_behaviour():
         # The extension->host direction has no 1 MB cap, so the peer writes the
         # oversize reply uncapped, then closes to end the session.
-        write_frame(ext_peer_w, big_reply, max_bytes=None)
+        wire_reply = {
+            **big_reply,
+            "id": [nmh._SESSION_ID_MARKER, 1, big_reply["id"]],
+        }
+        write_frame(ext_peer_w, wire_reply, max_bytes=None)
         ext_peer.shutdown(socket.SHUT_WR)
 
     def client_behaviour():
@@ -420,8 +432,11 @@ def test_main_serves_two_sequential_clients_and_exits_on_extension_eof(monkeypat
         client_r = client.makefile("rb")
         client_w = client.makefile("wb")
         write_frame(client_w, {"id": request_id, "op": "cdp"})
-        assert read_frame(ext_peer_r) == {"id": request_id, "op": "cdp"}
-        write_frame(ext_peer_w, {"id": request_id, "ok": True})
+        wire_request = read_frame(ext_peer_r)
+        assert wire_request["id"][:2] == [nmh._SESSION_ID_MARKER, request_id]
+        assert wire_request["id"][2] == request_id
+        assert wire_request["op"] == "cdp"
+        write_frame(ext_peer_w, {"id": wire_request["id"], "ok": True})
         assert read_frame(client_r) == {"id": request_id, "ok": True}
         client.shutdown(socket.SHUT_RDWR)
         client_r.close()
@@ -456,6 +471,52 @@ def test_main_exits_promptly_on_extension_eof_without_client(monkeypatch):
     assert result == [0]
     ext_peer.close()
     ext_host.close()
+
+
+def test_late_reply_from_previous_session_is_not_delivered_to_next_client(monkeypatch):
+    host, port = "127.0.0.1", _free_port()
+    ext_peer, ext_host = _make_socketpair()
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    ext_peer_r = ext_peer.makefile("rb")
+    ext_peer_w = ext_peer.makefile("wb")
+    monkeypatch.setenv("CBR_BRIDGE_HOST", host)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
+
+    server = threading.Thread(target=lambda: nmh.main([]), daemon=True)
+    server.start()
+
+    first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _connect_with_retry(first, (host, port))
+    first_w = first.makefile("wb")
+    write_frame(first_w, {"id": 1, "op": "cdp", "session": "old"})
+    old_wire_request = read_frame(ext_peer_r)
+    first.shutdown(socket.SHUT_RDWR)
+    first_w.close()
+    first.close()
+
+    second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _connect_with_retry(second, (host, port))
+    second_r = second.makefile("rb")
+    second_w = second.makefile("wb")
+    write_frame(second_w, {"id": 1, "op": "cdp", "session": "new"})
+    new_wire_request = read_frame(ext_peer_r)
+    assert old_wire_request["id"] != new_wire_request["id"]
+
+    # The stale reply arrives first and reuses the caller-visible id. Fencing
+    # must discard it; only the reply for session B reaches B.
+    write_frame(ext_peer_w, {"id": old_wire_request["id"], "ok": True, "value": "old"})
+    write_frame(ext_peer_w, {"id": new_wire_request["id"], "ok": True, "value": "new"})
+    assert read_frame(second_r) == {"id": 1, "ok": True, "value": "new"}
+
+    second.shutdown(socket.SHUT_RDWR)
+    second_r.close()
+    second_w.close()
+    second.close()
+    ext_peer.shutdown(socket.SHUT_WR)
+    server.join(timeout=5.0)
+    assert not server.is_alive()
 
 
 def test_log_level_falls_back_to_info_on_garbage(monkeypatch):
