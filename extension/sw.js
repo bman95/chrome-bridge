@@ -202,7 +202,14 @@ async function dial() {
   // no tab, create one, then race to overwrite the global attachment state.
   let requestChain = Promise.resolve();
   p.onMessage.addListener((msg) => {
-    requestChain = requestChain.then(() => onPythonMessage(msg, p));
+    requestChain = requestChain
+      .then(() => onPythonMessage(msg, p))
+      .catch((error) => {
+        // A disconnect can make postMessage throw even inside the handler's
+        // error path. Recover the chain so one failed request cannot suppress
+        // every later request delivered on a still-live port.
+        console.warn("chrome-bridge: request failed:", error);
+      });
   });
   p.onDisconnect.addListener(() => {
     // chrome.runtime.lastError is set here when the host died/was missing
