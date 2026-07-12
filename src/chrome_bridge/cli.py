@@ -43,6 +43,12 @@ def profiles_rm(name: str) -> None:
     Reports exactly what was removed and what was already absent. Exits non-zero
     only when no registry entry existed for the name.
     """
+    try:
+        profiles_mod.validate_profile_name(name)
+    except profiles_mod.ProfileError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
     removed_entry = profiles_mod.remove_profile(name)
     if removed_entry:
         typer.echo(f"Removed profile {name!r} from the registry.")
@@ -51,8 +57,11 @@ def profiles_rm(name: str) -> None:
 
     # Native-host registry key: Windows only; gracefully skipped elsewhere.
     if sys.platform == "win32":
-        install_mod.unregister_native_host(name)
-        typer.echo(f"Unregistered native-host key for {name!r} (removed if present).")
+        removed_key = install_mod.unregister_native_host(name)
+        if removed_key:
+            typer.echo(f"Removed native-host key for {name!r}.")
+        else:
+            typer.echo(f"No native-host key for {name!r} to remove.")
     else:
         typer.echo("Skipped native-host registry key (Windows-only).")
 
