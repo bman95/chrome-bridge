@@ -1322,3 +1322,5 @@ def test_fill_sets_value_and_dispatches_events(bridge):
         assert cdp.fill("textarea.absent", "x") is False
     finally:
         cdp.close()
+
+
