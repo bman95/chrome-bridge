@@ -165,7 +165,14 @@ async function dial() {
   // Remember which host this port dialed so the profile-rename path can tell
   // whether an in-flight dial already landed on the wanted identity.
   p.bridgeHostName = hostName;
-  p.onMessage.addListener((msg) => onPythonMessage(msg, p));
+  // Native Messaging listeners do not await async callbacks themselves.
+  // Serialize operations explicitly: two loopback client sessions share this
+  // same native port, and overlapping `open` calls could otherwise both see
+  // no tab, create one, then race to overwrite the global attachment state.
+  let requestChain = Promise.resolve();
+  p.onMessage.addListener((msg) => {
+    requestChain = requestChain.then(() => onPythonMessage(msg, p));
+  });
   p.onDisconnect.addListener(() => {
     // chrome.runtime.lastError is set here when the host died/was missing
     // (e.g. the worker was evicted and the native host Chrome spawned exited).
