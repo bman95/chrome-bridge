@@ -143,39 +143,93 @@ def _pump(
         on_close.set()
 
 
+class _ExtensionRelay:
+    """Own the single extension-input reader for the host process.
+
+    Client sessions come and go, but the Native Messaging stdin pipe is shared
+    for the process lifetime and must never have two competing readers.  This
+    relay keeps one reader thread alive and routes each frame only to the
+    currently attached client session.  Frames received between sessions are
+    discarded, so a late reply/event can never leak into the next client.
+    """
+
+    def __init__(self, ext_in: BinaryIO) -> None:
+        self._ext_in = ext_in
+        self._lock = threading.Lock()
+        self._client_out: BinaryIO | None = None
+        self._session_closed: threading.Event | None = None
+        self.closed = threading.Event()
+        self._started = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        if not self._started:
+            self._started = True
+            self._thread.start()
+
+    def attach(self, client_out: BinaryIO, session_closed: threading.Event) -> None:
+        with self._lock:
+            self._client_out = client_out
+            self._session_closed = session_closed
+
+    def detach(self, client_out: BinaryIO) -> None:
+        with self._lock:
+            if self._client_out is client_out:
+                self._client_out = None
+                self._session_closed = None
+
+    def _run(self) -> None:
+        try:
+            while True:
+                try:
+                    frame = read_frame(self._ext_in)
+                except FrameError as exc:
+                    logger.warning("ext->client: dropping bad frame: %s", exc)
+                    break
+                if frame is None:
+                    logger.debug("ext->client: extension closed")
+                    break
+
+                with self._lock:
+                    client_out = self._client_out
+                    session_closed = self._session_closed
+                if client_out is None or session_closed is None:
+                    logger.debug("ext->client: dropping frame with no active client")
+                    continue
+                try:
+                    write_frame(client_out, frame, max_bytes=MAX_READ_BYTES)
+                except FrameError as exc:
+                    logger.warning("ext->client: dropping oversize frame: %s", exc)
+                except (OSError, ValueError) as exc:
+                    logger.debug("ext->client: write failed: %s", exc)
+                    session_closed.set()
+        except (OSError, ValueError) as exc:
+            logger.debug("ext->client: read failed: %s", exc)
+        finally:
+            self.closed.set()
+            with self._lock:
+                session_closed = self._session_closed
+            if session_closed is not None:
+                session_closed.set()
+
+
 def _serve_session(
-    ext_in: BinaryIO,
+    ext_relay: _ExtensionRelay,
     ext_out: BinaryIO,
     client_in: BinaryIO,
     client_out: BinaryIO,
     client_sock: socket.socket | None = None,
 ) -> None:
-    """Relay frames in both directions until either side closes.
+    """Relay one client session while the process-wide relay owns ``ext_in``.
 
-    Both directions run on their own *daemon* thread sharing a ``closed`` event;
-    the caller waits on that event and returns as soon as the **first** direction
-    ends — it never joins either pump. A pump spends most of its time blocked
-    inside a read where it cannot observe ``closed``, and there is no portable way
-    to abort the surviving pump's parked read:
-
-    * ext->client is parked reading the extension stdio pipe, which cannot be
-      ``shutdown`` at all.
-    * client->ext is parked in a socket ``recv()``; ``shutdown(SHUT_RDWR)`` aborts
-      that read on Linux but NOT on Winsock (where a parked recv only wakes when
-      the *peer* closes). We still issue the shutdown as a best-effort nudge.
-
-    Because neither parked read can be reliably aborted, joining would block the
-    caller until the surviving peer closes on its own — on Windows, the full
-    duration of every normal (extension-first) Chrome teardown, while a
-    long-lived client keeps client->ext parked. So we leave both pumps as
-    fire-and-forget daemons: ``closed`` is set, the host runs one session per
-    process and is exiting, each pump dies when its peer closes, and the loopback
-    port is freed immediately for the next host (no lingering owner).
-
-    ``client_sock`` may be None in tests that drive the pumps over plain file
-    objects; the daemon threads still let the call return promptly.
+    Only the client->extension direction gets a per-session reader thread.  A
+    process-wide :class:`_ExtensionRelay` is the sole reader of extension stdin
+    and is atomically attached/detached here.  This prevents a reader left from
+    an earlier client from stealing a reply intended for a later session.
     """
     closed = threading.Event()
+    ext_relay.attach(client_out, closed)
+    ext_relay.start()
     t_up = threading.Thread(
         target=_pump,
         args=(client_in, ext_out),
@@ -187,40 +241,21 @@ def _serve_session(
         },
         daemon=True,
     )
-    t_down = threading.Thread(
-        target=_pump,
-        args=(ext_in, client_out),
-        kwargs={
-            "name": "ext->client",
-            "on_close": closed,
-            # Writes go to the local client socket: no Chrome cap, so large
-            # extension replies relay intact. Capped at the client's own read
-            # guard rather than None: emitting a frame over MAX_READ_BYTES
-            # would make the client's read_frame raise and tear the session
-            # down, which is worse than dropping the one reply.
-            "max_write_bytes": MAX_READ_BYTES,
-        },
-        daemon=True,
-    )
     t_up.start()
-    t_down.start()
-    # Block until the first direction ends (each _pump sets `closed` on exit).
     closed.wait()
-    # Best-effort nudge for the client->ext pump if it is parked in a recv():
-    # this aborts the read on platforms where shutting the local end unblocks a
-    # parked recv (Linux), but NOT on Winsock, where a parked recv only wakes
-    # when the *peer* closes. We therefore do NOT join either pump: both are
-    # fire-and-forget daemons. `closed` is already set, the host runs one session
-    # per process (main() has no loop) and is on its way out, and each pump dies
-    # on its own when its peer closes. Joining here would block the full timeout
-    # on every normal (extension-first) Chrome teardown while a long-lived
-    # client peer keeps client->ext's recv parked — holding the loopback port the
-    # next host needs. Returning immediately frees it.
+    ext_relay.detach(client_out)
     if client_sock is not None:
         try:
             client_sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass  # already closed / never connected
+    # A per-session client reader must be gone before another client can be
+    # accepted; otherwise an old operation could reach the extension during
+    # the next session. Peer close/shutdown wakes this read on supported
+    # platforms. If it does not, fail closed instead of overlapping sessions.
+    t_up.join(timeout=1.0)
+    if t_up.is_alive():
+        raise RuntimeError("client reader did not stop; refusing a new session")
 
 
 def _run_echo(ext_in: BinaryIO, ext_out: BinaryIO) -> None:
@@ -248,12 +283,22 @@ def _run_echo(ext_in: BinaryIO, ext_out: BinaryIO) -> None:
             break
 
 
-def _accept_client(host: str, port: int) -> tuple[socket.socket, BinaryIO, BinaryIO]:
-    """Bind the loopback endpoint and block until the client connects.
+def _bind_listener(host: str, port: int) -> socket.socket:
+    """Bind once for the host lifetime, preserving the single-owner invariant."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind((host, port))
+    listener.listen(1)
+    listener.settimeout(0.2)
+    logger.info("bridge listening for clients on %s:%d", host, port)
+    return listener
+
+
+def _accept_client(listener: socket.socket) -> tuple[socket.socket, BinaryIO, BinaryIO]:
+    """Accept one client from an already-bound process-lifetime listener.
 
     Returns the accepted client socket plus its binary read/write file objects.
-    The listening socket is closed once the single client is accepted (one
-    client connection per host process; Chrome restarts the host per session).
+    The listener remains open so the same host can serve the next client after
+    this session ends. Sessions are still strictly sequential.
 
     We deliberately do NOT set ``SO_REUSEADDR``: this is an ephemeral,
     Chrome-spawned host with no restart-with-TIME_WAIT use case, and on Windows
@@ -263,14 +308,7 @@ def _accept_client(host: str, port: int) -> tuple[socket.socket, BinaryIO, Binar
     fails with ``EADDRINUSE`` and that host exits cleanly, leaving a single
     owner of the port and preserving the single-tab invariant.
     """
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind((host, port))
-    listener.listen(1)
-    logger.info("bridge listening for client on %s:%d", host, port)
-    try:
-        client, addr = listener.accept()
-    finally:
-        listener.close()
+    client, addr = listener.accept()
     logger.info("client connected from %s", addr)
     client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     rfile = client.makefile("rb")
@@ -307,20 +345,35 @@ def main(argv: list[str] | None = None) -> int:
 
     host, port = _client_endpoint()
     try:
-        client, client_in, client_out = _accept_client(host, port)
+        listener = _bind_listener(host, port)
     except OSError as exc:
         # EADDRINUSE: another host already owns the port — exit cleanly so a
-        # single host stays the owner (see _accept_client on SO_REUSEADDR).
+        # single host stays the owner (see _bind_listener on SO_REUSEADDR).
         logger.error("could not accept client connection on %s:%d: %s", host, port, exc)
         return 1
+    ext_relay = _ExtensionRelay(ext_in)
+    ext_relay.start()
     try:
-        _serve_session(ext_in, ext_out, client_in, client_out, client)
-    finally:
-        for closeable in (client_in, client_out, client):
+        while not ext_relay.closed.is_set():
             try:
-                closeable.close()
-            except OSError:
-                pass
+                client, client_in, client_out = _accept_client(listener)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if ext_relay.closed.is_set():
+                    break
+                logger.error("could not accept client connection: %s", exc)
+                return 1
+            try:
+                _serve_session(ext_relay, ext_out, client_in, client_out, client)
+            finally:
+                for closeable in (client_in, client_out, client):
+                    try:
+                        closeable.close()
+                    except OSError:
+                        pass
+    finally:
+        listener.close()
     return 0
 
 
