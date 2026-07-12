@@ -88,6 +88,7 @@ const KEEPALIVE_ALARM = "ka";
 // alone. The client side (ChromeBridge.reconnect) re-dials the loopback and
 // re-attaches the moment this brings the host back, so resume needs no human.
 const RECONNECT_ALARM = "reconnect";
+const RELAY_SESSION_ID_MARKER = "chrome-bridge-session";
 
 let port = null;
 // Single-flight guard for connect(): the promise of the dial currently in
@@ -98,6 +99,10 @@ let port = null;
 // onDisconnect used to null the healthy connection's global `port`.
 let connectPromise = null;
 let dbgTabId = null;
+// Generation injected into request ids by nmh.py. Events have no correlation
+// id, so carry this explicitly to prevent a late event from an old loopback
+// client session leaking into its successor.
+let relaySessionGeneration = null;
 // Host name of the identity that opened the current tab (set alongside
 // dbgTabId on a successful "open"; meaningful only while dbgTabId !== null).
 // Lets the profile-rename path detect a tab that predates the rename even
@@ -203,6 +208,13 @@ async function onPythonMessage(msg, fromPort) {
   // mid-op, re-check after the awaits below before mutating shared state (or,
   // in the attach path, roll back the op's own freshly created tab).
   if (port !== fromPort) return;
+  if (
+    Array.isArray(msg.id) &&
+    msg.id.length === 3 &&
+    msg.id[0] === RELAY_SESSION_ID_MARKER
+  ) {
+    relaySessionGeneration = msg.id[1];
+  }
   try {
     if (msg.op === "open") {
       // Enforce the single-tab invariant: tear down any prior tab so a re-open
@@ -288,7 +300,13 @@ async function closeTab() {
 // Relay raw CDP events from the attached tab back to Python.
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (port && source.tabId === dbgTabId) {
-    port.postMessage({ event: true, type: "cdp", method, params });
+    port.postMessage({
+      event: true,
+      type: "cdp",
+      method,
+      params,
+      sessionGeneration: relaySessionGeneration,
+    });
   }
 });
 
@@ -297,7 +315,13 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId === dbgTabId) {
     const tabId = dbgTabId;
     dbgTabId = null;
-    if (port) port.postMessage({ event: true, type: "detached", reason });
+    if (port)
+      port.postMessage({
+        event: true,
+        type: "detached",
+        reason,
+        sessionGeneration: relaySessionGeneration,
+      });
     // If the tab still exists (detach was NOT caused by tab closure — e.g. the
     // user opened DevTools), reap it so it doesn't linger as an orphan.
     chrome.tabs.remove(tabId).catch(() => {});
