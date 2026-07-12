@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 # reachable off-host (it can drive a real, logged-in browser tab).
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+_SESSION_ID_MARKER = "chrome-bridge-session"
 
 
 def _force_binary_stdio() -> tuple[BinaryIO, BinaryIO]:
@@ -89,6 +90,7 @@ def _pump(
     name: str,
     on_close: threading.Event,
     max_write_bytes: int | None = MAX_MESSAGE_BYTES,
+    session_generation: int | None = None,
 ) -> None:
     """Relay frames from ``src`` to ``dst`` until either side closes or errors.
 
@@ -116,6 +118,11 @@ def _pump(
             if frame is None:
                 logger.debug("%s: peer closed", name)
                 break
+            if session_generation is not None and "id" in frame:
+                frame = {
+                    **frame,
+                    "id": [_SESSION_ID_MARKER, session_generation, frame["id"]],
+                }
             try:
                 write_frame(dst, frame, max_bytes=max_write_bytes)
             except FrameError as exc:
@@ -158,6 +165,8 @@ class _ExtensionRelay:
         self._lock = threading.Lock()
         self._client_out: BinaryIO | None = None
         self._session_closed: threading.Event | None = None
+        self._generation = 0
+        self._active_generation: int | None = None
         self.closed = threading.Event()
         self._started = False
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -167,16 +176,21 @@ class _ExtensionRelay:
             self._started = True
             self._thread.start()
 
-    def attach(self, client_out: BinaryIO, session_closed: threading.Event) -> None:
+    def attach(self, client_out: BinaryIO, session_closed: threading.Event) -> int:
         with self._lock:
+            self._generation += 1
+            generation = self._generation
             self._client_out = client_out
             self._session_closed = session_closed
+            self._active_generation = generation
+            return generation
 
     def detach(self, client_out: BinaryIO) -> None:
         with self._lock:
             if self._client_out is client_out:
                 self._client_out = None
                 self._session_closed = None
+                self._active_generation = None
 
     def _run(self) -> None:
         try:
@@ -193,9 +207,21 @@ class _ExtensionRelay:
                 with self._lock:
                     client_out = self._client_out
                     session_closed = self._session_closed
+                    active_generation = self._active_generation
                 if client_out is None or session_closed is None:
                     logger.debug("ext->client: dropping frame with no active client")
                     continue
+                if "id" in frame:
+                    fenced_id = frame["id"]
+                    if not (
+                        isinstance(fenced_id, list)
+                        and len(fenced_id) == 3
+                        and fenced_id[0] == _SESSION_ID_MARKER
+                        and fenced_id[1] == active_generation
+                    ):
+                        logger.debug("ext->client: dropping stale or unfenced reply")
+                        continue
+                    frame = {**frame, "id": fenced_id[2]}
                 try:
                     write_frame(client_out, frame, max_bytes=MAX_READ_BYTES)
                 except FrameError as exc:
@@ -228,7 +254,7 @@ def _serve_session(
     an earlier client from stealing a reply intended for a later session.
     """
     closed = threading.Event()
-    ext_relay.attach(client_out, closed)
+    generation = ext_relay.attach(client_out, closed)
     ext_relay.start()
     t_up = threading.Thread(
         target=_pump,
@@ -238,6 +264,7 @@ def _serve_session(
             "on_close": closed,
             # Writes go to Chrome: enforce the 1 MB host->extension cap.
             "max_write_bytes": MAX_MESSAGE_BYTES,
+            "session_generation": generation,
         },
         daemon=True,
     )
