@@ -273,11 +273,30 @@ def nav(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: navigate the profile's tab to URL."""
+    """One-shot: navigate the active tab to URL, leaving the tab open."""
     h, p = _resolve_host_port(profile, host, port)
-    with ChromeBridge(host=h, port=p) as cdp:
-        cdp.navigate(url)
+    cdp = ChromeBridge(host=h, port=p)
+    try:
+        cdp.connect()
+        try:
+            cdp.attach()
+        except BridgeError as exc:
+            # The structured error code distinguishes an empty window. Any other
+            # attach failure (contention, restricted page) surfaces as-is —
+            # a fresh tab is opened only when there is no tab at all.
+            if exc.code != "no_active_tab":
+                raise
+            # Nothing to attach to at all: fall back to opening a fresh tab
+            # (open() itself navigates); detach() below still leaves it open.
+            cdp.open(url)
+        else:
+            cdp.navigate(url)
         typer.echo(f"navigated to {url}")
+    except BridgeError as exc:
+        typer.echo(f"bridge error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        cdp.detach()  # leave the tab open on exit
 
 
 @app.command()
@@ -287,10 +306,15 @@ def html(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: print the outerHTML of the first element matching SELECTOR."""
+    """One-shot: print the active tab's outerHTML of the first SELECTOR match."""
     h, p = _resolve_host_port(profile, host, port)
-    with ChromeBridge(host=h, port=p) as cdp:
-        typer.echo(cdp.outer_html(selector))
+    try:
+        with ChromeBridge(host=h, port=p) as cdp:
+            cdp.attach()  # act on the active tab; exit detaches without closing it
+            typer.echo(cdp.outer_html(selector))
+    except BridgeError as exc:
+        typer.echo(f"bridge error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @app.command()
@@ -300,11 +324,16 @@ def click(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: click the first element matching SELECTOR."""
+    """One-shot: click the first SELECTOR match in the active tab."""
     h, p = _resolve_host_port(profile, host, port)
-    with ChromeBridge(host=h, port=p) as cdp:
-        cdp.click_selector(selector)
-        typer.echo(f"clicked {selector}")
+    try:
+        with ChromeBridge(host=h, port=p) as cdp:
+            cdp.attach()  # act on the active tab; exit detaches without closing it
+            cdp.click_selector(selector)
+            typer.echo(f"clicked {selector}")
+    except BridgeError as exc:
+        typer.echo(f"bridge error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @app.command()
@@ -315,13 +344,18 @@ def fill(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: fill SELECTOR's value with TEXT."""
+    """One-shot: fill SELECTOR's value with TEXT in the active tab."""
     h, p = _resolve_host_port(profile, host, port)
-    with ChromeBridge(host=h, port=p) as cdp:
-        ok = cdp.fill(selector, text)
-        typer.echo("filled" if ok else "no matching element")
-        if not ok:
-            raise typer.Exit(code=1)
+    try:
+        with ChromeBridge(host=h, port=p) as cdp:
+            cdp.attach()  # act on the active tab; exit detaches without closing it
+            ok = cdp.fill(selector, text)
+            typer.echo("filled" if ok else "no matching element")
+            if not ok:
+                raise typer.Exit(code=1)
+    except BridgeError as exc:
+        typer.echo(f"bridge error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @app.command(name="eval")
@@ -331,12 +365,17 @@ def eval_(
     host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """One-shot: evaluate a JS EXPRESSION in the page and print the result."""
+    """One-shot: evaluate a JS EXPRESSION in the active tab and print the result."""
     h, p = _resolve_host_port(profile, host, port)
-    with ChromeBridge(host=h, port=p) as cdp:
-        value = cdp._evaluate(expression)
-        typer.echo(value)
+    try:
+        with ChromeBridge(host=h, port=p) as cdp:
+            cdp.attach()  # act on the active tab; exit detaches without closing it
+            typer.echo(cdp.evaluate(expression))
+    except BridgeError as exc:
+        typer.echo(f"bridge error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 if __name__ == "__main__":
     app()
+
