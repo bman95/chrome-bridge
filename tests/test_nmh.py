@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import socket
+import stat
 import struct
 import threading
 import time
@@ -417,7 +419,8 @@ def test_main_returns_1_on_bind_collision(monkeypatch):
         holder.close()
 
 
-def test_main_serves_two_sequential_clients_and_exits_on_extension_eof(monkeypatch):
+def test_main_serves_two_sequential_clients_and_exits_on_extension_eof(monkeypatch, tmp_path):
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
     host, port = "127.0.0.1", _free_port()
     ext_peer, ext_host = _make_socketpair()
     ext_in = ext_host.makefile("rb")
@@ -426,17 +429,23 @@ def test_main_serves_two_sequential_clients_and_exits_on_extension_eof(monkeypat
     ext_peer_w = ext_peer.makefile("wb")
     monkeypatch.setenv("CBR_BRIDGE_HOST", host)
     monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.delenv("CBR_BRIDGE_PROFILE", raising=False)
     monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
 
     result: list[int] = []
     server = threading.Thread(target=lambda: result.append(nmh.main([])), daemon=True)
     server.start()
 
+    token_file = tmp_path / f"token-port.{port}.txt"
+    assert _wait_for(token_file.exists), "host never wrote its token file"
+    token = token_file.read_text(encoding="utf-8")
+
     for request_id in (1, 2):
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         _connect_with_retry(client, (host, port))
         client_r = client.makefile("rb")
         client_w = client.makefile("wb")
+        write_frame(client_w, {"auth": token})
         write_frame(client_w, {"id": request_id, "op": "cdp"})
         wire_request = read_frame(ext_peer_r)
         assert wire_request["id"][:2] == [nmh._SESSION_ID_MARKER, request_id]
@@ -459,13 +468,15 @@ def test_main_serves_two_sequential_clients_and_exits_on_extension_eof(monkeypat
     ext_host.close()
 
 
-def test_main_exits_promptly_on_extension_eof_without_client(monkeypatch):
+def test_main_exits_promptly_on_extension_eof_without_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
     host, port = "127.0.0.1", _free_port()
     ext_peer, ext_host = _make_socketpair()
     ext_in = ext_host.makefile("rb")
     ext_out = ext_host.makefile("wb")
     monkeypatch.setenv("CBR_BRIDGE_HOST", host)
     monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.delenv("CBR_BRIDGE_PROFILE", raising=False)
     monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
 
     result: list[int] = []
@@ -479,7 +490,8 @@ def test_main_exits_promptly_on_extension_eof_without_client(monkeypatch):
     ext_host.close()
 
 
-def test_late_reply_from_previous_session_is_not_delivered_to_next_client(monkeypatch):
+def test_late_reply_from_previous_session_is_not_delivered_to_next_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
     host, port = "127.0.0.1", _free_port()
     ext_peer, ext_host = _make_socketpair()
     ext_in = ext_host.makefile("rb")
@@ -488,14 +500,20 @@ def test_late_reply_from_previous_session_is_not_delivered_to_next_client(monkey
     ext_peer_w = ext_peer.makefile("wb")
     monkeypatch.setenv("CBR_BRIDGE_HOST", host)
     monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.delenv("CBR_BRIDGE_PROFILE", raising=False)
     monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
 
     server = threading.Thread(target=lambda: nmh.main([]), daemon=True)
     server.start()
 
+    token_file = tmp_path / f"token-port.{port}.txt"
+    assert _wait_for(token_file.exists), "host never wrote its token file"
+    token = token_file.read_text(encoding="utf-8")
+
     first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     _connect_with_retry(first, (host, port))
     first_w = first.makefile("wb")
+    write_frame(first_w, {"auth": token})
     write_frame(first_w, {"id": 1, "op": "cdp", "session": "old"})
     old_wire_request = read_frame(ext_peer_r)
     first.shutdown(socket.SHUT_RDWR)
@@ -506,6 +524,7 @@ def test_late_reply_from_previous_session_is_not_delivered_to_next_client(monkey
     _connect_with_retry(second, (host, port))
     second_r = second.makefile("rb")
     second_w = second.makefile("wb")
+    write_frame(second_w, {"auth": token})
     write_frame(second_w, {"id": 1, "op": "cdp", "session": "new"})
     new_wire_request = read_frame(ext_peer_r)
     assert old_wire_request["id"] != new_wire_request["id"]
@@ -559,3 +578,292 @@ def test_log_level_falls_back_to_info_on_garbage(monkeypatch):
 def test_log_level_honours_valid_value(monkeypatch):
     monkeypatch.setenv("CBR_LOG_LEVEL", "debug")
     assert nmh._log_level() == logging.DEBUG
+
+
+# --------------------------------------------------------------------------- #
+# Token file + auth handshake (issue #7)
+# --------------------------------------------------------------------------- #
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return bool(predicate())
+
+
+def test_token_path_uses_profile_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+    monkeypatch.setenv("CBR_BRIDGE_PROFILE", "work")
+    assert nmh._token_path() == tmp_path / "token-work.txt"
+
+
+def test_token_path_falls_back_to_port(monkeypatch, tmp_path):
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+    monkeypatch.delenv("CBR_BRIDGE_PROFILE", raising=False)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", "9001")
+    assert nmh._token_path() == tmp_path / "token-port.9001.txt"
+
+
+def test_write_token_creates_hex_secret_with_0600_perms(tmp_path):
+    path = tmp_path / "token-test.txt"
+    token = nmh._write_token(path)
+    assert path.read_text(encoding="utf-8") == token
+    assert len(token) == 64 and int(token, 16) >= 0  # 32 bytes, hex-encoded
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_write_token_tightens_perms_on_preexisting_loose_file(tmp_path):
+    # A stale token from a prior run may be world-readable; rewriting it must
+    # restore 0600 rather than inherit the loose mode.
+    path = tmp_path / "token-test.txt"
+    path.write_text("stale", encoding="utf-8")
+    if os.name == "posix":
+        os.chmod(path, 0o644)
+    nmh._write_token(path)
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_authenticate_client_accepts_correct_token():
+    client, server = _make_socketpair()
+    client_w = client.makefile("wb")
+    server_r = server.makefile("rb")
+    write_frame(client_w, {"auth": "s3cret-token"})
+    assert nmh._authenticate_client(server, server_r, "s3cret-token") is True
+    for s in (client, server):
+        s.close()
+
+
+def test_authenticate_client_rejects_wrong_token():
+    client, server = _make_socketpair()
+    client_w = client.makefile("wb")
+    server_r = server.makefile("rb")
+    write_frame(client_w, {"auth": "wrong"})
+    assert nmh._authenticate_client(server, server_r, "right") is False
+    for s in (client, server):
+        s.close()
+
+
+def test_authenticate_client_rejects_non_ascii_token_without_crashing():
+    # compare_digest(str, str) raises TypeError on non-ASCII input; a hostile
+    # client must get a clean rejection, never crash the accept loop.
+    client, server = _make_socketpair()
+    client_w = client.makefile("wb")
+    server_r = server.makefile("rb")
+    write_frame(client_w, {"auth": "señor-token"})
+    assert nmh._authenticate_client(server, server_r, "right") is False
+    for s in (client, server):
+        s.close()
+
+
+def test_authenticate_client_rejects_non_string_token():
+    client, server = _make_socketpair()
+    client_w = client.makefile("wb")
+    server_r = server.makefile("rb")
+    write_frame(client_w, {"auth": 12345})
+    assert nmh._authenticate_client(server, server_r, "right") is False
+    for s in (client, server):
+        s.close()
+
+
+def test_authenticate_client_rejects_non_auth_first_frame():
+    client, server = _make_socketpair()
+    client_w = client.makefile("wb")
+    server_r = server.makefile("rb")
+    write_frame(client_w, {"id": 1, "op": "cdp"})  # no "auth" key
+    assert nmh._authenticate_client(server, server_r, "tok") is False
+    for s in (client, server):
+        s.close()
+
+
+def test_authenticate_client_rejects_immediate_close():
+    client, server = _make_socketpair()
+    server_r = server.makefile("rb")
+    client.shutdown(socket.SHUT_RDWR)
+    client.close()
+    assert nmh._authenticate_client(server, server_r, "tok") is False
+    server.close()
+
+
+def test_authenticate_client_rejects_on_timeout():
+    # A client that connects but never sends the auth frame is dropped after the
+    # timeout rather than wedging the accept loop.
+    client, server = _make_socketpair()
+    server_r = server.makefile("rb")
+    started = time.monotonic()
+    assert nmh._authenticate_client(server, server_r, "tok", timeout=0.2) is False
+    assert time.monotonic() - started < 2.0
+    for s in (client, server):
+        s.close()
+
+
+def test_main_authenticates_correct_token_and_relays(monkeypatch, tmp_path):
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+    host, port = "127.0.0.1", _free_port()
+    ext_peer, ext_host = _make_socketpair()
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    ext_peer_r = ext_peer.makefile("rb")
+    ext_peer_w = ext_peer.makefile("wb")
+    monkeypatch.setenv("CBR_BRIDGE_HOST", host)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.setenv("CBR_BRIDGE_PROFILE", "test")
+    monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
+
+    server = threading.Thread(target=lambda: nmh.main([]), daemon=True)
+    server.start()
+
+    token_file = tmp_path / "token-test.txt"
+    assert _wait_for(token_file.exists), "host never wrote its token file"
+    token = token_file.read_text(encoding="utf-8")
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _connect_with_retry(client, (host, port))
+    client_r = client.makefile("rb")
+    client_w = client.makefile("wb")
+    write_frame(client_w, {"auth": token})
+    write_frame(client_w, {"id": 1, "op": "cdp"})
+    wire = read_frame(ext_peer_r)
+    assert wire["id"][:2] == [nmh._SESSION_ID_MARKER, 1]
+    assert wire["id"][2] == 1
+    assert wire["op"] == "cdp"
+    write_frame(ext_peer_w, {"id": wire["id"], "ok": True})
+    assert read_frame(client_r) == {"id": 1, "ok": True}
+    client.shutdown(socket.SHUT_RDWR)
+    client_r.close()
+    client_w.close()
+    client.close()
+
+    ext_peer.shutdown(socket.SHUT_WR)
+    server.join(timeout=5.0)
+    assert not server.is_alive()
+
+    ext_peer_r.close()
+    ext_peer_w.close()
+    ext_peer.close()
+    ext_host.close()
+
+
+def test_main_survives_unauthenticated_connect_and_close(monkeypatch, tmp_path):
+    # `chrome-bridge status` is a pure reachability probe: it connects and
+    # immediately closes without ever sending the token. The host must drop it
+    # and still serve the next (authenticated) client — never wedge.
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+    host, port = "127.0.0.1", _free_port()
+    ext_peer, ext_host = _make_socketpair()
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    ext_peer_r = ext_peer.makefile("rb")
+    ext_peer_w = ext_peer.makefile("wb")
+    monkeypatch.setenv("CBR_BRIDGE_HOST", host)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.setenv("CBR_BRIDGE_PROFILE", "test")
+    monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
+
+    server = threading.Thread(target=lambda: nmh.main([]), daemon=True)
+    server.start()
+
+    token_file = tmp_path / "token-test.txt"
+    assert _wait_for(token_file.exists)
+    token = token_file.read_text(encoding="utf-8")
+
+    # The status probe: connect, then close without sending anything.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _connect_with_retry(probe, (host, port))
+    probe.close()
+
+    # A real client right after is authenticated and served.
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _connect_with_retry(client, (host, port))
+    client_r = client.makefile("rb")
+    client_w = client.makefile("wb")
+    write_frame(client_w, {"auth": token})
+    write_frame(client_w, {"id": 1, "op": "cdp"})
+    wire = read_frame(ext_peer_r)
+    assert wire["id"][2] == 1
+    write_frame(ext_peer_w, {"id": wire["id"], "ok": True})
+    assert read_frame(client_r) == {"id": 1, "ok": True}
+    client.shutdown(socket.SHUT_RDWR)
+    client_r.close()
+    client_w.close()
+    client.close()
+
+    ext_peer.shutdown(socket.SHUT_WR)
+    server.join(timeout=5.0)
+    assert not server.is_alive()
+
+    ext_peer_r.close()
+    ext_peer_w.close()
+    ext_peer.close()
+    ext_host.close()
+
+
+def test_main_drops_wrong_token_then_serves_next_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+    host, port = "127.0.0.1", _free_port()
+    ext_peer, ext_host = _make_socketpair()
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    ext_peer_r = ext_peer.makefile("rb")
+    ext_peer_w = ext_peer.makefile("wb")
+    monkeypatch.setenv("CBR_BRIDGE_HOST", host)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.setenv("CBR_BRIDGE_PROFILE", "test")
+    monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (ext_in, ext_out))
+
+    server = threading.Thread(target=lambda: nmh.main([]), daemon=True)
+    server.start()
+
+    token_file = tmp_path / "token-test.txt"
+    assert _wait_for(token_file.exists)
+    token = token_file.read_text(encoding="utf-8")
+
+    # Bad client: wrong token, then an op that must NEVER reach the extension.
+    bad = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _connect_with_retry(bad, (host, port))
+    bad_r = bad.makefile("rb")
+    bad_w = bad.makefile("wb")
+    write_frame(bad_w, {"auth": "deadbeef"})
+    write_frame(bad_w, {"id": 99, "op": "cdp", "session": "bad"})
+    # The host drops it: no reply is ever sent — the connection just ends
+    # (clean EOF, or a reset if the pipelined second frame was still in the
+    # socket buffer when the host closed).
+    try:
+        assert read_frame(bad_r) is None
+    except OSError:
+        pass
+    bad_r.close()
+    bad_w.close()
+    bad.close()
+
+    # A good client with the right token is still served after the rejection.
+    good = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _connect_with_retry(good, (host, port))
+    good_r = good.makefile("rb")
+    good_w = good.makefile("wb")
+    write_frame(good_w, {"auth": token})
+    write_frame(good_w, {"id": 1, "op": "cdp", "session": "good"})
+    # The FIRST frame the extension ever sees is the GOOD client's op, proving
+    # the rejected client's frame was never relayed.
+    wire = read_frame(ext_peer_r)
+    assert wire["session"] == "good"
+    assert wire["id"][2] == 1
+    write_frame(ext_peer_w, {"id": wire["id"], "ok": True})
+    assert read_frame(good_r) == {"id": 1, "ok": True}
+    good.shutdown(socket.SHUT_RDWR)
+    good_r.close()
+    good_w.close()
+    good.close()
+
+    ext_peer.shutdown(socket.SHUT_WR)
+    server.join(timeout=5.0)
+    assert not server.is_alive()
+
+    ext_peer_r.close()
+    ext_peer_w.close()
+    ext_peer.close()
+    ext_host.close()

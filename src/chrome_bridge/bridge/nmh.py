@@ -18,6 +18,19 @@ dials into. Exactly one client connection is served at a time (the bridge
 drives a single Chrome tab; concurrent clients would interleave ops the
 single-tab model forbids — see the sw.js WIRE PROTOCOL note).
 
+Client authentication (client -> host only; the sw.js wire contract is
+unchanged)
+    Loopback is not a trust boundary on a shared machine — on WSL2 the Windows
+    host and Linux share ``127.0.0.1``, so any local process could race to
+    connect and pull cookies off the real profile. So on startup the host
+    writes a random ``0600`` token file (see ``chrome_bridge.profiles``), and
+    the **first frame** from every accepted client must be
+    ``{"auth": "<hex>"}`` matching that token. On a mismatch, a malformed
+    frame, or a read that stalls past a short timeout, the host closes that
+    client and loops back to accept — the extension side is never disturbed and
+    the auth frame is never relayed to the extension. On success the host sends
+    **no reply**; the relay simply starts.
+
 Each Chrome profile you want to script gets its **own** native host name and
 **own** port (see ``docs/multi-profile.md``): Chrome passes no profile-
 identifying information to the spawned host process, so the port a given
@@ -39,13 +52,16 @@ Run modes
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import socket
 import sys
 import threading
+from pathlib import Path
 from typing import BinaryIO
 
+from .. import profiles
 from .frames import MAX_MESSAGE_BYTES, MAX_READ_BYTES, FrameError, read_frame, write_frame
 
 logger = logging.getLogger(__name__)
@@ -55,6 +71,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 _SESSION_ID_MARKER = "chrome-bridge-session"
+
+# Seconds to wait for a client's first (auth) frame before dropping it. Short so
+# an unauthenticated connect-and-close (e.g. `chrome-bridge status`, or a local
+# process probing the port) can never wedge the accept loop.
+AUTH_TIMEOUT = 5.0
 
 
 def _force_binary_stdio() -> tuple[BinaryIO, BinaryIO]:
@@ -81,6 +102,94 @@ def _client_endpoint() -> tuple[str, int]:
     except ValueError:
         port = DEFAULT_PORT
     return host, port
+
+
+def _token_path() -> Path:
+    """Resolve where THIS host writes its auth token.
+
+    ``install.write_launcher`` bakes ``CBR_BRIDGE_PROFILE`` into the launcher, so
+    a Chrome-spawned host learns its profile name and writes the profile-named
+    token file the client resolves through the registry. A ``--host/--port``-only
+    host (no profile) falls back to a port-derived filename so those setups still
+    authenticate.
+    """
+    profile = os.getenv("CBR_BRIDGE_PROFILE")
+    if profile:
+        return profiles.token_path(profile)
+    _, port = _client_endpoint()
+    return profiles.port_token_path(port)
+
+
+def _write_token(path: Path) -> str:
+    """Generate a fresh random token and write it to ``path`` with ``0600`` perms.
+
+    The token is 32 bytes from ``os.urandom`` (hex-encoded, 64 chars). Called
+    only AFTER the listener bind succeeds, so a losing host in a bind race (a
+    normal MV3 respawn — see ``_accept_client`` on SO_REUSEADDR) exits before
+    ever touching the live owner's token. ``os.open`` with ``0o600`` plus an
+    explicit ``chmod`` (for a pre-existing, looser-permissioned file) keeps the
+    token unreadable by other local users on POSIX; on Windows ``chmod`` only
+    toggles the read-only bit, the platform's own limitation.
+    """
+    token = os.urandom(32).hex()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(token)
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:  # best-effort; e.g. a filesystem that ignores chmod
+        logger.debug("could not chmod token file %s: %s", path, exc)
+    return token
+
+
+def _authenticate_client(
+    client: socket.socket,
+    client_in: BinaryIO,
+    expected_token: str,
+    *,
+    timeout: float = AUTH_TIMEOUT,
+) -> bool:
+    """Consume and validate the client's first frame as the auth handshake.
+
+    Returns ``True`` iff that frame is ``{"auth": "<hex>"}`` matching
+    ``expected_token``. A mismatch, a malformed/non-object frame, a first frame
+    without a string ``auth``, an early close, or a read that stalls past
+    ``timeout`` all return ``False`` — the caller then closes the client and
+    loops back to accept, so the extension side is never disturbed and the auth
+    frame is never relayed. On success the host sends NO reply; the relay starts.
+
+    The first frame is read from ``client_in`` (the same buffered reader the
+    relay then uses), so any bytes the client pipelined after the auth frame are
+    preserved for the session.
+    """
+    client.settimeout(timeout)
+    try:
+        frame = read_frame(client_in)
+    except (FrameError, OSError, ValueError) as exc:
+        # OSError covers socket.timeout (slow/absent first frame) and a broken
+        # pipe; FrameError/ValueError a corrupt or non-JSON first frame.
+        logger.warning("auth: rejecting client (no valid first frame): %s", exc)
+        return False
+    finally:
+        # Restore blocking mode for the relay's per-op reads.
+        client.settimeout(None)
+    if not isinstance(frame, dict):
+        logger.warning("auth: rejecting client (closed before auth frame)")
+        return False
+    token = frame.get("auth")
+    # Compare as bytes: compare_digest on str raises TypeError for non-ASCII
+    # input, and a client-supplied token containing an unpaired surrogate can't
+    # even encode — both must reject, never crash the accept loop.
+    try:
+        supplied = token.encode("utf-8") if isinstance(token, str) else None
+    except UnicodeEncodeError:
+        supplied = None
+    if supplied is None or not hmac.compare_digest(supplied, expected_token.encode("utf-8")):
+        logger.warning("auth: rejecting client (token mismatch or malformed)")
+        return False
+    logger.info("auth: client authenticated")
+    return True
 
 
 def _pump(
@@ -384,6 +493,14 @@ def main(argv: list[str] | None = None) -> int:
         # single host stays the owner (see _bind_listener on SO_REUSEADDR).
         logger.error("could not accept client connection on %s:%d: %s", host, port, exc)
         return 1
+    # Only the port owner writes the token — AFTER a successful bind — so a
+    # losing host in a respawn race never clobbers the live owner's token.
+    try:
+        token = _write_token(_token_path())
+    except OSError as exc:
+        logger.error("could not write bridge auth token: %s", exc)
+        listener.close()
+        return 1
     ext_relay = _ExtensionRelay(ext_in)
     ext_relay.start()
     try:
@@ -398,6 +515,12 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("could not accept client connection: %s", exc)
                 return 1
             try:
+                # Drop any client that doesn't present the token first; the
+                # extension side is never touched and we loop back to accept.
+                # (timeout passed explicitly so the module constant is read at
+                # call time, not frozen into the default arg at import.)
+                if not _authenticate_client(client, client_in, token, timeout=AUTH_TIMEOUT):
+                    continue
                 _serve_session(ext_relay, ext_out, client_in, client_out, client)
             finally:
                 for closeable in (client_in, client_out, client):

@@ -112,8 +112,34 @@ Environment variables (all optional):
 |---|---|---|
 | `CBR_BRIDGE_HOST` | `127.0.0.1` | Loopback host the native host binds / a script dials |
 | `CBR_BRIDGE_PORT` | `8765` | Loopback port (each profile normally gets its own via `init`) |
+| `CBR_BRIDGE_PROFILE` | *(unset)* | Profile name the native host writes its auth token under (baked into each launcher by `init`; without it the host falls back to a port-derived token file) |
 | `CBR_LOG_LEVEL` | `INFO` | Log level for the native-messaging host (writes to stderr) |
 
 Profile-to-port mapping lives in `~/.config/chrome-bridge/profiles.json`,
 managed by `chrome-bridge init`/`profiles rm` — you shouldn't need to edit it
 by hand.
+
+## Security
+
+The bridge drives a **real, logged-in Chrome profile**, so its loopback socket
+is a direct path to that profile's cookies and pages. Loopback alone is not a
+trust boundary: any local process can dial `127.0.0.1:<port>` — and under
+WSL2 that includes **Windows-side processes**, because WSL2 shares localhost
+with the Windows host.
+
+The socket is therefore authenticated as a baseline. On every launch the
+native host writes a fresh random token (32 bytes from `os.urandom`,
+hex-encoded) to a `0600` file in `~/.config/chrome-bridge/`
+(`token-<profile>.txt`, or `token-port.<port>.txt` for `--host`/`--port`-only
+setups), and a client must present it as its **first frame** —
+`{"auth": "<hex>"}` — or the host drops that connection and keeps serving
+the next one. `ChromeBridge` reads the token and sends the handshake
+automatically; if the token file is missing or stale (e.g. the bridge was
+never started, or the host restarted), it raises an actionable error telling
+you to reload the extension so the host regenerates it. `chrome-bridge
+status` stays a pure reachability probe: it never needs the token, and its
+unauthenticated connect-and-close cannot wedge the host.
+
+The token gates same-user local processes; it does not (and cannot) protect
+against an attacker who can already read your files — they could read the
+token, and the Chrome profile itself. See `docs/design.md` (risk #3).

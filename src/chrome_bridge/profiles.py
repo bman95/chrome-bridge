@@ -95,6 +95,39 @@ def default_registry_path() -> Path:
     return Path.home() / ".config" / "chrome-bridge" / "profiles.json"
 
 
+def token_path(profile: str) -> Path:
+    """Absolute path to a named profile's ``0600`` auth-token file.
+
+    The host writes a fresh random token here on startup and the client reads it
+    to authenticate its first frame; the file lives beside the registry in
+    ``~/.config/chrome-bridge/``. Shared by host (writer) and client (reader).
+    """
+    return default_registry_path().parent / f"token-{profile}.txt"
+
+
+def port_token_path(port: int) -> Path:
+    """Auth-token path for a bridge identified only by port (no named profile).
+
+    Used by ``--host/--port``-only setups that never registered a profile. The
+    ``port.`` infix carries a ``.``, which :func:`validate_profile_name` forbids
+    in a profile name, so this filename can never collide with a
+    :func:`token_path` one.
+    """
+    return default_registry_path().parent / f"token-port.{port}.txt"
+
+
+def find_profile_by_port(port: int, path: Path | None = None) -> str | None:
+    """Name of a registered profile bound to ``port``, or ``None`` if none is.
+
+    Lets a host/port-only client resolve the profile-named token file the host
+    wrote (``chrome-bridge`` passes host+port even for ``--profile`` usage).
+    """
+    for name, cfg in list_profiles(path).items():
+        if _coerce_port(cfg.port) == port:
+            return name
+    return None
+
+
 def load_registry(path: Path | None = None) -> _Registry:
     """Load the profile registry, or an empty one if it doesn't exist yet."""
     p = path or default_registry_path()
