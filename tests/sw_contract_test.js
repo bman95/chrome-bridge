@@ -171,15 +171,23 @@ const tests = String.raw`
   // Exercise dial()'s real listener-level requestChain. A postMessage failure
   // makes the first handler reject; the chain must recover and process the
   // following request instead of remaining permanently rejected.
+  // KEEP THIS THE FINAL CASE: it permanently swaps the global port,
+  // storage.local.get, and connectNative — tab-op cases appended below it
+  // would misroute their replies into chainedReplies instead of replies.
+  // (No backticks in this template literal.)
   let receive;
-  let throwOnce = true;
+  // Throw on the first TWO postMessage calls: the first kills the try-path
+  // reply, the second kills onPythonMessage's own catch-path reply, so the
+  // handler's promise rejects and ONLY the listener-level chain .catch can
+  // recover delivery of the following request.
+  let throwsLeft = 2;
   const chainedReplies = [];
   const nativePort = {
     onMessage: { addListener: (fn) => { receive = fn; } },
     onDisconnect: { addListener: () => {} },
     postMessage: (msg) => {
-      if (throwOnce) {
-        throwOnce = false;
+      if (throwsLeft > 0) {
+        throwsLeft -= 1;
         throw new Error("simulated disconnected reply");
       }
       chainedReplies.push(msg);

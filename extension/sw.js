@@ -83,8 +83,10 @@
 //     replaces the reference: it tears down any existing bridge tab (removing
 //     it only if bridge-created), so callers cannot leak tabs by re-opening.
 //     "attach" secures the NEW attachment before that teardown, so a failed
-//     attach leaves the prior session intact. Callers
-//     (chrome_bridge.bridge.client) drive one tab.
+//     attach leaves the prior session intact. Exception: "attach" when the
+//     active tab IS the current bridge tab performs an ownership handover
+//     instead (owned -> false, generation transfer, no teardown) — the tab
+//     is kept. Callers (chrome_bridge.bridge.client) drive one tab.
 //   * `dbgTabOwned` records whether the current tab was bridge-created
 //     ("open") or merely attached ("attach"). Teardown — the "close" op and
 //     the onDetach reaper — removes the tab only when bridge-created; a user
@@ -320,7 +322,7 @@ async function onPythonMessage(msg, fromPort) {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (port !== fromPort) return;
       if (!tab || tab.id === undefined) {
-        // NOTE: the CLI's nav fallback matches this exact string
+        // NOTE: the CLI's nav fallback keys on the errorCode below
         // (src/chrome_bridge/cli.py) — keep it stable.
         reply(msg.id, {
           ok: false,
