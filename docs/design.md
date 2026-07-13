@@ -141,9 +141,10 @@ already carry.
    be `{"auth": "<hex>"}`. A wrong/malformed/missing first frame closes that
    client and the host loops back to accept (the extension side is never
    disturbed); on success no reply is sent — the relay just starts. This
-   authenticates same-user local processes cheaply; it is not a defense
-   against an attacker who can already read the user's files (they can read
-   the token — and the browser profile itself).
+   cheaply blocks processes that can reach the port but not the user's files
+   (other local users; Windows-side processes under WSL2); it is not a
+   defense against an attacker who can already read the user's files (they
+   can read the token — and the browser profile itself).
 
 ## References
 

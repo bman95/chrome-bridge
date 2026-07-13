@@ -142,10 +142,10 @@ class FakeBridge:
 
 
 @pytest.fixture
-def bridge(tmp_path, monkeypatch):
-    # Redirect the config dir so the token file (and any registry lookup) lands
-    # in a per-test tmp dir, never the real ~/.config/chrome-bridge.
-    monkeypatch.setattr(profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+def bridge():
+    # conftest.py's autouse fixture has already redirected the config dir to a
+    # per-test tmp dir, so FakeBridge's token write never touches the real
+    # ~/.config/chrome-bridge.
     b = FakeBridge()
     b.start()
     yield b
@@ -224,6 +224,47 @@ def test_connect_missing_token_raises_actionable_error(bridge):
     cdp = ChromeBridge(host=bridge.host, port=bridge.port)
     with pytest.raises(BridgeError, match="auth token"):
         cdp.connect()
+
+
+def test_connect_empty_token_raises_actionable_error(bridge):
+    # A zero-byte token file (e.g. interrupted host startup) is as unusable as
+    # a missing one and must surface the same actionable error.
+    profiles.port_token_path(bridge.port).write_text("", encoding="utf-8")
+    cdp = ChromeBridge(host=bridge.host, port=bridge.port)
+    with pytest.raises(BridgeError, match="empty"):
+        cdp.connect()
+
+
+def _wait_auth_frame(bridge: FakeBridge, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while bridge.auth_frame is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_connect_with_profile_reads_profile_token(bridge):
+    # A profile-constructed client must read token_path(<profile>) — the file
+    # the launcher-spawned host writes — not the port-derived fallback.
+    profiles.add_profile("personal", bridge.port)
+    token_file = profiles.token_path("personal")
+    token_file.write_text("profile-secret", encoding="utf-8")
+    cdp = ChromeBridge(profile="personal")
+    cdp.connect()
+    _wait_auth_frame(bridge)
+    cdp.close()
+    assert bridge.auth_frame == {"auth": "profile-secret"}
+
+
+def test_connect_host_port_resolves_registered_profile_token(bridge):
+    # The CLI resolves --profile to host+port before constructing the client
+    # (cli._resolve_host_port), so the host/port-only path must look the
+    # profile up by port in the registry and read ITS token file.
+    profiles.add_profile("personal", bridge.port)
+    profiles.token_path("personal").write_text("profile-secret", encoding="utf-8")
+    cdp = ChromeBridge(host=bridge.host, port=bridge.port)
+    cdp.connect()
+    _wait_auth_frame(bridge)
+    cdp.close()
+    assert bridge.auth_frame == {"auth": "profile-secret"}
 
 
 # --------------------------------------------------------------------------- #

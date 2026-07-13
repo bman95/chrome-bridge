@@ -140,6 +140,15 @@ you to reload the extension so the host regenerates it. `chrome-bridge
 status` stays a pure reachability probe: it never needs the token, and its
 unauthenticated connect-and-close cannot wedge the host.
 
-The token gates same-user local processes; it does not (and cannot) protect
-against an attacker who can already read your files — they could read the
-token, and the Chrome profile itself. See `docs/design.md` (risk #3).
+The token gates processes that can reach the port but **not your files** —
+other local users, and cross-boundary processes in the WSL2/Windows
+shared-loopback topology. It does not (and cannot) protect against an
+attacker who can already read your files: they could read the token, and the
+Chrome profile itself. On Windows the file's protection comes from your user
+profile directory's ACL rather than POSIX permissions (`chmod` only toggles
+the read-only bit there). Two practical notes: scripts must run where they
+can read `~/.config/chrome-bridge/` (the same account — and, under WSL, the
+same side of the WSL/Windows boundary — as the host), and a *wrong* token is
+answered with silence rather than an error (the host never replies to the
+handshake), surfacing as the connection dying on first use; reconnecting
+re-reads the fresh token. See `docs/design.md` (risk #3).

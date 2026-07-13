@@ -70,8 +70,8 @@ class _EchoBridgeServer:
 
 
 @pytest.fixture
-def echo_server(tmp_path, monkeypatch):
-    monkeypatch.setattr(profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+def echo_server():
+    # conftest.py's autouse fixture isolates the config dir before construction.
     s = _EchoBridgeServer()
     s.start()
     yield s

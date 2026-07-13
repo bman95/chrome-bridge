@@ -174,8 +174,8 @@ class ReconnectableBridge:
 
 
 @pytest.fixture
-def rbridge(tmp_path, monkeypatch):
-    monkeypatch.setattr(profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+def rbridge():
+    # conftest.py's autouse fixture isolates the config dir before construction.
     b = ReconnectableBridge()
     b.start()
     yield b

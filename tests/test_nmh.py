@@ -607,6 +607,26 @@ def test_token_path_falls_back_to_port(monkeypatch, tmp_path):
     assert nmh._token_path() == tmp_path / "token-port.9001.txt"
 
 
+def test_token_path_resolves_registered_profile_by_port(monkeypatch, tmp_path):
+    # A host launched with only CBR_BRIDGE_PORT on a REGISTERED port must write
+    # the profile-named token file — the same one the client resolves by port —
+    # not the port-derived fallback (host/client resolution symmetry).
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+    monkeypatch.delenv("CBR_BRIDGE_PROFILE", raising=False)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", "9001")
+    nmh.profiles.add_profile("personal", 9001)
+    assert nmh._token_path() == tmp_path / "token-personal.txt"
+
+
+def test_token_path_ignores_invalid_profile_env(monkeypatch, tmp_path):
+    # The port-derived filename's collision-freedom rests on the profile-name
+    # grammar; an env value that grammar forbids must be ignored, not honoured.
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: tmp_path / "profiles.json")
+    monkeypatch.setenv("CBR_BRIDGE_PROFILE", "port.9001")  # '.' is invalid
+    monkeypatch.setenv("CBR_BRIDGE_PORT", "9001")
+    assert nmh._token_path() == tmp_path / "token-port.9001.txt"
+
+
 def test_write_token_creates_hex_secret_with_0600_perms(tmp_path):
     path = tmp_path / "token-test.txt"
     token = nmh._write_token(path)
@@ -616,24 +636,29 @@ def test_write_token_creates_hex_secret_with_0600_perms(tmp_path):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
-def test_write_token_tightens_perms_on_preexisting_loose_file(tmp_path):
-    # A stale token from a prior run may be world-readable; rewriting it must
-    # restore 0600 rather than inherit the loose mode.
+def test_write_token_replaces_loose_preexisting_file_with_fresh_inode(tmp_path):
+    # A stale token from a prior run may be world-readable. The rewrite must
+    # end 0600 AND live on a brand-new inode: writing into the old (loose)
+    # inode would hand the fresh secret to any process already holding an fd
+    # to it, and chmod cannot revoke an open fd.
     path = tmp_path / "token-test.txt"
     path.write_text("stale", encoding="utf-8")
     if os.name == "posix":
         os.chmod(path, 0o644)
-    nmh._write_token(path)
+    old_ino = path.stat().st_ino
+    token = nmh._write_token(path)
+    assert path.read_text(encoding="utf-8") == token
     if os.name == "posix":
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        st = path.stat()
+        assert stat.S_IMODE(st.st_mode) == 0o600
+        assert st.st_ino != old_ino, "token was written into the old loose inode"
 
 
 def test_authenticate_client_accepts_correct_token():
     client, server = _make_socketpair()
     client_w = client.makefile("wb")
-    server_r = server.makefile("rb")
     write_frame(client_w, {"auth": "s3cret-token"})
-    assert nmh._authenticate_client(server, server_r, "s3cret-token") is True
+    assert nmh._authenticate_client(server, "s3cret-token") is True
     for s in (client, server):
         s.close()
 
@@ -641,9 +666,8 @@ def test_authenticate_client_accepts_correct_token():
 def test_authenticate_client_rejects_wrong_token():
     client, server = _make_socketpair()
     client_w = client.makefile("wb")
-    server_r = server.makefile("rb")
     write_frame(client_w, {"auth": "wrong"})
-    assert nmh._authenticate_client(server, server_r, "right") is False
+    assert nmh._authenticate_client(server, "right") is False
     for s in (client, server):
         s.close()
 
@@ -653,9 +677,8 @@ def test_authenticate_client_rejects_non_ascii_token_without_crashing():
     # client must get a clean rejection, never crash the accept loop.
     client, server = _make_socketpair()
     client_w = client.makefile("wb")
-    server_r = server.makefile("rb")
     write_frame(client_w, {"auth": "señor-token"})
-    assert nmh._authenticate_client(server, server_r, "right") is False
+    assert nmh._authenticate_client(server, "right") is False
     for s in (client, server):
         s.close()
 
@@ -663,9 +686,8 @@ def test_authenticate_client_rejects_non_ascii_token_without_crashing():
 def test_authenticate_client_rejects_non_string_token():
     client, server = _make_socketpair()
     client_w = client.makefile("wb")
-    server_r = server.makefile("rb")
     write_frame(client_w, {"auth": 12345})
-    assert nmh._authenticate_client(server, server_r, "right") is False
+    assert nmh._authenticate_client(server, "right") is False
     for s in (client, server):
         s.close()
 
@@ -673,19 +695,17 @@ def test_authenticate_client_rejects_non_string_token():
 def test_authenticate_client_rejects_non_auth_first_frame():
     client, server = _make_socketpair()
     client_w = client.makefile("wb")
-    server_r = server.makefile("rb")
     write_frame(client_w, {"id": 1, "op": "cdp"})  # no "auth" key
-    assert nmh._authenticate_client(server, server_r, "tok") is False
+    assert nmh._authenticate_client(server, "tok") is False
     for s in (client, server):
         s.close()
 
 
 def test_authenticate_client_rejects_immediate_close():
     client, server = _make_socketpair()
-    server_r = server.makefile("rb")
     client.shutdown(socket.SHUT_RDWR)
     client.close()
-    assert nmh._authenticate_client(server, server_r, "tok") is False
+    assert nmh._authenticate_client(server, "tok") is False
     server.close()
 
 
@@ -693,12 +713,72 @@ def test_authenticate_client_rejects_on_timeout():
     # A client that connects but never sends the auth frame is dropped after the
     # timeout rather than wedging the accept loop.
     client, server = _make_socketpair()
-    server_r = server.makefile("rb")
     started = time.monotonic()
-    assert nmh._authenticate_client(server, server_r, "tok", timeout=0.2) is False
+    assert nmh._authenticate_client(server, "tok", timeout=0.2) is False
     assert time.monotonic() - started < 2.0
     for s in (client, server):
         s.close()
+
+
+def test_authenticate_client_bounds_total_handshake_time_against_drip():
+    # A hostile client dribbling one byte per interval must NOT reset the clock:
+    # the whole handshake is bounded by a wall-clock deadline. A plain per-recv
+    # settimeout would let this drip hold the single accept loop open forever.
+    client, server = _make_socketpair()
+    stop = threading.Event()
+
+    def dripper():
+        try:
+            # Claim a plausible frame size, then feed body bytes one at a time,
+            # each well inside the per-recv window.
+            client.sendall(struct.pack("<I", 512))
+            for _ in range(40):
+                if stop.is_set():
+                    break
+                client.sendall(b"x")
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    t = threading.Thread(target=dripper, daemon=True)
+    t.start()
+    started = time.monotonic()
+    ok = nmh._authenticate_client(server, "tok", timeout=0.4)
+    elapsed = time.monotonic() - started
+    stop.set()
+    assert ok is False
+    assert elapsed < 1.5, f"handshake not deadline-bounded: {elapsed:.2f}s"
+    for s in (client, server):
+        s.close()
+    t.join(timeout=5.0)
+
+
+def test_authenticate_client_rejects_oversize_auth_frame_on_prefix():
+    # A first frame bigger than the auth cap is rejected on the length prefix
+    # alone — no body byte is read, so a huge declared length cannot stall or
+    # balloon the handshake.
+    client, server = _make_socketpair()
+    client.sendall(struct.pack("<I", nmh.MAX_AUTH_FRAME_BYTES + 1))
+    started = time.monotonic()
+    assert nmh._authenticate_client(server, "tok", timeout=5.0) is False
+    assert time.monotonic() - started < 1.0
+    for s in (client, server):
+        s.close()
+
+
+def test_main_returns_1_when_token_write_fails(monkeypatch):
+    # An unwritable token means an unauthenticatable bridge; the host must exit
+    # cleanly (like a bind failure) rather than serve unauthenticated.
+    host, port = "127.0.0.1", _free_port()
+    monkeypatch.setenv("CBR_BRIDGE_HOST", host)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", str(port))
+    monkeypatch.setattr(nmh, "_force_binary_stdio", lambda: (io.BytesIO(), io.BytesIO()))
+
+    def failing_write(path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(nmh, "_write_token", failing_write)
+    assert nmh.main([]) == 1
 
 
 def test_main_authenticates_correct_token_and_relays(monkeypatch, tmp_path):

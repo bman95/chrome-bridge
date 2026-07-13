@@ -53,16 +53,26 @@ Run modes
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 import socket
+import struct
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import BinaryIO
 
 from .. import profiles
-from .frames import MAX_MESSAGE_BYTES, MAX_READ_BYTES, FrameError, read_frame, write_frame
+from .frames import (
+    LENGTH_PREFIX_BYTES,
+    MAX_MESSAGE_BYTES,
+    MAX_READ_BYTES,
+    FrameError,
+    read_frame,
+    write_frame,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +82,14 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 _SESSION_ID_MARKER = "chrome-bridge-session"
 
-# Seconds to wait for a client's first (auth) frame before dropping it. Short so
-# an unauthenticated connect-and-close (e.g. `chrome-bridge status`, or a local
-# process probing the port) can never wedge the accept loop.
+# Wall-clock budget for a client's whole auth handshake (its first frame). Short
+# so an unauthenticated connect-and-close (e.g. `chrome-bridge status`, or a
+# local process probing the port) can never wedge the accept loop.
 AUTH_TIMEOUT = 5.0
+# Hard cap on the auth frame size. A legitimate frame is ~80 bytes
+# ({"auth": "<64 hex chars>"}); anything bigger is an attack or a confusion and
+# is rejected on the length prefix alone, before any body byte is read.
+MAX_AUTH_FRAME_BYTES = 1024
 
 
 def _force_binary_stdio() -> tuple[BinaryIO, BinaryIO]:
@@ -107,16 +121,36 @@ def _client_endpoint() -> tuple[str, int]:
 def _token_path() -> Path:
     """Resolve where THIS host writes its auth token.
 
-    ``install.write_launcher`` bakes ``CBR_BRIDGE_PROFILE`` into the launcher, so
-    a Chrome-spawned host learns its profile name and writes the profile-named
-    token file the client resolves through the registry. A ``--host/--port``-only
-    host (no profile) falls back to a port-derived filename so those setups still
-    authenticate.
+    Resolution mirrors the client's (``client.ChromeBridge._read_token``) so
+    both sides always land on the same file: the ``CBR_BRIDGE_PROFILE`` env var
+    wins (``install.write_launcher`` bakes it into the launcher); otherwise a
+    profile registered on this port; otherwise the port-derived filename, so
+    ``--host/--port``-only setups still authenticate.
+
+    An invalid env value is ignored (with a warning) rather than honoured: the
+    profile-name grammar is what guarantees the port-derived filename can never
+    collide (see ``profiles.port_token_path``). A corrupt registry likewise
+    degrades to the port-derived file instead of crashing a Chrome-spawned host
+    whose only failure symptom would be connectNative silently dropping.
     """
     profile = os.getenv("CBR_BRIDGE_PROFILE")
     if profile:
-        return profiles.token_path(profile)
+        try:
+            profiles.validate_profile_name(profile)
+        except profiles.ProfileError:
+            logger.warning(
+                "ignoring invalid CBR_BRIDGE_PROFILE %r; using a port-derived token file",
+                profile,
+            )
+        else:
+            return profiles.token_path(profile)
     _, port = _client_endpoint()
+    try:
+        name = profiles.find_profile_by_port(port)
+    except (OSError, ValueError):
+        name = None
+    if name is not None:
+        return profiles.token_path(name)
     return profiles.port_token_path(port)
 
 
@@ -126,26 +160,57 @@ def _write_token(path: Path) -> str:
     The token is 32 bytes from ``os.urandom`` (hex-encoded, 64 chars). Called
     only AFTER the listener bind succeeds, so a losing host in a bind race (a
     normal MV3 respawn — see ``_accept_client`` on SO_REUSEADDR) exits before
-    ever touching the live owner's token. ``os.open`` with ``0o600`` plus an
-    explicit ``chmod`` (for a pre-existing, looser-permissioned file) keeps the
-    token unreadable by other local users on POSIX; on Windows ``chmod`` only
-    toggles the read-only bit, the platform's own limitation.
+    ever touching the live owner's token.
+
+    The secret is written to a fresh ``O_EXCL``-created ``0600`` temp inode and
+    atomically ``os.replace``d into place. Never reusing a pre-existing inode
+    matters twice over: a stale token file with looser permissions must not
+    receive the new secret (``O_TRUNC`` would write into the loose inode, and a
+    process already holding an fd to it would read every future token), and a
+    client re-reading the token mid-rotation must never observe a truncated or
+    empty file. On Windows ``chmod`` only toggles the read-only bit; there the
+    config directory's own ACL is the protection (see the README security
+    section).
     """
     token = os.urandom(32).hex()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)  # leftover from a crashed prior run
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(token)
     try:
-        os.chmod(path, 0o600)
+        os.chmod(tmp, 0o600)  # belt-and-braces against an odd umask
     except OSError as exc:  # best-effort; e.g. a filesystem that ignores chmod
-        logger.debug("could not chmod token file %s: %s", path, exc)
+        logger.debug("could not chmod token file %s: %s", tmp, exc)
+    os.replace(tmp, path)
     return token
+
+
+def _recv_exact(client: socket.socket, n: int, deadline: float) -> bytes | None:
+    """Read exactly ``n`` bytes off the raw socket before a wall-clock deadline.
+
+    Returns ``None`` if the peer closes first. Raises ``socket.timeout`` (an
+    ``OSError``) once ``deadline`` passes. The per-``recv`` timeout is re-armed
+    with the *remaining* budget on every iteration, so a client dribbling one
+    byte per interval cannot keep resetting the clock — a plain ``settimeout``
+    is an idle limit per ``recv``, not a bound on the whole read.
+    """
+    buf = bytearray()
+    while len(buf) < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("auth handshake deadline expired")
+        client.settimeout(remaining)
+        chunk = client.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 def _authenticate_client(
     client: socket.socket,
-    client_in: BinaryIO,
     expected_token: str,
     *,
     timeout: float = AUTH_TIMEOUT,
@@ -154,28 +219,49 @@ def _authenticate_client(
 
     Returns ``True`` iff that frame is ``{"auth": "<hex>"}`` matching
     ``expected_token``. A mismatch, a malformed/non-object frame, a first frame
-    without a string ``auth``, an early close, or a read that stalls past
-    ``timeout`` all return ``False`` — the caller then closes the client and
-    loops back to accept, so the extension side is never disturbed and the auth
-    frame is never relayed. On success the host sends NO reply; the relay starts.
+    without a string ``auth``, an oversize length prefix, an early close, or a
+    handshake that outlasts ``timeout`` all return ``False`` — the caller then
+    closes the client and loops back to accept, so the extension side is never
+    disturbed and the auth frame is never relayed. On success the host sends NO
+    reply; the relay starts.
 
-    The first frame is read from ``client_in`` (the same buffered reader the
-    relay then uses), so any bytes the client pipelined after the auth frame are
-    preserved for the session.
+    The whole handshake is bounded by one wall-clock deadline enforced in
+    :func:`_recv_exact` — this host authenticates on its single accept thread,
+    so a slow-dripping client must not be able to hold it open indefinitely.
+    The frame is read raw off the socket, consuming exactly the frame's bytes:
+    anything the client pipelined after it is untouched and reaches the relay's
+    buffered reader (which has not read anything yet) intact.
     """
-    client.settimeout(timeout)
+    deadline = time.monotonic() + timeout
     try:
-        frame = read_frame(client_in)
-    except (FrameError, OSError, ValueError) as exc:
-        # OSError covers socket.timeout (slow/absent first frame) and a broken
-        # pipe; FrameError/ValueError a corrupt or non-JSON first frame.
+        header = _recv_exact(client, LENGTH_PREFIX_BYTES, deadline)
+        if header is None:
+            logger.warning("auth: rejecting client (closed before auth frame)")
+            return False
+        (length,) = struct.unpack("<I", header)
+        if length > MAX_AUTH_FRAME_BYTES:
+            logger.warning(
+                "auth: rejecting client (first frame of %d bytes exceeds the "
+                "%d-byte auth cap)",
+                length,
+                MAX_AUTH_FRAME_BYTES,
+            )
+            return False
+        body = _recv_exact(client, length, deadline)
+        if body is None:
+            logger.warning("auth: rejecting client (closed mid auth frame)")
+            return False
+        frame = json.loads(body.decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        # OSError covers the handshake deadline (socket.timeout) and a broken
+        # pipe; ValueError covers undecodable bytes / invalid JSON.
         logger.warning("auth: rejecting client (no valid first frame): %s", exc)
         return False
     finally:
         # Restore blocking mode for the relay's per-op reads.
         client.settimeout(None)
     if not isinstance(frame, dict):
-        logger.warning("auth: rejecting client (closed before auth frame)")
+        logger.warning("auth: rejecting client (first frame is not an object)")
         return False
     token = frame.get("auth")
     # Compare as bytes: compare_digest on str raises TypeError for non-ASCII
@@ -519,7 +605,7 @@ def main(argv: list[str] | None = None) -> int:
                 # extension side is never touched and we loop back to accept.
                 # (timeout passed explicitly so the module constant is read at
                 # call time, not frozen into the default arg at import.)
-                if not _authenticate_client(client, client_in, token, timeout=AUTH_TIMEOUT):
+                if not _authenticate_client(client, token, timeout=AUTH_TIMEOUT):
                     continue
                 _serve_session(ext_relay, ext_out, client_in, client_out, client)
             finally:

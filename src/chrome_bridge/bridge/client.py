@@ -232,7 +232,11 @@ class ChromeBridge:
         the dial succeeds — a missing/stale token then surfaces as an actionable
         :class:`BridgeError` distinct from a plain "could not connect". The token
         is re-read on every (re)connect, so a host that rotated it on restart is
-        picked up transparently.
+        picked up transparently. One caveat: the host answers a WRONG token with
+        silence (by design it sends no auth reply either way), so a stale token
+        that still exists on disk surfaces not here but as the connection dying
+        on the first op ("bridge reader stopped") — reconnecting re-reads the
+        fresh token and heals it.
         """
         if self._sock is not None:
             return
@@ -320,7 +324,13 @@ class ChromeBridge:
         if self._profile is not None:
             path = _profiles.token_path(self._profile)
         else:
-            name = _profiles.find_profile_by_port(self._port)
+            try:
+                name = _profiles.find_profile_by_port(self._port)
+            except (OSError, ValueError):
+                # A corrupt/unreadable registry must degrade to the port-derived
+                # file (mirroring the host's resolution), not mask itself as an
+                # auth-handshake failure.
+                name = None
             path = (
                 _profiles.token_path(name)
                 if name is not None
