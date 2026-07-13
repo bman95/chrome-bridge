@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const path = require("node:path");
 
 const debuggerEvents = [];
 const debuggerDetaches = [];
@@ -47,7 +48,10 @@ global.chrome = {
   },
 };
 
-const source = fs.readFileSync("extension/sw.js", "utf8");
+const source = fs.readFileSync(
+  path.join(__dirname, "..", "extension", "sw.js"),
+  "utf8"
+);
 const tests = String.raw`
 (async () => {
   const replies = [];
@@ -162,6 +166,7 @@ const tests = String.raw`
   const midTeardown = replies.filter((m) => m.event && m.type === "detached").at(-1);
   assert.equal(midTeardown.reason, "target_closed");
   assert.equal(midTeardown.sessionGeneration, 11);
+  assert.equal(replies.at(-1).ok, false); // never ok:true for a dead session
 
   // Exercise dial()'s real listener-level requestChain. A postMessage failure
   // makes the first handler reject; the chain must recover and process the

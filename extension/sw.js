@@ -63,6 +63,10 @@
 //   { "id": <id>, "ok": true,  "result": <object> }  // reply to "cdp"
 //   { "id": <id>, "ok": true }                        // reply to "close"/"detach"
 //   { "id": <id>, "ok": false, "error": <string> }   // any op failed
+//       Failure replies MAY additionally carry a machine-readable
+//       "errorCode" where a caller must branch on the failure kind
+//       (today: "no_active_tab" from "attach", which the CLI's nav
+//       fallback keys on).
 //
 // Unsolicited events (no `id`; `event:true` discriminator):
 //
@@ -379,6 +383,13 @@ async function onPythonMessage(msg, fromPort) {
             /* already detached */
           }
         }
+        return;
+      }
+      if (dbgTabId !== tab.id || dbgTabSessionGeneration !== requestGeneration) {
+        // A mid-teardown onDetach for the just-attached tab already ended
+        // this session (the detached event was relayed above) — replying
+        // ok:true would claim a tab whose debugger is gone.
+        reply(msg.id, { ok: false, error: "debugger detached during attach" });
         return;
       }
       reply(msg.id, { ok: true, tabId: tab.id });
