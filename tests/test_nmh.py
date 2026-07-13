@@ -627,6 +627,18 @@ def test_token_path_ignores_invalid_profile_env(monkeypatch, tmp_path):
     assert nmh._token_path() == tmp_path / "token-port.9001.txt"
 
 
+def test_token_path_degrades_to_port_file_on_corrupt_registry(monkeypatch, tmp_path):
+    # A corrupt registry (parse OR shape) must degrade to the port-derived
+    # token file, never crash a Chrome-spawned host whose only failure symptom
+    # would be connectNative silently dropping.
+    registry = tmp_path / "profiles.json"
+    registry.write_text('{"profiles": {"personal": {}}}', encoding="utf-8")  # missing port
+    monkeypatch.setattr(nmh.profiles, "default_registry_path", lambda: registry)
+    monkeypatch.delenv("CBR_BRIDGE_PROFILE", raising=False)
+    monkeypatch.setenv("CBR_BRIDGE_PORT", "9001")
+    assert nmh._token_path() == tmp_path / "token-port.9001.txt"
+
+
 def test_write_token_creates_hex_secret_with_0600_perms(tmp_path):
     path = tmp_path / "token-test.txt"
     token = nmh._write_token(path)

@@ -129,18 +129,29 @@ def find_profile_by_port(port: int, path: Path | None = None) -> str | None:
 
 
 def load_registry(path: Path | None = None) -> _Registry:
-    """Load the profile registry, or an empty one if it doesn't exist yet."""
+    """Load the profile registry, or an empty one if it doesn't exist yet.
+
+    A registry that cannot be parsed OR has the wrong shape (hand-edited and
+    legacy files are part of this module's threat model — see ``_coerce_port``)
+    raises :class:`ProfileError`, never a raw ``json``/``TypeError``/
+    ``AttributeError``: callers that must degrade gracefully (the token-path
+    resolution in the host and client) catch one well-known error type.
+    """
     p = path or default_registry_path()
     if not p.exists():
         return _Registry()
-    data = json.loads(p.read_text(encoding="utf-8"))
-    # Ignore unknown keys so a registry written by an older version (which
-    # persisted now-removed fields such as ``chrome_user_data_dir``) still loads.
-    known = {f.name for f in fields(ProfileConfig)} - {"name"}
-    profiles = {
-        name: ProfileConfig(name=name, **{k: v for k, v in cfg.items() if k in known})
-        for name, cfg in data.get("profiles", {}).items()
-    }
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        # Ignore unknown keys so a registry written by an older version (which
+        # persisted now-removed fields such as ``chrome_user_data_dir``) still
+        # loads.
+        known = {f.name for f in fields(ProfileConfig)} - {"name"}
+        profiles = {
+            name: ProfileConfig(name=name, **{k: v for k, v in cfg.items() if k in known})
+            for name, cfg in data.get("profiles", {}).items()
+        }
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ProfileError(f"corrupt profile registry at {p}: {exc}") from exc
     return _Registry(profiles=profiles)
 
 

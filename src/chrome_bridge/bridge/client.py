@@ -64,7 +64,7 @@ import threading
 import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any
+from typing import Any, BinaryIO
 
 from .frames import FrameError, read_frame, write_frame
 
@@ -311,7 +311,7 @@ class ChromeBridge:
         log.debug("chrome-bridge connected to bridge at %s:%d", self._host, self._port)
 
     @staticmethod
-    def _abort_connect(sock: socket.socket, *files) -> None:
+    def _abort_connect(sock: socket.socket, *files: BinaryIO) -> None:
         """Close a half-open socket + its file objects after a failed handshake."""
         for f in files:
             try:

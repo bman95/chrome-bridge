@@ -250,3 +250,23 @@ def test_find_profile_by_port_matches_legacy_string_port(registry_path):
         json.dumps({"profiles": {"legacy": {"port": "8765"}}}), encoding="utf-8"
     )
     assert profiles.find_profile_by_port(8765, path=registry_path) == "legacy"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{not json",  # syntax corruption
+        "[1, 2, 3]",  # top-level non-object
+        '{"profiles": [1]}',  # profiles not a dict
+        '{"profiles": {"a": {}}}',  # entry missing port
+        '{"profiles": {"a": 5}}',  # entry not an object
+    ],
+)
+def test_load_registry_raises_profile_error_on_corrupt_registry(registry_path, payload):
+    # Hand-edited/legacy registries are part of this module's threat model:
+    # any parse OR shape failure must surface as one well-known ProfileError
+    # (a ValueError), never a raw json/TypeError/AttributeError — the host and
+    # client token-path resolvers rely on that to degrade instead of crash.
+    registry_path.write_text(payload, encoding="utf-8")
+    with pytest.raises(profiles.ProfileError, match="corrupt profile registry"):
+        profiles.load_registry(registry_path)

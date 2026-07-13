@@ -140,10 +140,10 @@ hex-encoded) to a `0600` file in `~/.config/chrome-bridge/`
 setups), and a client must present it as its **first frame** —
 `{"auth": "<hex>"}` — or the host drops that connection and keeps serving
 the next one. `ChromeBridge` reads the token and sends the handshake
-automatically; if the token file is missing or stale (e.g. the bridge was
-never started, or the host restarted), it raises an actionable error telling
-you to reload the extension so the host regenerates it. `chrome-bridge
-status` stays a pure reachability probe: it never needs the token, and its
+automatically; if the token file is missing or empty (e.g. the bridge was
+never started for this profile), it raises an actionable error telling you to
+reload the extension so the host regenerates it. `chrome-bridge status`
+stays a pure reachability probe: it never needs the token, and its
 unauthenticated connect-and-close cannot wedge the host.
 
 The token gates processes that can reach the port but **not your files** —

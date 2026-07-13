@@ -271,6 +271,20 @@ def test_connect_host_port_resolves_registered_profile_token(bridge):
     assert bridge.auth_frame == {"auth": "profile-secret"}
 
 
+def test_connect_degrades_to_port_token_on_corrupt_registry(bridge):
+    # A structurally-corrupt registry must not crash connect() (or leak the
+    # half-open socket): the by-port lookup degrades to the port-derived token
+    # file — the same one the host would write — and auth succeeds.
+    profiles.default_registry_path().write_text(
+        '{"profiles": {"x": {}}}', encoding="utf-8"  # entry missing port
+    )
+    cdp = ChromeBridge(host=bridge.host, port=bridge.port)
+    cdp.connect()
+    _wait_auth_frame(bridge)
+    cdp.close()
+    assert bridge.auth_frame == {"auth": bridge.token}
+
+
 # --------------------------------------------------------------------------- #
 # open / navigate
 # --------------------------------------------------------------------------- #

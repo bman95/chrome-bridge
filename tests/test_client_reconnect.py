@@ -87,12 +87,16 @@ class ReconnectableBridge:
 
     def _serve(self, client: socket.socket) -> None:
         rfile = client.makefile("rb")
-        # Consume the auth handshake the client sends first on this connection
-        # (the real host validates + swallows it and never relays it); the
-        # client re-sends it on every reconnect, so swallow it per connection.
+        # ENFORCE the auth handshake like the real host: the first frame on
+        # every connection must be this bridge's token, or the client gets no
+        # service (its ops would time out and the test fails loudly). This
+        # makes the reconnect tests prove the token is re-sent on every
+        # re-dial, not merely that some first frame was swallowed.
         try:
-            read_frame(rfile)
+            first = read_frame(rfile)
         except (OSError, ValueError):
+            return
+        if first != {"auth": self.token}:
             return
         try:
             while not self._stop.is_set():
