@@ -26,13 +26,17 @@
 //       remove it.
 //
 //   { "id": <id>, "op": "attach" }
-//       Attach to the ACTIVE tab in the current window — the page the user
-//       is looking at. Enforces the same single-tab invariant as "open"
-//       (tears down any prior bridge tab first). Fails (ok:false) when
-//       there is no active tab ("no active tab"), on attach contention
-//       (DevTools open), or on a restricted page (chrome:// etc.); the
-//       user's tab is never removed on failure. The tab is MERELY ATTACHED:
-//       "close" detaches but leaves it open.
+//       Attach to the ACTIVE tab — the page the user is looking at. A
+//       service worker has no window of its own, so "current window"
+//       resolves to this profile's LAST-FOCUSED Chrome window. Enforces the
+//       same single-tab invariant as "open": once the new attachment is
+//       secured, any prior bridge tab is torn down (removed only if
+//       bridge-created). Fails (ok:false) when there is no active tab
+//       ("no active tab", errorCode "no_active_tab"), on attach contention
+//       (DevTools open), or on a restricted page (chrome:// etc.); a failed
+//       attach leaves any prior session fully intact and never removes the
+//       user's tab. The tab is MERELY ATTACHED: "close" detaches but leaves
+//       it open.
 //
 //   { "id": <id>, "op": "cdp",   "method": <string>, "params": <object?> }
 //       chrome.debugger.sendCommand on the attached tab. `params` optional
@@ -72,9 +76,11 @@
 //
 // Contract notes:
 //   * Single attached tab at a time (`dbgTabId`). A second "open" or "attach"
-//     replaces the reference: it first tears down any existing bridge tab
-//     (removing it only if bridge-created), so callers cannot leak tabs by
-//     re-opening. Callers (chrome_bridge.bridge.client) drive one tab.
+//     replaces the reference: it tears down any existing bridge tab (removing
+//     it only if bridge-created), so callers cannot leak tabs by re-opening.
+//     "attach" secures the NEW attachment before that teardown, so a failed
+//     attach leaves the prior session intact. Callers
+//     (chrome_bridge.bridge.client) drive one tab.
 //   * `dbgTabOwned` records whether the current tab was bridge-created
 //     ("open") or merely attached ("attach"). Teardown — the "close" op and
 //     the onDetach reaper — removes the tab only when bridge-created; a user
@@ -303,9 +309,10 @@ async function onPythonMessage(msg, fromPort) {
       dbgTabOwned = true;
       reply(msg.id, { ok: true, tabId: dbgTabId });
     } else if (msg.op === "attach") {
-      // Query FIRST so a failed attach ("no active tab") does not destroy the
-      // prior session, and so removing a prior owned tab cannot shift which
-      // tab is active before we read it.
+      // Query FIRST so removing a prior owned tab cannot shift which tab is
+      // active before we read it. A service worker has no window of its own,
+      // so currentWindow resolves to this profile's LAST-FOCUSED window (see
+      // the contract block).
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (port !== fromPort) return;
       if (!tab || tab.id === undefined) {
@@ -328,13 +335,24 @@ async function onPythonMessage(msg, fromPort) {
         reply(msg.id, { ok: true, tabId: dbgTabId });
         return;
       }
-      // Single-tab invariant, same as "open": tear down any prior bridge tab
-      // (removed only if bridge-created) before attaching to the new one.
-      if (dbgTabId !== null) await closeTab();
-      if (port !== fromPort) return;
-      // If attach fails (contention, restricted chrome:// page, crash) the
-      // outer catch replies ok:false. The tab is the USER's — never remove it.
+      // Acquire before release: attach the NEW tab first, so a failed attach
+      // (contention, restricted chrome:// page, crash) leaves any prior
+      // session fully intact — the outer catch replies ok:false and the
+      // user's tab is never removed. chrome.debugger supports concurrent
+      // debuggees, so briefly holding both attachments is safe.
       await chrome.debugger.attach({ tabId: tab.id }, CDP_PROTOCOL_VERSION);
+      if (port !== fromPort) {
+        try {
+          await chrome.debugger.detach({ tabId: tab.id });
+        } catch (_) {
+          /* already detached */
+        }
+        return;
+      }
+      // Single-tab invariant, same as "open": with the new attachment
+      // secured, tear down any prior bridge tab (removed only if
+      // bridge-created).
+      if (dbgTabId !== null) await closeTab();
       if (port !== fromPort) {
         try {
           await chrome.debugger.detach({ tabId: tab.id });
@@ -375,6 +393,13 @@ async function onPythonMessage(msg, fromPort) {
       // the reference here matters as much as the detach itself: stale
       // dbgTabId/dbgTabOwned state would make the NEXT session's "attach"
       // teardown remove a tab a prior session promised to leave open.
+      if (dbgTabId === null) {
+        // Nothing attached: idempotent ok:true for ANY caller generation —
+        // there is no session state a stale client could clobber, and the
+        // contract promises this succeeds.
+        reply(msg.id, { ok: true });
+        return;
+      }
       if (requestGeneration !== dbgTabSessionGeneration) {
         reply(msg.id, { ok: false, error: "stale client session" });
         return;
@@ -384,12 +409,10 @@ async function onPythonMessage(msg, fromPort) {
       dbgTabOwned = false;
       dbgTabOwner = null;
       dbgTabSessionGeneration = null;
-      if (tabId !== null) {
-        try {
-          await chrome.debugger.detach({ tabId });
-        } catch (e) {
-          /* already detached */
-        }
+      try {
+        await chrome.debugger.detach({ tabId });
+      } catch (e) {
+        /* already detached */
       }
       reply(msg.id, { ok: true });
     } else {

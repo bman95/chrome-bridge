@@ -217,7 +217,10 @@ class ChromeBridge:
         self._current_url: str | None = None
         # True when the current tab was bridge-created (open()); False when the
         # bridge merely attached to the user's active tab (attach()). Mirrors
-        # sw.js's dbgTabOwned and gates detach()'s leave-the-tab-open exit.
+        # sw.js's dbgTabOwned — which is what actually gates tab removal
+        # server-side — and is kept client-side for introspection and tests;
+        # the close-vs-detach choice is the caller's, via which method it
+        # invokes.
         self._tab_owned = False
 
     # ------------------------------------------------------------------ #
@@ -682,7 +685,10 @@ class ChromeBridge:
         """Attach the debugger to the user's current active tab.
 
         The page the user is looking at becomes the bridge's tab, and ``Page``
-        events are enabled on it. Unlike :meth:`open`, the tab is NOT
+        events are enabled on it. "Active tab" means the active tab of the
+        profile's *last-focused* Chrome window (the extension's service worker
+        has no window of its own) — with several windows open, that is the one
+        most recently in the foreground. Unlike :meth:`open`, the tab is NOT
         bridge-created: :meth:`close` (and the context-manager exit) detaches
         but leaves it open, as does :meth:`detach`.
 
