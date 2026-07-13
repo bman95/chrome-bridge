@@ -123,5 +123,3 @@ Environment variables (all optional):
 Profile-to-port mapping lives in `~/.config/chrome-bridge/profiles.json`,
 managed by `chrome-bridge init`/`profiles rm` — you shouldn't need to edit it
 by hand.
-
-

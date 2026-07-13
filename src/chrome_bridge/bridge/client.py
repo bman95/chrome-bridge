@@ -1250,4 +1250,3 @@ class ChromeBridge:
             load_timeout = max(0.0, min(DEFAULT_REATTACH_TIMEOUT, timeout))
         log.info("chrome-bridge: re-attaching to %s after detach", self._current_url)
         self.open(self._current_url, timeout=load_timeout)
-

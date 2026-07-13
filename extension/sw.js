@@ -349,23 +349,39 @@ async function onPythonMessage(msg, fromPort) {
         }
         return;
       }
-      // Single-tab invariant, same as "open": with the new attachment
-      // secured, tear down any prior bridge tab (removed only if
-      // bridge-created).
-      if (dbgTabId !== null) await closeTab();
-      if (port !== fromPort) {
-        try {
-          await chrome.debugger.detach({ tabId: tab.id });
-        } catch (_) {
-          /* already detached */
-        }
-        return;
-      }
+      // Commit the new session BEFORE tearing down the prior tab: the
+      // teardown awaits below run the event loop, and an onDetach for the
+      // just-attached tab landing there must be recognized (it matches on
+      // dbgTabId), relayed under the new generation, and clear this state —
+      // a held-but-uncommitted attachment would silently swallow it and
+      // reply ok:true for a tab whose debugger is already gone.
+      const priorTabId = dbgTabId;
+      const priorOwned = dbgTabOwned;
       dbgTabId = tab.id;
       dbgTabOwned = false;
       dbgTabOwner = fromPort.bridgeHostName;
       dbgTabSessionGeneration = requestGeneration;
-      reply(msg.id, { ok: true, tabId: dbgTabId });
+      // Single-tab invariant, same as "open": tear down the prior bridge tab
+      // (removed only if bridge-created).
+      if (priorTabId !== null) await teardownTab(priorTabId, priorOwned);
+      if (port !== fromPort) {
+        // This session died mid-teardown. Roll back only what is still OURS:
+        // a successor may already have taken the state over (e.g. its own
+        // "attach" to this same active tab re-generations the session).
+        if (dbgTabId === tab.id && dbgTabSessionGeneration === requestGeneration) {
+          dbgTabId = null;
+          dbgTabOwned = false;
+          dbgTabOwner = null;
+          dbgTabSessionGeneration = null;
+          try {
+            await chrome.debugger.detach({ tabId: tab.id });
+          } catch (_) {
+            /* already detached */
+          }
+        }
+        return;
+      }
+      reply(msg.id, { ok: true, tabId: tab.id });
     } else if (msg.op === "cdp") {
       if (dbgTabId === null) {
         reply(msg.id, { ok: false, error: "no attached tab" });
@@ -431,9 +447,15 @@ async function closeTab() {
   dbgTabOwned = false;
   dbgTabOwner = null;
   if (tabId === null) return;
-  // Detach first, then remove (bridge-created tabs only — a user tab the
-  // bridge merely attached to stays open). Swallow per-step errors so a
-  // half-gone tab (e.g. already closed by the user) still fully tears down.
+  await teardownTab(tabId, owned);
+}
+
+// Detach first, then remove (bridge-created tabs only — a user tab the
+// bridge merely attached to stays open). Swallow per-step errors so a
+// half-gone tab (e.g. already closed by the user) still fully tears down.
+// Parameterized (not reading the globals) so the "attach" op can tear down
+// a PRIOR tab by captured values after already committing the new session.
+async function teardownTab(tabId, owned) {
   try {
     await chrome.debugger.detach({ tabId });
   } catch (e) {

@@ -138,6 +138,31 @@ const tests = String.raw`
   assert.equal(userDetach.sessionGeneration, 9);
   assert.equal(dbgTabId, null);
 
+  // An onDetach for the JUST-ATTACHED tab landing during the prior tab's
+  // teardown must be seen: the new session is committed before the teardown,
+  // so the event is relayed under the new generation and the reference is
+  // cleared — never a silent ok:true for an already-detached tab.
+  await onPythonMessage(
+    { id: id(10, 1), op: "open", url: "https://example.com/prior" },
+    fakePort
+  );
+  const priorTab = dbgTabId;
+  activeTab = { id: 92 };
+  const originalRemove = chrome.tabs.remove;
+  chrome.tabs.remove = async (tabId) => {
+    await originalRemove(tabId);
+    // The new tab's debugger detaches while the prior tab is being removed.
+    debuggerDetaches[0]({ tabId: 92 }, "target_closed");
+  };
+  await onPythonMessage({ id: id(11, 1), op: "attach" }, fakePort);
+  chrome.tabs.remove = originalRemove;
+  assert.ok(removed.includes(priorTab)); // prior owned tab torn down
+  assert.ok(!removed.includes(92)); // the user's tab is never removed
+  assert.equal(dbgTabId, null); // the mid-teardown detach was recognized
+  const midTeardown = replies.filter((m) => m.event && m.type === "detached").at(-1);
+  assert.equal(midTeardown.reason, "target_closed");
+  assert.equal(midTeardown.sessionGeneration, 11);
+
   // Exercise dial()'s real listener-level requestChain. A postMessage failure
   // makes the first handler reject; the chain must recover and process the
   // following request instead of remaining permanently rejected.
