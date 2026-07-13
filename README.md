@@ -118,7 +118,7 @@ Environment variables (all optional):
 |---|---|---|
 | `CBR_BRIDGE_HOST` | `127.0.0.1` | Loopback host the native host binds / a script dials |
 | `CBR_BRIDGE_PORT` | `8765` | Loopback port (each profile normally gets its own via `init`) |
-| `CBR_BRIDGE_PROFILE` | *(unset)* | Profile name the native host writes its auth token under (baked into each launcher by `init`; without it the host falls back to a port-derived token file) |
+| `CBR_BRIDGE_PROFILE` | *(unset)* | Profile name the native host writes its auth token under (baked into each launcher by `init`; without it the host falls back to the profile registered on its port, then to a port-derived token file) |
 | `CBR_LOG_LEVEL` | `INFO` | Log level for the native-messaging host (writes to stderr) |
 
 Profile-to-port mapping lives in `~/.config/chrome-bridge/profiles.json`,
