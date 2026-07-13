@@ -26,6 +26,9 @@ Responsibilities (the contract this module owns):
 
   - :meth:`ChromeBridge.open` / :meth:`ChromeBridge.navigate`  — open + ``Page.navigate`` +
     await ``Page.loadEventFired`` (the load wait is non-fatal — see below).
+  - :meth:`ChromeBridge.attach`                          — attach to the user's
+    current active tab instead of opening a fresh one; :meth:`ChromeBridge.close`
+    then detaches but leaves that tab open (the one-shot CLI path).
   - :meth:`ChromeBridge.wait_selector`                   — poll ``querySelector !== null``.
   - :meth:`ChromeBridge.outer_html`                      — read a subtree's
     ``outerHTML`` (not the whole document by default, to keep replies modest;
@@ -93,6 +96,10 @@ DEFAULT_CONTAINER_SELECTOR = "body"
 
 class BridgeError(RuntimeError):
     """The bridge transport failed (not connected, peer gone, or op error)."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class BridgeTimeoutError(BridgeError):
@@ -208,6 +215,13 @@ class ChromeBridge:
 
         self._tab_id: int | None = None
         self._current_url: str | None = None
+        # True when the current tab was bridge-created (open()); False when the
+        # bridge merely attached to the user's active tab (attach()). Mirrors
+        # sw.js's dbgTabOwned — which is what actually gates tab removal
+        # server-side — and is kept client-side for introspection and tests;
+        # the close-vs-detach choice is the caller's, via which method it
+        # invokes.
+        self._tab_owned = False
 
     # ------------------------------------------------------------------ #
     # Connection lifecycle
@@ -300,9 +314,12 @@ class ChromeBridge:
             self.open(self._current_url, timeout=DEFAULT_REATTACH_TIMEOUT)
 
     def close(self) -> None:
-        """Best-effort close the tab, then tear down the socket.
+        """Best-effort end the session, then tear down the socket.
 
-        Safe to call more than once and even if the tab was never opened.
+        Sends the ``close`` op: the extension detaches the debugger and
+        removes the tab only if it was bridge-created (:meth:`open`) — a user
+        tab joined via :meth:`attach` is detached but left open. Safe to call
+        more than once and even if no tab was ever opened/attached.
         """
         if self._sock is None:
             return
@@ -313,6 +330,29 @@ class ChromeBridge:
             except BridgeError as exc:
                 log.debug("chrome-bridge close op failed (ignored): %s", exc)
         self._tab_id = None
+        self._tab_owned = False
+        self._current_url = None
+        self._teardown_socket()
+
+    def detach(self) -> None:
+        """End the session, always leaving the tab open, then drop the socket.
+
+        Sends the ``detach`` op: the extension detaches the debugger and
+        clears its tab reference without removing the tab — even a
+        bridge-created one (:meth:`open`). This matters beyond politeness: a
+        stale server-side reference would make the *next* session's ``attach``
+        teardown remove a tab this session promised to leave open. Use
+        :meth:`close` when a bridge-created tab should be removed.
+        """
+        if self._sock is None:
+            return
+        if self._tab_id is not None and not self._closed.is_set():
+            try:
+                self._request({"op": "detach"}, timeout=self._op_timeout)
+            except BridgeError as exc:
+                log.debug("chrome-bridge detach op failed (ignored): %s", exc)
+        self._tab_id = None
+        self._tab_owned = False
         self._current_url = None
         self._teardown_socket()
 
@@ -468,6 +508,7 @@ class ChromeBridge:
             # in-flight op so it doesn't hang on a reply that will never arrive.
             self._detached.set()
             self._tab_id = None
+            self._tab_owned = False
             self._fail_all_pending(DetachedError(f"debugger detached: {reason}"))
             self._fire("__detached__", {"reason": reason})
             return
@@ -552,7 +593,8 @@ class ChromeBridge:
                 ) from exc
         if not reply.get("ok", False):
             raise BridgeError(
-                f"bridge op {payload.get('op')} failed: {reply.get('error', 'unknown')}"
+                f"bridge op {payload.get('op')} failed: {reply.get('error', 'unknown')}",
+                code=reply.get("errorCode"),
             )
         return reply
 
@@ -629,6 +671,7 @@ class ChromeBridge:
                     "bridge 'open' reply carried no tabId; cannot attach to the tab"
                 )
             self._tab_id = tab_id
+            self._tab_owned = True
             self._current_url = url
             self._cdp("Page.enable")
             # The page may already have loaded between open and Page.enable; in
@@ -637,6 +680,56 @@ class ChromeBridge:
             self._wait_load(loaded, timeout)
         finally:
             self.off_event("Page.loadEventFired", _on_load)
+
+    def attach(self, *, timeout: float | None = None) -> None:
+        """Attach the debugger to the user's current active tab.
+
+        The page the user is looking at becomes the bridge's tab, and ``Page``
+        events are enabled on it. "Active tab" means the active tab of the
+        profile's *last-focused* Chrome window (the extension's service worker
+        has no window of its own) — with several windows open, that is the one
+        most recently in the foreground. Unlike :meth:`open`, the tab is NOT
+        bridge-created: :meth:`close` (and the context-manager exit) detaches
+        but leaves it open, as does :meth:`detach`.
+
+        Re-attach semantics for the attach case: no URL is recorded, so if the
+        attached user tab goes away (an ``onDetach``), the next primitive
+        raises :class:`DetachedError` — the bridge never silently re-opens the
+        user's page in a fresh tab (re-creating a tab the user closed is never
+        wanted). A subsequent explicit :meth:`navigate` records its URL and
+        restores the usual re-attach behaviour for that script-requested page.
+
+        ``timeout`` caps the ``attach`` op round-trip (default: the per-op
+        timeout); the follow-up ``Page.enable`` uses the default per-op
+        timeout. Raises :class:`BridgeError` if there is no active tab, on
+        attach contention (DevTools open), or on a restricted page.
+        """
+        # Same rationale as open(): clear the detach flag BEFORE the request so
+        # a detach observed for the new tab during this attach survives.
+        self._detached.clear()
+        reply = self._request({"op": "attach"}, timeout=timeout)
+        tab_id = reply.get("tabId")
+        if tab_id is None:
+            raise BridgeError(
+                "bridge 'attach' reply carried no tabId; cannot attach to the tab"
+            )
+        self._tab_id = tab_id
+        self._tab_owned = False
+        # No URL bookkeeping: an attached user tab must never be silently
+        # re-opened after a detach (see docstring).
+        self._current_url = None
+        self._cdp("Page.enable")
+
+    def evaluate(self, expression: str, *, timeout: float | None = None) -> Any:
+        """Evaluate a JS ``expression`` in the page and return its value.
+
+        The public counterpart of the internal evaluate primitive: it first
+        ensures the session is attached (re-attaching idempotently where
+        possible), then runs ``Runtime.evaluate`` with ``returnByValue``.
+        Raises :class:`BridgeError` if the page threw.
+        """
+        self._ensure_attached()
+        return self._evaluate(expression, timeout=timeout)
 
     def navigate(self, url: str, *, timeout: float = DEFAULT_NAV_TIMEOUT) -> None:
         """Navigate the attached tab to ``url`` and await the load event.
@@ -1128,6 +1221,10 @@ class ChromeBridge:
         cannot blow past their own bound. It is clamped to a small ceiling
         (:data:`DEFAULT_REATTACH_TIMEOUT`) since the re-attach load event is
         non-fatal anyway — the caller's own readiness check is the real gate.
+
+        Sessions joined via :meth:`attach` record no URL, so a detach of the
+        user's tab surfaces here as :class:`DetachedError` — by design the
+        bridge never silently re-opens a user tab (see :meth:`attach`).
         """
         # A dead socket must be rebuilt first: reconnect() re-dials and (if a URL
         # was opened) re-attaches, so this returns ready. Without a URL there is
@@ -1137,7 +1234,7 @@ class ChromeBridge:
             if self._current_url is None:
                 raise BridgeError(
                     "bridge connection lost and no URL to re-attach to "
-                    "(call open/navigate first)"
+                    "(call open/navigate/attach first)"
                 )
             self.reconnect()
             return
@@ -1145,7 +1242,8 @@ class ChromeBridge:
             return
         if self._current_url is None:
             raise DetachedError(
-                "debugger detached and no URL to re-attach to (call open/navigate first)"
+                "debugger detached and no URL to re-attach to "
+                "(call open/navigate/attach first)"
             )
         load_timeout = DEFAULT_REATTACH_TIMEOUT
         if timeout is not None:

@@ -136,6 +136,10 @@ def _ok_open(tab_id: int = 7):
     return lambda frame: {"ok": True, "tabId": tab_id}
 
 
+def _ok_attach(tab_id: int = 9):
+    return lambda frame: {"ok": True, "tabId": tab_id}
+
+
 def _cdp_result(result: dict):
     return lambda frame: {"ok": True, "result": result}
 
@@ -627,6 +631,176 @@ def test_navigate_reopens_after_detach(bridge):
         # Re-opened a fresh tab rather than issuing Page.navigate on a dead one.
         assert open_calls["n"] == 2
         assert all(f.get("method") != "Page.navigate" for f in bridge.received)
+    finally:
+        cdp.close()
+
+
+# --------------------------------------------------------------------------- #
+# attach / detach — active-tab sessions (op "attach"; tab left open on exit)
+# --------------------------------------------------------------------------- #
+
+
+def test_attach_sends_attach_op_and_enables_page_events(bridge):
+    bridge.on("attach", _ok_attach(tab_id=13))
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        cdp.attach()
+        assert cdp._tab_id == 13
+        assert cdp._tab_owned is False
+        ops = [f.get("op") for f in bridge.received]
+        assert "attach" in ops
+        assert "open" not in ops
+        methods = [f.get("method") for f in bridge.received if f.get("op") == "cdp"]
+        assert "Page.enable" in methods
+    finally:
+        cdp.close()
+
+
+def test_attach_failure_surfaces_error(bridge):
+    bridge.on("attach", lambda f: {"ok": False, "error": "no active tab"})
+    cdp = _client(bridge)
+    try:
+        with pytest.raises(BridgeError, match="no active tab"):
+            cdp.attach()
+    finally:
+        cdp.close()
+
+
+def test_attach_reply_without_tabid_raises(bridge):
+    bridge.on("attach", lambda f: {"ok": True})
+    cdp = _client(bridge)
+    try:
+        with pytest.raises(BridgeError, match="no tabId"):
+            cdp.attach()
+    finally:
+        cdp.close()
+
+
+def test_close_after_attach_sends_close_op(bridge):
+    # close() on an attached session still sends the "close" op — the extension
+    # detaches and, because the tab is not bridge-created, leaves it open.
+    bridge.on("attach", _ok_attach())
+    bridge.set_default(_cdp_result({}))
+    with ChromeBridge(host=bridge.host, port=bridge.port) as cdp:
+        cdp.attach()
+    ops = [f.get("op") for f in bridge.received]
+    assert "attach" in ops
+    assert "close" in ops
+    assert "open" not in ops
+
+
+def test_attached_tab_detach_raises_without_reopen(bridge):
+    # If the user's attached tab goes away, the next primitive must surface
+    # DetachedError — NEVER silently re-open the user's page in a fresh tab.
+    bridge.on("attach", _ok_attach())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        cdp.attach()
+        bridge.send_event({"event": True, "type": "detached", "reason": "target_closed"})
+        deadline = time.monotonic() + 2
+        while not cdp._detached.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        with pytest.raises(DetachedError, match="no URL to re-attach"):
+            cdp.banner_present(".x")
+        assert all(f.get("op") != "open" for f in bridge.received)
+    finally:
+        cdp.close()
+
+
+def test_detach_on_attached_session_sends_detach_op(bridge):
+    bridge.on("attach", _ok_attach())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    cdp.attach()
+    cdp.detach()
+    ops = [f.get("op") for f in bridge.received]
+    assert "detach" in ops
+    assert "close" not in ops
+    assert not cdp.is_alive()
+
+
+def test_detach_on_owned_session_sends_detach_never_close(bridge):
+    # detach() must leave even a bridge-created tab open: it sends the
+    # "detach" op (detach + clear the server-side reference, never remove),
+    # NOT the "close" op which would remove a bridge-created tab. Clearing
+    # the reference matters: stale server state would make the next
+    # session's "attach" teardown remove this tab.
+    bridge.on("open", _ok_open())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    cdp.open("https://x", timeout=0.2)
+    cdp.detach()
+    ops = [f.get("op") for f in bridge.received]
+    assert "detach" in ops
+    assert "close" not in ops
+    assert not cdp.is_alive()
+
+
+def test_detach_without_tab_just_drops_socket(bridge):
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    cdp.detach()
+    assert bridge.received == []  # no tab: nothing to send
+    assert not cdp.is_alive()
+
+
+def test_attach_after_open_clears_reattach_url(bridge):
+    # attach() after a prior open() must drop the recorded URL: once the
+    # session rides a user tab, a detach must surface DetachedError, never
+    # silently re-open the stale bridge URL.
+    bridge.on("open", _ok_open())
+    bridge.on("attach", _ok_attach(tab_id=21))
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://x", timeout=0.2)
+        cdp.attach()
+        assert cdp._current_url is None
+        assert cdp._tab_owned is False
+        bridge.send_event({"event": True, "type": "detached", "reason": "gone"})
+        deadline = time.monotonic() + 2
+        while not cdp._detached.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        open_ops_before = sum(1 for f in bridge.received if f.get("op") == "open")
+        with pytest.raises(DetachedError, match="no URL to re-attach"):
+            cdp.banner_present(".x")
+        open_ops_after = sum(1 for f in bridge.received if f.get("op") == "open")
+        assert open_ops_after == open_ops_before  # no silent re-open
+    finally:
+        cdp.close()
+
+
+def test_navigate_after_attach_navigates_in_place(bridge):
+    # navigate() on an attached session must issue Page.navigate on the user's
+    # tab, not open a fresh bridge tab.
+    bridge.on("attach", _ok_attach())
+
+    def default(frame):
+        if frame.get("method") == "Page.navigate":
+            return {"ok": True, "result": {"frameId": "f1"}}
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge)
+    try:
+        cdp.attach()
+        cdp.navigate("https://b", timeout=0.2)
+        methods = [f.get("method") for f in bridge.received if f.get("op") == "cdp"]
+        assert "Page.navigate" in methods
+        assert all(f.get("op") != "open" for f in bridge.received)
+    finally:
+        cdp.close()
+
+
+def test_public_evaluate_returns_value_on_attached_tab(bridge):
+    bridge.on("attach", _ok_attach())
+    bridge.set_default(_evaluate_value(42))
+    cdp = _client(bridge)
+    try:
+        cdp.attach()
+        assert cdp.evaluate("6*7") == 42
     finally:
         cdp.close()
 
