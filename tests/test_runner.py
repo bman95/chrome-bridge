@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import threading
 
 import pytest
 
+from chrome_bridge import profiles
 from chrome_bridge.bridge.frames import read_frame, write_frame
 from chrome_bridge.bridge.client import ChromeBridge
 from chrome_bridge.runner import get_bridge, run_script
@@ -20,6 +22,11 @@ class _EchoBridgeServer:
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(1)
         self.host, self.port = self._listener.getsockname()
+        # Provision the token the client presents first (config dir redirected to
+        # a tmp dir by the `echo_server` fixture before construction).
+        token_file = profiles.port_token_path(self.port)
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(os.urandom(16).hex(), encoding="utf-8")
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._stop = threading.Event()
 
@@ -30,6 +37,12 @@ class _EchoBridgeServer:
         client, _ = self._listener.accept()
         rfile = client.makefile("rb")
         wfile = client.makefile("wb")
+        # Swallow the client's first frame (the auth handshake); the real host
+        # consumes it and never relays it.
+        try:
+            read_frame(rfile)
+        except (OSError, ValueError):
+            return
         try:
             while not self._stop.is_set():
                 try:
@@ -58,6 +71,7 @@ class _EchoBridgeServer:
 
 @pytest.fixture
 def echo_server():
+    # conftest.py's autouse fixture isolates the config dir before construction.
     s = _EchoBridgeServer()
     s.start()
     yield s

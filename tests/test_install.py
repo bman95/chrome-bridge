@@ -24,6 +24,15 @@ def test_write_launcher_bakes_in_port_and_uses_crlf(tmp_path):
     assert "chrome_bridge.bridge.nmh" in text
 
 
+def test_write_launcher_bakes_in_profile_env(tmp_path):
+    # The host learns its profile name from CBR_BRIDGE_PROFILE (issue #7) to
+    # resolve which per-profile token file to write.
+    path = install.write_launcher(tmp_path, "personal", 8765)
+    text = path.read_bytes().decode("utf-8")
+    assert "set CBR_BRIDGE_PROFILE=personal" in text
+    assert "set CBR_BRIDGE_PORT=8765" in text
+
+
 def test_write_manifest_points_at_launcher_and_lists_origins(tmp_path):
     install.write_launcher(tmp_path, "personal", 8765)
     manifest = install.write_manifest(tmp_path, "personal", extension_ids=["abc123"])

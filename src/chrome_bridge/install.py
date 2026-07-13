@@ -33,6 +33,7 @@ REM cd to this script's own directory so `uv run` resolves the project's
 REM virtualenv regardless of Chrome's working directory.
 cd /d "%~dp0"
 set CBR_BRIDGE_PORT={port}
+set CBR_BRIDGE_PROFILE={profile}
 where uv >nul 2>nul
 if errorlevel 1 (
   echo run_nmh_{profile}.bat: 'uv' not found on PATH; install uv or add it to PATH 1>&2

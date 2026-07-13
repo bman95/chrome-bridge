@@ -95,19 +95,63 @@ def default_registry_path() -> Path:
     return Path.home() / ".config" / "chrome-bridge" / "profiles.json"
 
 
+def token_path(profile: str) -> Path:
+    """Absolute path to a named profile's ``0600`` auth-token file.
+
+    The host writes a fresh random token here on startup and the client reads it
+    to authenticate its first frame; the file lives beside the registry in
+    ``~/.config/chrome-bridge/``. Shared by host (writer) and client (reader).
+    """
+    return default_registry_path().parent / f"token-{profile}.txt"
+
+
+def port_token_path(port: int) -> Path:
+    """Auth-token path for a bridge identified only by port (no named profile).
+
+    Used by ``--host/--port``-only setups that never registered a profile. The
+    ``port.`` infix carries a ``.``, which :func:`validate_profile_name` forbids
+    in a profile name, so this filename can never collide with a
+    :func:`token_path` one.
+    """
+    return default_registry_path().parent / f"token-port.{port}.txt"
+
+
+def find_profile_by_port(port: int, path: Path | None = None) -> str | None:
+    """Name of a registered profile bound to ``port``, or ``None`` if none is.
+
+    Lets a host/port-only client resolve the profile-named token file the host
+    wrote (``chrome-bridge`` passes host+port even for ``--profile`` usage).
+    """
+    for name, cfg in list_profiles(path).items():
+        if _coerce_port(cfg.port) == port:
+            return name
+    return None
+
+
 def load_registry(path: Path | None = None) -> _Registry:
-    """Load the profile registry, or an empty one if it doesn't exist yet."""
+    """Load the profile registry, or an empty one if it doesn't exist yet.
+
+    A registry that cannot be parsed OR has the wrong shape (hand-edited and
+    legacy files are part of this module's threat model — see ``_coerce_port``)
+    raises :class:`ProfileError`, never a raw ``json``/``TypeError``/
+    ``AttributeError``: callers that must degrade gracefully (the token-path
+    resolution in the host and client) catch one well-known error type.
+    """
     p = path or default_registry_path()
     if not p.exists():
         return _Registry()
-    data = json.loads(p.read_text(encoding="utf-8"))
-    # Ignore unknown keys so a registry written by an older version (which
-    # persisted now-removed fields such as ``chrome_user_data_dir``) still loads.
-    known = {f.name for f in fields(ProfileConfig)} - {"name"}
-    profiles = {
-        name: ProfileConfig(name=name, **{k: v for k, v in cfg.items() if k in known})
-        for name, cfg in data.get("profiles", {}).items()
-    }
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        # Ignore unknown keys so a registry written by an older version (which
+        # persisted now-removed fields such as ``chrome_user_data_dir``) still
+        # loads.
+        known = {f.name for f in fields(ProfileConfig)} - {"name"}
+        profiles = {
+            name: ProfileConfig(name=name, **{k: v for k, v in cfg.items() if k in known})
+            for name, cfg in data.get("profiles", {}).items()
+        }
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ProfileError(f"corrupt profile registry at {p}: {exc}") from exc
     return _Registry(profiles=profiles)
 
 

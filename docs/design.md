@@ -128,13 +128,23 @@ already carry.
    (re-open the last URL, fresh `Page.enable`). `sw.js` re-dials on every
    worker spin-up plus a post-drop reconnect alarm. `Input.dispatchMouseEvent`
    keeps realistic coordinates (not synthetic `el.click()`).
-3. **The host's script-facing channel is an unauthenticated loopback
-   socket.** The host binds `127.0.0.1:<port>` and relays the first client's
-   frames into raw CDP on the real profile, with no token. Loopback is not a
-   hard trust boundary on a shared machine: any local process could race to
-   connect. Acceptable for a single-user PC; add a per-launch shared secret
-   (a `0600` token file the host writes, validated on the first frame) before
-   using this on a shared machine.
+3. **The host's script-facing channel is a loopback socket — now
+   authenticated by a shared-secret token (baseline).** Loopback is not a
+   hard trust boundary: any local process can dial `127.0.0.1:<port>`, and
+   under WSL2 that includes **Windows-side processes**, since WSL2 shares
+   localhost with the host OS — an unauthenticated bridge would let any of
+   them pull every cookie of the logged-in profile via `Network.getCookies`.
+   So the host writes a per-launch random token (32 bytes from `os.urandom`,
+   hex) to a `0600` file next to the profile registry
+   (`~/.config/chrome-bridge/token-<profile>.txt`, or `token-port.<port>.txt`
+   for host/port-only setups) and requires every client's **first frame** to
+   be `{"auth": "<hex>"}`. A wrong/malformed/missing first frame closes that
+   client and the host loops back to accept (the extension side is never
+   disturbed); on success no reply is sent — the relay just starts. This
+   cheaply blocks processes that can reach the port but not the user's files
+   (other local users; Windows-side processes under WSL2); it is not a
+   defense against an attacker who can already read the user's files (they
+   can read the token — and the browser profile itself).
 
 ## References
 

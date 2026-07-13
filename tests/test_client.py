@@ -12,6 +12,7 @@ re-attach.
 from __future__ import annotations
 
 import json as _json
+import os
 import shutil as _shutil
 import socket
 import subprocess as _subprocess
@@ -21,6 +22,7 @@ from pathlib import Path as _Path
 
 import pytest
 
+from chrome_bridge import profiles
 from chrome_bridge.bridge.frames import read_frame, write_frame
 from chrome_bridge.bridge.client import (
     BridgeError,
@@ -56,6 +58,14 @@ class FakeBridge:
         self._handlers = {}
         self._default_handler = None
         self.received: list[dict] = []
+        # The host writes a 0600 token the client must present as its first
+        # frame; provision one at the port-derived path (the config dir is
+        # redirected to a tmp dir by the `bridge` fixture before construction).
+        self.token = os.urandom(16).hex()
+        token_file = profiles.port_token_path(self.port)
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(self.token, encoding="utf-8")
+        self.auth_frame: dict | None = None  # the client's first frame
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._ready = threading.Event()
         self._send_lock = threading.Lock()
@@ -77,6 +87,13 @@ class FakeBridge:
         self._rfile = client.makefile("rb")
         self._wfile = client.makefile("wb")
         self._ready.set()
+        # The client's first frame is the auth handshake ({"auth": <hex>}); the
+        # real host consumes it and never relays it. Record it (for assertions)
+        # and swallow it so `received` holds only real ops.
+        try:
+            self.auth_frame = read_frame(self._rfile)
+        except (OSError, ValueError):
+            self.auth_frame = None
         try:
             while not self._stop.is_set():
                 try:
@@ -126,6 +143,9 @@ class FakeBridge:
 
 @pytest.fixture
 def bridge():
+    # conftest.py's autouse fixture has already redirected the config dir to a
+    # per-test tmp dir, so FakeBridge's token write never touches the real
+    # ~/.config/chrome-bridge.
     b = FakeBridge()
     b.start()
     yield b
@@ -188,6 +208,81 @@ def test_context_manager_connects_and_closes(bridge):
     ops = [f.get("op") for f in bridge.received]
     assert "open" in ops
     assert "close" in ops
+
+
+def test_connect_sends_auth_frame_first(bridge):
+    bridge.on("open", _ok_open())
+    bridge.set_default(_cdp_result({}))
+    with ChromeBridge(host=bridge.host, port=bridge.port) as cdp:
+        cdp.open("https://x", timeout=0.2)
+    # The very first frame the client sent was the auth handshake carrying the
+    # host's token, and it was NOT relayed as an op (received holds only ops).
+    assert bridge.auth_frame == {"auth": bridge.token}
+    assert all("auth" not in f for f in bridge.received)
+
+
+def test_connect_missing_token_raises_actionable_error(bridge):
+    # Delete the token the host would have written: connect() must fail with an
+    # actionable BridgeError, not a bare socket error.
+    profiles.port_token_path(bridge.port).unlink()
+    cdp = ChromeBridge(host=bridge.host, port=bridge.port)
+    with pytest.raises(BridgeError, match="auth token"):
+        cdp.connect()
+
+
+def test_connect_empty_token_raises_actionable_error(bridge):
+    # A zero-byte token file (e.g. interrupted host startup) is as unusable as
+    # a missing one and must surface the same actionable error.
+    profiles.port_token_path(bridge.port).write_text("", encoding="utf-8")
+    cdp = ChromeBridge(host=bridge.host, port=bridge.port)
+    with pytest.raises(BridgeError, match="empty"):
+        cdp.connect()
+
+
+def _wait_auth_frame(bridge: FakeBridge, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while bridge.auth_frame is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_connect_with_profile_reads_profile_token(bridge):
+    # A profile-constructed client must read token_path(<profile>) — the file
+    # the launcher-spawned host writes — not the port-derived fallback.
+    profiles.add_profile("personal", bridge.port)
+    token_file = profiles.token_path("personal")
+    token_file.write_text("profile-secret", encoding="utf-8")
+    cdp = ChromeBridge(profile="personal")
+    cdp.connect()
+    _wait_auth_frame(bridge)
+    cdp.close()
+    assert bridge.auth_frame == {"auth": "profile-secret"}
+
+
+def test_connect_host_port_resolves_registered_profile_token(bridge):
+    # The CLI resolves --profile to host+port before constructing the client
+    # (cli._resolve_host_port), so the host/port-only path must look the
+    # profile up by port in the registry and read ITS token file.
+    profiles.add_profile("personal", bridge.port)
+    profiles.token_path("personal").write_text("profile-secret", encoding="utf-8")
+    cdp = ChromeBridge(host=bridge.host, port=bridge.port)
+    cdp.connect()
+    _wait_auth_frame(bridge)
+    cdp.close()
+    assert bridge.auth_frame == {"auth": "profile-secret"}
+
+
+def test_connect_degrades_to_port_token_on_corrupt_registry(bridge):
+    # A structurally-corrupt registry must not crash connect() (or leak the
+    # half-open socket): the by-port lookup degrades to the port-derived token
+    # file — the same one the host would write — and auth succeeds.
+    profiles.default_registry_path().write_text(
+        '{"profiles": {"x": {}}}', encoding="utf-8"  # entry missing port
+    )
+    cdp = ChromeBridge(host=bridge.host, port=bridge.port)
+    cdp.connect()
+    _wait_auth_frame(bridge)
+    cdp.close()
+    assert bridge.auth_frame == {"auth": bridge.token}
 
 
 # --------------------------------------------------------------------------- #

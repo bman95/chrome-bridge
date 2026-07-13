@@ -64,7 +64,7 @@ import threading
 import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any
+from typing import Any, BinaryIO
 
 from .frames import FrameError, read_frame, write_frame
 
@@ -169,6 +169,9 @@ class ChromeBridge:
         ``CBR_BRIDGE_PORT`` environment variables are used; otherwise the
         module defaults (``127.0.0.1:8765``).
         """
+        # Remembered for the auth handshake: a named profile maps straight to its
+        # token file; a host/port-only client resolves the token by port instead.
+        self._profile = profile
         if host is not None or port is not None:
             env_host, env_port = _endpoint()
             self._host = host if host is not None else env_host
@@ -228,7 +231,7 @@ class ChromeBridge:
     # ------------------------------------------------------------------ #
 
     def connect(self) -> None:
-        """Dial the bridge loopback socket and start the reader thread.
+        """Dial the bridge loopback socket, authenticate, and start the reader.
 
         Idempotent: a no-op if already connected. Safe to call again after a
         :meth:`close` or a transport loss (the reader thread that set
@@ -236,6 +239,18 @@ class ChromeBridge:
         new socket + reader and clears ``_closed``), which is what
         :meth:`reconnect` relies on to re-dial a Chrome-spawned host that came
         back after a service-worker eviction.
+
+        The host drops any client whose FIRST frame is not the shared-secret
+        token, so this sends ``{"auth": "<hex>"}`` before anything else. The
+        token file is only meaningful once the host is up, so it is read AFTER
+        the dial succeeds — a missing/stale token then surfaces as an actionable
+        :class:`BridgeError` distinct from a plain "could not connect". The token
+        is re-read on every (re)connect, so a host that rotated it on restart is
+        picked up transparently. One caveat: the host answers a WRONG token with
+        silence (by design it sends no auth reply either way), so a stale token
+        that still exists on disk surfaces not here but as the connection dying
+        on the first op ("bridge reader stopped") — reconnecting re-reads the
+        fresh token and heals it.
         """
         if self._sock is not None:
             return
@@ -255,9 +270,23 @@ class ChromeBridge:
         sock.settimeout(None)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         rfile = sock.makefile("rb")
+        wfile = sock.makefile("wb")
+        # First frame MUST be the auth token or the host drops us.
+        try:
+            token = self._read_token()
+            write_frame(wfile, {"auth": token})
+        except BridgeError:
+            self._abort_connect(sock, rfile, wfile)
+            raise
+        except (FrameError, OSError, ValueError) as exc:
+            self._abort_connect(sock, rfile, wfile)
+            raise BridgeError(
+                f"failed to send auth handshake to bridge at "
+                f"{self._host}:{self._port}: {exc}"
+            ) from exc
         self._sock = sock
         self._rfile = rfile
-        self._wfile = sock.makefile("wb")
+        self._wfile = wfile
         # A reconnect leaves stale request ids pending from the dead socket; drop
         # them so a late reply (it never comes — the host is gone) can't collide
         # with a fresh id and the pending map starts clean for the new reader.
@@ -280,6 +309,63 @@ class ChromeBridge:
         )
         self._reader.start()
         log.debug("chrome-bridge connected to bridge at %s:%d", self._host, self._port)
+
+    @staticmethod
+    def _abort_connect(sock: socket.socket, *files: BinaryIO) -> None:
+        """Close a half-open socket + its file objects after a failed handshake."""
+        for f in files:
+            try:
+                f.close()
+            except OSError:
+                pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _read_token(self) -> str:
+        """Read this endpoint's shared-secret token for the auth handshake.
+
+        Resolution mirrors the host: a named ``profile`` maps straight to
+        :func:`chrome_bridge.profiles.token_path`; a host/port-only client looks
+        up the registry for a profile bound to this port (the ``chrome-bridge``
+        CLI passes host+port even for ``--profile`` usage) and falls back to the
+        port-derived filename when none is registered. A missing/unreadable/empty
+        token surfaces as an actionable :class:`BridgeError`.
+        """
+        from .. import profiles as _profiles
+
+        if self._profile is not None:
+            path = _profiles.token_path(self._profile)
+        else:
+            try:
+                name = _profiles.find_profile_by_port(self._port)
+            except (OSError, ValueError):
+                # A corrupt/unreadable registry must degrade to the port-derived
+                # file (mirroring the host's resolution), not mask itself as an
+                # auth-handshake failure.
+                name = None
+            path = (
+                _profiles.token_path(name)
+                if name is not None
+                else _profiles.port_token_path(self._port)
+            )
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise BridgeError(
+                f"could not read the bridge auth token at {path}: {exc}. The "
+                "bridge may not have started yet, or the token is stale — reload "
+                "the Chrome Bridge extension for this profile (chrome://extensions) "
+                "so the host regenerates it, then retry."
+            ) from exc
+        if not token:
+            raise BridgeError(
+                f"the bridge auth token at {path} is empty; reload the Chrome "
+                "Bridge extension for this profile so the host regenerates it, "
+                "then retry."
+            )
+        return token
 
     def reconnect(self) -> None:
         """Re-dial the bridge socket after a transport loss, then re-attach.

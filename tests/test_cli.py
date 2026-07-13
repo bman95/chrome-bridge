@@ -111,6 +111,22 @@ def test_profiles_rm_reports_absent_artifacts(registry_path, monkeypatch, tmp_pa
     assert "No nmh-manifest.personal.local.json to delete." in result.output
 
 
+def test_profiles_rm_deletes_token_file(registry_path, monkeypatch, tmp_path):
+    """rm must also clean up the profile's auth-token file (a 0600 secret the
+    host wrote next to the registry), not leave it behind indefinitely."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(cli_mod, "_PROJECT_ROOT", tmp_path)
+    profiles_mod.add_profile("personal", 8765, path=registry_path)
+    token = profiles_mod.token_path("personal")
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text("secret", encoding="utf-8")
+
+    result = runner.invoke(cli_mod.app, ["profiles", "rm", "personal"])
+    assert result.exit_code == 0, result.output
+    assert not token.exists()
+    assert "Deleted token-personal.txt." in result.output
+
+
 def test_profiles_rm_reports_absent_windows_key(registry_path, monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     profiles_mod.add_profile("personal", 8765, path=registry_path)

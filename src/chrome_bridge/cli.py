@@ -65,10 +65,11 @@ def profiles_rm(name: str) -> None:
     else:
         typer.echo("Skipped native-host registry key (Windows-only).")
 
-    # Generated launcher + manifest files.
+    # Generated launcher + manifest files, plus the profile's auth-token file.
     for path in (
         install_mod.launcher_path(_PROJECT_ROOT, name),
         install_mod.manifest_path(_PROJECT_ROOT, name),
+        profiles_mod.token_path(name),
     ):
         if path.exists():
             path.unlink()

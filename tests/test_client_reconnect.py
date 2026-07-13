@@ -18,12 +18,14 @@ without the caller discarding it. No Chrome, no native host, no running script.
 
 from __future__ import annotations
 
+import os
 import socket
 import threading
 import time
 
 import pytest
 
+from chrome_bridge import profiles
 from chrome_bridge.bridge.frames import read_frame, write_frame
 from chrome_bridge.bridge.client import BridgeError, ChromeBridge
 
@@ -47,6 +49,12 @@ class ReconnectableBridge:
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(1)
         self.host, self.port = self._listener.getsockname()
+        # Token the client presents as its first frame on every (re)connect; the
+        # `rbridge` fixture redirects the config dir to a tmp dir first.
+        self.token = os.urandom(16).hex()
+        token_file = profiles.port_token_path(self.port)
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(self.token, encoding="utf-8")
         self._client: socket.socket | None = None
         self._rfile = None
         self._wfile = None
@@ -79,6 +87,17 @@ class ReconnectableBridge:
 
     def _serve(self, client: socket.socket) -> None:
         rfile = client.makefile("rb")
+        # ENFORCE the auth handshake like the real host: the first frame on
+        # every connection must be this bridge's token, or the client gets no
+        # service (its ops would time out and the test fails loudly). This
+        # makes the reconnect tests prove the token is re-sent on every
+        # re-dial, not merely that some first frame was swallowed.
+        try:
+            first = read_frame(rfile)
+        except (OSError, ValueError):
+            return
+        if first != {"auth": self.token}:
+            return
         try:
             while not self._stop.is_set():
                 try:
@@ -160,6 +179,7 @@ class ReconnectableBridge:
 
 @pytest.fixture
 def rbridge():
+    # conftest.py's autouse fixture isolates the config dir before construction.
     b = ReconnectableBridge()
     b.start()
     yield b

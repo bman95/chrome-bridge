@@ -209,3 +209,64 @@ def test_registry_file_is_well_formed_json(registry_path):
     text = registry_path.read_text(encoding="utf-8")
     assert '"personal"' in text
     assert '"port": 8765' in text
+
+
+# --------------------------------------------------------------------------- #
+# Auth-token paths + profile-by-port lookup (issue #7)
+# --------------------------------------------------------------------------- #
+
+
+def test_token_path_beside_registry(registry_path, monkeypatch):
+    monkeypatch.setattr(profiles, "default_registry_path", lambda: registry_path)
+    assert profiles.token_path("personal") == registry_path.parent / "token-personal.txt"
+
+
+def test_port_token_path_beside_registry(registry_path, monkeypatch):
+    monkeypatch.setattr(profiles, "default_registry_path", lambda: registry_path)
+    assert profiles.port_token_path(8765) == registry_path.parent / "token-port.8765.txt"
+
+
+def test_token_path_and_port_token_path_never_collide(registry_path, monkeypatch):
+    # A profile literally named "port-8765" is valid; its token file must still
+    # not collide with the port-8765 fallback (the '.' infix guarantees this).
+    monkeypatch.setattr(profiles, "default_registry_path", lambda: registry_path)
+    profiles.validate_profile_name("port-8765")  # confirms it is a valid name
+    assert profiles.token_path("port-8765") != profiles.port_token_path(8765)
+
+
+def test_find_profile_by_port_returns_match(registry_path):
+    profiles.add_profile("personal", 8765, path=registry_path)
+    profiles.add_profile("work", 8766, path=registry_path)
+    assert profiles.find_profile_by_port(8766, path=registry_path) == "work"
+
+
+def test_find_profile_by_port_none_when_absent(registry_path):
+    profiles.add_profile("personal", 8765, path=registry_path)
+    assert profiles.find_profile_by_port(9999, path=registry_path) is None
+
+
+def test_find_profile_by_port_matches_legacy_string_port(registry_path):
+    registry_path.write_text(
+        json.dumps({"profiles": {"legacy": {"port": "8765"}}}), encoding="utf-8"
+    )
+    assert profiles.find_profile_by_port(8765, path=registry_path) == "legacy"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{not json",  # syntax corruption
+        "[1, 2, 3]",  # top-level non-object
+        '{"profiles": [1]}',  # profiles not a dict
+        '{"profiles": {"a": {}}}',  # entry missing port
+        '{"profiles": {"a": 5}}',  # entry not an object
+    ],
+)
+def test_load_registry_raises_profile_error_on_corrupt_registry(registry_path, payload):
+    # Hand-edited/legacy registries are part of this module's threat model:
+    # any parse OR shape failure must surface as one well-known ProfileError
+    # (a ValueError), never a raw json/TypeError/AttributeError — the host and
+    # client token-path resolvers rely on that to degrade instead of crash.
+    registry_path.write_text(payload, encoding="utf-8")
+    with pytest.raises(profiles.ProfileError, match="corrupt profile registry"):
+        profiles.load_registry(registry_path)
