@@ -476,14 +476,16 @@ class ChromeBridge:
         in ``sw.js`` and re-binds the loopback port). A fresh socket means no
         attached tabs — whatever the old socket held is at best a
         generation-fenced leftover server-side — so every :meth:`new_tab`
-        handle is marked detached and re-opens (``replace:false``) on its next
-        use, while the default tab — if a URL was ever opened — re-opens
-        eagerly on it so the legacy session resumes idempotently. Because
-        every other handle is detached at that moment, the default tab's open
-        keeps the legacy ``replace:true`` wire shape, which also reaps fenced
-        leftover tabs server-side. A long-lived owner reusing one client
-        across jobs calls this instead of discarding the client, so
-        ``current_url`` is preserved across the heal.
+        handle is marked detached and re-opens adaptively on its next use
+        (``replace:false`` while the healed default tab or any sibling is
+        attached; the key-less reaper shape otherwise — see
+        :meth:`Tab._reopen_replace`), while the default tab — if a URL was
+        ever opened — re-opens eagerly on it so the legacy session resumes
+        idempotently. Because every other handle is detached at that moment,
+        the default tab's open keeps the legacy ``replace:true`` wire shape,
+        which also reaps fenced leftover tabs server-side. A long-lived owner
+        reusing one client across jobs calls this instead of discarding the
+        client, so ``current_url`` is preserved across the heal.
 
         Raises :class:`BridgeError` if the socket cannot be re-dialled (host not
         back yet); the caller surfaces it and retries later.
@@ -715,7 +717,7 @@ class ChromeBridge:
             if generation != self._generation:
                 return
         if frame.get("event") is True:
-            self._dispatch_event(frame)
+            self._dispatch_event(frame, generation)
             return
         # A reply: correlate by id.
         msg_id = frame.get("id")
@@ -729,7 +731,7 @@ class ChromeBridge:
         if not fut.done():
             fut.set_result(frame)
 
-    def _dispatch_event(self, frame: dict[str, Any]) -> None:
+    def _dispatch_event(self, frame: dict[str, Any], generation: int) -> None:
         """Route an unsolicited event frame to the connection bus + tab buses.
 
         Events from the extension carry the source ``tabId`` (see the sw.js
@@ -738,6 +740,12 @@ class ChromeBridge:
         matching :class:`Tab` handle. An event WITHOUT ``tabId`` — a
         single-tab-era peer — is broadcast to every handle, preserving the
         historical behavior. The connection-wide bus always fires.
+
+        ``generation`` is re-checked inside the routing critical sections:
+        :meth:`_dispatch`'s up-front check releases ``_lock`` before this
+        runs, so a stale reader could otherwise be preempted across a
+        reconnect and then park/route a dead session's event into the fresh
+        connection's state.
         """
         etype = frame.get("type")
         if etype == "detached":
@@ -745,6 +753,8 @@ class ChromeBridge:
             tab_id = frame.get("tabId")
             log.info("chrome-bridge: debugger detached (%s)", reason)
             with self._lock:
+                if generation != self._generation:
+                    return  # stale reader: never touch the fresh connection
                 if tab_id is None:
                     targets = list(self._tabs)
                 else:
@@ -755,7 +765,10 @@ class ChromeBridge:
                         # thread, whose handle would otherwise never learn of
                         # this detach and believe itself attached forever.
                         # Park it; _open/_attach consume it atomically (under
-                        # this same lock) when publishing the id.
+                        # this same lock) when publishing the id. An entry
+                        # whose reply was lost (op timeout) lingers until the
+                        # next (re)connect clears the map — inert, as Chrome
+                        # never reuses tab ids within one browser session.
                         self._undispatched_detaches[tab_id] = reason
             # The tab is gone; mark so the next primitive on it re-opens.
             for tab in targets:
@@ -780,13 +793,15 @@ class ChromeBridge:
             method = frame.get("method", "")
             params = frame.get("params") or {}
             tab_id = frame.get("tabId")
-            # Connection-wide bus first (the legacy surface sees every tab's
-            # events), then per-tab routing.
-            self._fire(method, params)
             with self._lock:
+                if generation != self._generation:
+                    return  # stale reader: never route into the fresh connection
                 targets = [
                     t for t in self._tabs if tab_id is None or t.tab_id == tab_id
                 ]
+            # Connection-wide bus first (the legacy surface sees every tab's
+            # events), then per-tab routing.
+            self._fire(method, params)
             for tab in targets:
                 tab._fire(method, params)
 
@@ -1357,11 +1372,20 @@ class Tab:
             # harmless extra re-attach, which is the safe direction to err.
             self._detached.clear()
             payload: dict[str, Any] = {"op": "open", "url": url}
-            if replace is _ADAPTIVE_REPLACE:
-                replace = self._reopen_replace()
-            if replace is not None:
-                payload["replace"] = replace
-            reply = self._bridge._request(payload, timeout=self._bridge._op_timeout)
+            bridge = self._bridge
+            # Compute the adaptive replace shape UNDER the op lock: with the
+            # lock held no sibling can BECOME attached before this frame is
+            # sent (attaching requires its own op round-trip through the same
+            # lock), so a key-less reaper open can never race a concurrent
+            # new_tab and silently destroy its fresh tab. Drift the other way
+            # (a sibling detaching after the snapshot) errs to replace:false,
+            # which is harmless. The RLock nests with _request's own hold.
+            with bridge._op_lock:
+                if replace is _ADAPTIVE_REPLACE:
+                    replace = self._reopen_replace()
+                if replace is not None:
+                    payload["replace"] = replace
+                reply = bridge._request(payload, timeout=bridge._op_timeout)
             tab_id = reply.get("tabId")
             if tab_id is None:
                 raise BridgeError(
@@ -1400,6 +1424,10 @@ class Tab:
                 self.tab_id = tab_id
         if reason is not None:
             self._detached.set()
+            # The connection-wide bus already fired at event time; this tab's
+            # own bus could not (the id was unpublished), so honour the
+            # Tab.on_event contract now.
+            self._fire("__detached__", {"reason": reason, "tabId": tab_id})
             raise DetachedError(f"debugger detached during {during}: {reason}")
 
     def _attach(self, *, timeout: float | None = None) -> None:
@@ -1432,7 +1460,19 @@ class Tab:
         # client-side.
         self._bridge._mark_other_tabs_detached(self)
         self._publish_tab_id(tab_id, during="attach")
-        self._cdp("Page.enable")
+        try:
+            self._cdp("Page.enable")
+        except BridgeError:
+            # The attach reply's tabId can ALIAS a tab another handle already
+            # held (the extension's attach handover): a detach racing the
+            # reply is then routed to that handle rather than parked, so the
+            # id published above is already dead and Page.enable is the first
+            # op to notice. Mark this handle detached so it lands on the
+            # documented detached path (next primitive raises DetachedError /
+            # re-attaches after a navigate) instead of holding a stale tab_id
+            # forever. A spurious mark only costs one extra re-attach.
+            self._mark_detached()
+            raise
 
     def navigate(self, url: str, *, timeout: float = DEFAULT_NAV_TIMEOUT) -> None:
         """Navigate this tab to ``url`` and await the load event.

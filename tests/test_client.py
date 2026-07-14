@@ -1956,3 +1956,66 @@ def test_bridge_close_retires_new_tab_handles(bridge):
     with pytest.raises(BridgeError, match="closed"):
         tab.banner_present(".x")
     assert cdp._tabs == [cdp._default_tab]
+
+
+def test_detach_racing_attach_reply_is_not_lost(bridge):
+    # The attach counterpart of the open-reply race: the tab's detached event
+    # is processed before the op thread publishes the attach reply's tabId.
+    # The parked detach must be consumed (DetachedError, per-tab __detached__
+    # fired) rather than the handle publishing a dead id and wedging.
+    def on_attach(frame):
+        bridge.send_event(
+            {"event": True, "type": "detached", "reason": "early_gone",
+             "tabId": 55}
+        )
+        return {"ok": True, "tabId": 55}
+
+    bridge.on("attach", on_attach)
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    seen = []
+    cdp._default_tab.on_event("__detached__", lambda p: seen.append(p))
+    try:
+        with pytest.raises(DetachedError, match="early_gone"):
+            cdp.attach()
+        assert cdp._detached.is_set()
+        assert cdp._tab_id is None
+        assert seen == [{"reason": "early_gone", "tabId": 55}]
+    finally:
+        cdp.close()
+
+
+def test_undispatched_detaches_cleared_on_connect(bridge):
+    # A parked detach from a dead connection must never poison the next one:
+    # a fresh browser session may reuse tab ids, so connect() clears the map
+    # and an open replying with a colliding id succeeds.
+    bridge.on("open", _ok_open(tab_id=7))
+    bridge.set_default(_cdp_result({}))
+    cdp = ChromeBridge(host=bridge.host, port=bridge.port)
+    cdp._undispatched_detaches[7] = "stale"  # dead session's parked entry
+    cdp.connect()
+    try:
+        assert cdp._undispatched_detaches == {}
+        cdp.open("https://a", timeout=0.2)  # tabId 7 — no spurious detach
+        assert cdp._tab_id == 7
+        assert not cdp._detached.is_set()
+    finally:
+        cdp.close()
+
+
+def test_bridge_close_teardown_budget_is_shared(bridge):
+    # With a wedged worker (close ops never answered), tearing down N tabs
+    # must cost ~ONE op_timeout total, not N stacked timeouts.
+    bridge.on("open", _sequential_opens())
+    bridge.on("close", lambda f: None)  # never reply
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge, op_timeout=0.4)
+    cdp.open("https://a", timeout=0.2)
+    cdp.new_tab("https://b", timeout=0.2)
+    cdp.new_tab("https://c", timeout=0.2)
+    started = time.monotonic()
+    cdp.close()
+    elapsed = time.monotonic() - started
+    # ~one shared 0.4 s budget; 3 stacked per-tab timeouts (1.2 s) fail this.
+    assert elapsed < 1.0, f"teardown took {elapsed:.2f}s"
+    assert not cdp.is_alive()
