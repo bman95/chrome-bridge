@@ -1651,6 +1651,101 @@ def test_targeted_detach_does_not_fail_other_tabs_inflight_op(bridge):
         cdp.close()
 
 
+def test_targeted_detach_fails_only_that_tabs_op_and_b_completes(bridge):
+    # The issue-#17 acceptance shape end-to-end: a mid-op detach of tab A
+    # fails A's in-flight op with DetachedError (correlated via the op's
+    # tabId), an op on tab B then completes untouched, and A's next primitive
+    # re-attaches (replace:false) without disturbing B.
+    bridge.on("open", _sequential_opens())
+
+    def default(frame):
+        if frame.get("method") == "Runtime.evaluate" and frame.get("tabId") == 100:
+            # Never answer tab A's evaluate; detach A instead.
+            bridge.send_event(
+                {"event": True, "type": "detached", "reason": "target_closed",
+                 "tabId": 100}
+            )
+            return None
+        if frame.get("method") == "Runtime.evaluate":
+            return {"ok": True, "result": {"result": {"value": True}}}
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge, op_timeout=10.0)
+    try:
+        cdp.open("https://a", timeout=0.2)         # tab A: id 100
+        tab_b = cdp.new_tab("https://b", timeout=0.2)  # tab B: id 101
+
+        started = time.monotonic()
+        with pytest.raises(DetachedError):
+            cdp.banner_present(".x")
+        # Failed via the targeted detach, well before the 10s op timeout.
+        assert time.monotonic() - started < 5.0
+
+        # Tab B was never marked detached and its op completes normally.
+        assert not tab_b._detached.is_set()
+        assert tab_b.tab_id == 101
+        assert tab_b.banner_present(".y") is True
+
+        # A's next primitive re-attaches — replace:false, since B is live —
+        # and B is not disturbed by the heal.
+        bridge.received.clear()
+        assert cdp.banner_present(".x") is True    # A re-opens as id 102
+        reopen = next(f for f in bridge.received if f.get("op") == "open")
+        assert reopen["url"] == "https://a"
+        assert reopen["replace"] is False
+        assert cdp._tab_id == 102
+        assert tab_b.tab_id == 101
+        assert not tab_b._detached.is_set()
+    finally:
+        cdp.close()
+
+
+def test_stale_tagged_event_is_dropped(bridge):
+    # An event tagged with a tabId no live handle has published (a late event
+    # from a tab that already detached) must be dropped entirely — neither
+    # the connection-wide bus nor any per-tab bus fires — so it can never
+    # land on the wrong handle once tab ids are remapped.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    got_conn, got_a, got_b = [], [], []
+    try:
+        cdp.open("https://a", timeout=0.2)             # id 100
+        tab_b = cdp.new_tab("https://b", timeout=0.2)  # id 101
+        cdp.on_event("Custom.evt", lambda p: got_conn.append(p))
+        cdp._default_tab.on_event("Custom.evt", lambda p: got_a.append(p))
+        tab_b.on_event("Custom.evt", lambda p: got_b.append(p))
+
+        # Detach tab B: id 101 is now mapped to no live handle.
+        bridge.send_event(
+            {"event": True, "type": "detached", "reason": "gone", "tabId": 101}
+        )
+        deadline = time.monotonic() + 2
+        while not tab_b._detached.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        # A late event from the dead tab, then a live-tab event as the fence:
+        # the reader dispatches in order, so once the live event has fired we
+        # know the stale one was processed (and dropped) before it.
+        bridge.send_event(
+            {"event": True, "type": "cdp", "method": "Custom.evt",
+             "params": {"stale": True}, "tabId": 101}
+        )
+        bridge.send_event(
+            {"event": True, "type": "cdp", "method": "Custom.evt",
+             "params": {"live": True}, "tabId": 100}
+        )
+        deadline = time.monotonic() + 2
+        while not got_conn and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert got_conn == [{"live": True}]  # the stale event never fired
+        assert got_a == [{"live": True}]
+        assert got_b == []
+    finally:
+        cdp.close()
+
+
 def test_tab_reattach_after_detach_uses_replace_false(bridge):
     # A detached new_tab handle must re-open transparently on its next
     # primitive — with replace:false, so the re-attach never tears down the

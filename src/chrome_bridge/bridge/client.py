@@ -66,6 +66,22 @@ Concurrency / failure model:
   tab's session so the **next** primitive on it re-attaches idempotently
   (re-open + re-``Page.enable``). Other attached tabs are untouched. Callers
   that must survive a mid-op detach should retry the primitive.
+* A DEAD SOCKET (the MV3 service worker was evicted, dropping the native
+  port and with it every attachment at once) is recovered whole-connection:
+  :meth:`ChromeBridge.reconnect` re-dials the host and re-opens EVERY tab
+  that had a ``current_url``, in creation order, remapping each handle's
+  ``tab_id`` onto its fresh Chrome tab so callers' :class:`Tab` references
+  keep working. A handle that never opened a URL has nothing to restore and
+  is marked dead: its next primitive raises an actionable
+  :class:`BridgeError` (an explicit open/navigate/attach starts a fresh
+  session on it and revives the handle). Primitives trigger this heal
+  transparently via ``_ensure_attached``.
+* Stale events: an event tagged with a ``tabId`` no live handle has
+  published — e.g. a late event from a tab that already detached, or from a
+  pre-eviction session — is dropped (debug-logged) rather than routed, so it
+  can never fire a listener on the wrong handle. (A ``detached`` event in
+  that position is parked instead of dropped, to catch a detach racing its
+  own open/attach reply — see ``_undispatched_detaches``.)
 """
 
 from __future__ import annotations
@@ -461,29 +477,39 @@ class ChromeBridge:
         return token
 
     def reconnect(self) -> None:
-        """Re-dial the bridge socket after a transport loss, then re-attach.
+        """Re-dial the bridge socket after a transport loss, then re-attach
+        ALL tabs.
 
         The MV3 service worker can be evicted (the documented #2 risk). When it
         is, the native port Chrome spawned drops, the host's relay ends, and this
         client's loopback socket dies — the reader thread sets ``_closed`` and
         every primitive then raises "bridge is not connected". Unlike an
         ``onDetach`` (one tab gone, socket alive — handled per tab by the
-        idempotent re-attach), a dead socket needs the **whole connection**
-        rebuilt before any op can flow.
+        idempotent re-attach), a dead socket kills every attachment at once and
+        needs the **whole connection** rebuilt before any op can flow.
 
         This tears down the dead socket and dials a fresh one (the
         Chrome-spawned host is back as soon as the worker re-runs ``connect()``
         in ``sw.js`` and re-binds the loopback port). A fresh socket means no
         attached tabs — whatever the old socket held is at best a
-        generation-fenced leftover server-side — so every :meth:`new_tab`
-        handle is marked detached and re-opens adaptively on its next use
-        (``replace:false`` while the healed default tab or any sibling is
-        attached; the key-less reaper shape otherwise — see
-        :meth:`Tab._reopen_replace`), while the default tab — if a URL was
-        ever opened — re-opens eagerly on it so the legacy session resumes
-        idempotently. Because every other handle is detached at that moment,
-        the default tab's open keeps the legacy ``replace:true`` wire shape,
-        which also reaps fenced leftover tabs server-side. A long-lived owner
+        generation-fenced leftover server-side — so every handle (the default
+        tab and each :meth:`new_tab` handle) that had a ``current_url`` is
+        re-opened eagerly, in creation order, remapping its ``tab_id`` onto
+        the fresh Chrome tab so callers' :class:`Tab` references keep
+        working. Each re-open's load wait is capped at the short
+        :data:`DEFAULT_REATTACH_TIMEOUT` (non-fatal — the caller's own
+        readiness check is the real gate). The FIRST re-open goes out in the
+        key-less reaper shape (``replace:true`` on the wire — nothing else is
+        attached yet, and it reclaims the dead session's fenced leftover tabs
+        server-side); every later one is ``replace:false`` so it never tears
+        down an already-healed sibling (:meth:`Tab._reopen_replace`).
+
+        Re-opens are best-effort PER TAB: one tab's failed heal is logged and
+        must not poison its siblings — the failed handle stays unattached and
+        retries transparently on its next primitive. A handle that never
+        opened a URL has nothing to restore and is marked dead: its next
+        primitive raises an actionable :class:`BridgeError`, and an explicit
+        open/navigate/attach starts a fresh session on it. A long-lived owner
         reusing one client across jobs calls this instead of discarding the
         client, so ``current_url`` is preserved across the heal.
 
@@ -494,20 +520,39 @@ class ChromeBridge:
         self._teardown_socket()
         self.connect()
         with self._lock:
-            others = [t for t in self._tabs if t is not self._default_tab]
-        for tab in others:
+            tabs = list(self._tabs)  # creation order: default first, then new_tab
+        # A fresh socket means no attached tabs. Null every stale id BEFORE the
+        # first re-open so its adaptive replace shape sees no phantom "attached"
+        # sibling and goes out as the key-less reaper (each _open below clears
+        # the detach flag it sets here).
+        for tab in tabs:
             tab._mark_detached()
-        # The default tab's detach flag was set on the socket death's failure
-        # path; a fresh socket means no attached tab, so force a re-open on the
-        # last URL (the open below clears the flag itself).
-        default = self._default_tab
-        default.tab_id = None
-        default._detached.clear()
-        if default.current_url is not None:
+        for tab in tabs:
+            if tab.current_url is None:
+                # Nothing to restore: dead until an explicit open/navigate/
+                # attach. The next primitive raises this as an actionable
+                # BridgeError instead of silently running against no tab.
+                tab._dead_reason = (
+                    "bridge reconnected after a connection loss, but this tab "
+                    "never had a URL to restore; call open/navigate/attach to "
+                    "start a new session on it"
+                )
+                continue
             log.info(
-                "chrome-bridge: reconnected; re-attaching to %s", default.current_url
+                "chrome-bridge: reconnected; re-attaching to %s", tab.current_url
             )
-            default._open(default.current_url, timeout=DEFAULT_REATTACH_TIMEOUT)
+            try:
+                tab._open(tab.current_url, timeout=DEFAULT_REATTACH_TIMEOUT)
+            except BridgeError as exc:
+                # Best-effort per tab: one tab's failed heal must not poison
+                # the siblings. The handle stays unattached; its next
+                # primitive retries via _ensure_attached.
+                log.warning(
+                    "chrome-bridge: re-attach of %s failed (will retry on "
+                    "next use): %s",
+                    tab.current_url,
+                    exc,
+                )
 
     def close(self) -> None:
         """Best-effort end the session — closing all open tabs — then tear down
@@ -548,6 +593,7 @@ class ChromeBridge:
             tab.tab_id = None
             tab._owned = False
             tab.current_url = None
+            tab._dead_reason = None  # explicit teardown supersedes a dead mark
         self._retire_extra_tabs()
         self._teardown_socket()
 
@@ -582,6 +628,7 @@ class ChromeBridge:
             tab.tab_id = None
             tab._owned = False
             tab.current_url = None
+            tab._dead_reason = None  # explicit teardown supersedes a dead mark
         self._retire_extra_tabs()
         self._teardown_socket()
 
@@ -636,11 +683,10 @@ class ChromeBridge:
         """True if the loopback socket is connected and not torn down.
 
         A fatal transport loss (peer gone, reader thread stopped) sets
-        ``_closed`` and drops the socket; after that every primitive raises
-        "bridge is not connected", and this client cannot recover it on its own
-        (the per-tab re-attach only heals a detached *tab*, not a dead
-        *socket*). A long-lived owner that reuses one client across calls can
-        poll this to discard and rebuild a dead client.
+        ``_closed`` and drops the socket. Tabs with a ``current_url`` heal
+        transparently — their next primitive rebuilds the connection via
+        :meth:`reconnect` — but a session that never opened a URL cannot, so a
+        long-lived owner can poll this to decide when to re-open explicitly.
         """
         return self._sock is not None and not self._closed.is_set()
 
@@ -770,6 +816,10 @@ class ChromeBridge:
                         # next (re)connect clears the map — inert, as Chrome
                         # never reuses tab ids within one browser session.
                         self._undispatched_detaches[tab_id] = reason
+            if tab_id is not None and not targets:
+                log.debug(
+                    "chrome-bridge: parked detach for unpublished tab %r", tab_id
+                )
             # The tab is gone; mark so the next primitive on it re-opens.
             for tab in targets:
                 tab._mark_detached()
@@ -799,6 +849,21 @@ class ChromeBridge:
                 targets = [
                     t for t in self._tabs if tab_id is None or t.tab_id == tab_id
                 ]
+            if tab_id is not None and not targets:
+                # A tabId no live handle has published: a late event from a
+                # tab that already detached (or a pre-eviction session whose
+                # ids were since remapped). Routing it anywhere — even the
+                # connection-wide bus — could hand it to a listener observing
+                # a different tab, so drop it. (A legit event cannot race its
+                # tab's open/attach publish: no CDP domain is enabled until
+                # the post-publish Page.enable, so nothing fires before the
+                # id is routable.)
+                log.debug(
+                    "chrome-bridge: dropping event %s for unknown tab %r",
+                    method,
+                    tab_id,
+                )
+                return
             # Connection-wide bus first (the legacy surface sees every tab's
             # events), then per-tab routing.
             self._fire(method, params)
@@ -1177,6 +1242,11 @@ class Tab:
         # Flips on this tab's onDetach so primitives can re-attach
         # idempotently before their next op.
         self._detached = threading.Event()
+        # Set by ChromeBridge.reconnect() when it found nothing to restore for
+        # this handle (no URL was ever opened on it): the next primitive
+        # raises it as an actionable BridgeError. An explicit open/navigate/
+        # attach starts a fresh session and clears it.
+        self._dead_reason: str | None = None
         # Flipped by close(): the handle is permanently unusable.
         self._handle_closed = False
         # Per-tab event bus: raw CDP events routed to this tab by tabId, plus
@@ -1371,6 +1441,9 @@ class Tab:
             # session falsely "attached". A spuriously-set flag only costs one
             # harmless extra re-attach, which is the safe direction to err.
             self._detached.clear()
+            # An explicit open is exactly the "start a new session" action a
+            # dead handle's error message asks for: revive it.
+            self._dead_reason = None
             payload: dict[str, Any] = {"op": "open", "url": url}
             bridge = self._bridge
             # Compute the adaptive replace shape UNDER the op lock: with the
@@ -1444,8 +1517,10 @@ class Tab:
         """
         self._check_usable()
         # Same rationale as _open(): clear the detach flag BEFORE the request so
-        # a detach observed for the new tab during this attach survives.
+        # a detach observed for the new tab during this attach survives. An
+        # explicit attach also revives a dead handle (see _open).
         self._detached.clear()
+        self._dead_reason = None
         reply = self._bridge._request({"op": "attach"}, timeout=timeout)
         tab_id = reply.get("tabId")
         if tab_id is None:
@@ -1487,10 +1562,11 @@ class Tab:
 
         A dead loopback socket (the service worker was evicted, dropping the
         native port and thus the host's relay) is healed first: record ``url``
-        so the rebuilt session lands on it, reconnect, and re-open — the page
-        is then open and loaded on a fresh tab. On that heal path ``timeout``
-        does not govern the default tab's load wait (``reconnect`` uses the
-        short :data:`DEFAULT_REATTACH_TIMEOUT` ceiling), which is harmless:
+        so the rebuilt session lands on it, reconnect (which re-opens EVERY
+        tab that had a URL, this one included), and the page is then open and
+        loaded on a fresh tab. On that heal path ``timeout`` does not govern
+        the re-attach load waits (``reconnect`` uses the short
+        :data:`DEFAULT_REATTACH_TIMEOUT` ceiling per tab), which is harmless:
         the re-attach load wait is non-fatal and ``wait_selector`` is the real
         readiness gate a script should apply next.
         """
@@ -1499,13 +1575,15 @@ class Tab:
         if bridge._sock is None or bridge._closed.is_set():
             # No live socket to navigate over: rebuild the whole connection and
             # land on `url`. Set current_url first so the reconnect's eager
-            # default-tab re-open (or the re-open below for an additional tab)
-            # targets the requested page, not a stale prior one.
+            # re-open of this tab targets the requested page, not a stale
+            # prior one.
             self.current_url = url
             bridge.reconnect()
             if self.tab_id is not None:
-                return  # reconnect() re-opened this (default) tab on `url`
-            # An additional tab: reconnect() only re-opens the default tab.
+                return  # reconnect() re-opened this tab on `url`
+            # reconnect() heals best-effort per tab; if this tab's eager
+            # re-open failed, retry it here so the error (if any) surfaces on
+            # this call.
             self._open(url, timeout=timeout)
             return
         if self.tab_id is None or self._detached.is_set():
@@ -1986,9 +2064,12 @@ class Tab:
           so the host's relay ended and this client's loopback socket died. A
           dead socket cannot carry an ``open``; rebuild the whole connection via
           :meth:`ChromeBridge.reconnect` (which re-dials and eagerly re-opens
-          the default tab's last URL) before any op; an additional tab then
-          re-opens itself below. A long-lived owner reusing one client thus
-          self-heals an evicted worker without being discarded and rebuilt.
+          EVERY tab that had a URL, in creation order, remapping tab ids —
+          including this one, so it normally returns ready) before any op. If
+          this tab's eager re-open failed (reconnect heals best-effort per
+          tab), it falls through to the re-open below as the retry. A
+          long-lived owner reusing one client thus self-heals an evicted
+          worker without being discarded and rebuilt.
 
         ``timeout`` caps the re-attach load wait; callers running on a deadline
         (e.g. :meth:`wait_selector`) pass their remaining budget so a re-attach
@@ -1998,15 +2079,19 @@ class Tab:
 
         Sessions joined via :meth:`ChromeBridge.attach` record no URL, so a
         detach of the user's tab surfaces here as :class:`DetachedError` — by
-        design the bridge never silently re-opens a user tab.
+        design the bridge never silently re-opens a user tab. A handle a
+        reconnect marked dead (no URL to restore) surfaces its stored
+        :class:`BridgeError` here; an explicit open/navigate/attach revives it.
         """
         self._check_usable()
+        if self._dead_reason is not None:
+            raise BridgeError(self._dead_reason)
         bridge = self._bridge
-        # A dead socket must be rebuilt first: reconnect() re-dials and (if a
-        # URL was opened) re-attaches the default tab, so that handle returns
-        # ready; an additional tab falls through to its own re-open below.
-        # Without a URL there is nothing to resume — surface the loss rather
-        # than silently reconnect to an unattached session.
+        # A dead socket must be rebuilt first: reconnect() re-dials and
+        # re-attaches every tab that had a URL — including this one, which
+        # then returns ready below. Without a URL there is nothing to resume —
+        # surface the loss rather than silently reconnect to an unattached
+        # session.
         if bridge._sock is None or bridge._closed.is_set():
             if self.current_url is None:
                 raise BridgeError(
@@ -2015,7 +2100,7 @@ class Tab:
                 )
             bridge.reconnect()
             if self.tab_id is not None:
-                return  # reconnect() re-opened this (default) tab
+                return  # reconnect() re-opened this tab
         if self.tab_id is not None and not self._detached.is_set():
             return
         if self.current_url is None:

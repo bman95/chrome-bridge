@@ -27,7 +27,7 @@ import pytest
 
 from chrome_bridge import profiles
 from chrome_bridge.bridge.frames import read_frame, write_frame
-from chrome_bridge.bridge.client import BridgeError, ChromeBridge
+from chrome_bridge.bridge.client import BridgeError, ChromeBridge, DetachedError
 
 
 class ReconnectableBridge:
@@ -368,9 +368,9 @@ def test_reattach_targets_the_last_url_not_an_earlier_one(rbridge):
 
 def test_reconnect_heals_default_and_additional_tabs(rbridge):
     # A socket death with BOTH the default tab and a new_tab handle open:
-    # touching the additional tab must rebuild the connection, eagerly re-open
-    # the default tab on its last URL (legacy resume, key-less reaper shape),
-    # then re-open the additional tab itself with replace:false so the healed
+    # touching the additional tab must rebuild the connection, which re-opens
+    # BOTH tabs in creation order — the default on its last URL (key-less
+    # reaper shape), then the additional tab with replace:false so the healed
     # default is not torn down.
     cdp = _client(rbridge)
     try:
@@ -395,8 +395,9 @@ def test_reconnect_heals_default_and_additional_tabs(rbridge):
 
 def test_navigate_on_additional_tab_reconnects_after_socket_death(rbridge):
     # navigate() on a new_tab handle over a dead socket must rebuild the
-    # connection (which eagerly re-opens the default tab on ITS last URL),
-    # then re-open THIS tab on the requested URL with replace:false.
+    # connection, which re-opens the default tab on ITS last URL and then
+    # THIS tab on the requested URL (recorded before the reconnect) with
+    # replace:false.
     cdp = _client(rbridge)
     try:
         cdp.open("https://a", timeout=0.3)
@@ -436,6 +437,67 @@ def test_reconnect_new_tab_only_session_reaps_on_first_reopen(rbridge):
         assert opens[0]["url"] == "https://b"
         assert "replace" not in opens[0]      # the reaper shape
         assert tab.tab_id is not None and tab.tab_id != first_id
+    finally:
+        cdp.close()
+
+
+def test_reconnect_restores_all_tabs_in_creation_order(rbridge):
+    # An explicit reconnect() after a socket death must EAGERLY re-open every
+    # tab that had a URL — the default tab first, then new_tab handles in
+    # creation order — remapping each handle's tab_id onto its fresh Chrome
+    # tab so existing Tab references keep working.
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        old_default_id, old_b_id = cdp._tab_id, tab_b.tab_id
+
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        rbridge.received.clear()
+        cdp.reconnect()
+
+        # Both tabs re-opened inside reconnect() itself, oldest first.
+        opens = [f for f in rbridge.received if f.get("op") == "open"]
+        assert [f["url"] for f in opens] == ["https://a", "https://b"]
+        assert "replace" not in opens[0]     # first re-open: the reaper shape
+        assert opens[1]["replace"] is False  # later ones never reap siblings
+        # Fresh tab ids were remapped onto the existing handles.
+        assert cdp._tab_id is not None and cdp._tab_id != old_default_id
+        assert tab_b.tab_id is not None and tab_b.tab_id != old_b_id
+        assert cdp._tab_id != tab_b.tab_id
+        # Both handles remain usable without any further re-open.
+        assert cdp.banner_present(".x") is True
+        assert tab_b.banner_present(".y") is True
+        assert sum(1 for f in rbridge.received if f.get("op") == "open") == 2
+    finally:
+        cdp.close()
+
+
+def test_reconnect_marks_urlless_default_tab_dead_until_reopened(rbridge):
+    # A tab that never opened a URL has nothing to restore: after a socket
+    # death + reconnect() it is marked dead — its next primitive raises an
+    # actionable BridgeError (not a bare DetachedError) — while its siblings
+    # are restored and usable. An explicit open() starts a fresh session on
+    # the dead handle and revives it.
+    cdp = _client(rbridge)
+    try:
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        cdp.reconnect()
+        # The new_tab handle was restored; the URL-less default tab is dead.
+        assert tab_b.tab_id is not None
+        with pytest.raises(BridgeError, match="never had a URL to restore") as ei:
+            cdp.banner_present(".x")
+        assert not isinstance(ei.value, DetachedError)
+        # The restored sibling is untouched by the dead handle.
+        assert tab_b.banner_present(".y") is True
+        # An explicit open revives the dead handle with a fresh session.
+        cdp.open("https://a", timeout=0.3)
+        assert cdp.banner_present(".x") is True
     finally:
         cdp.close()
 
