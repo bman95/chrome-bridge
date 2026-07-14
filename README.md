@@ -6,8 +6,9 @@ scripting **multiple Chrome profiles** (e.g. personal vs. work accounts)
 independently of one another.
 
 See [`docs/design.md`](docs/design.md) for why this exists and how it works,
-and [`docs/multi-profile.md`](docs/multi-profile.md) for the multi-profile
-design.
+[`docs/multi-profile.md`](docs/multi-profile.md) for the multi-profile
+design, and [`docs/multi-tab.md`](docs/multi-tab.md) for driving several
+tabs over one connection.
 
 ## Quick start
 
@@ -50,6 +51,27 @@ with ChromeBridge(profile="personal") as cdp:
     cdp.navigate("https://example.com")
     cdp.click_selector("button.submit")
 ```
+
+### Multiple tabs
+
+One connection can drive several tabs: `new_tab` opens an additional tab and
+returns a `Tab` handle with the same page primitives.
+
+```python
+from chrome_bridge import ChromeBridge
+
+with ChromeBridge(profile="personal") as bridge:
+    a = bridge.new_tab("https://example.com")
+    b = bridge.new_tab("https://example.org")
+    a.wait_selector("#content")
+    print(b.outer_html("h1"))
+    b.close()          # closes that tab; `a` is untouched
+```
+
+The legacy single-tab usage above is unchanged — the facade methods
+(`cdp.navigate(...)` etc.) keep driving one tab at a time. Operations are
+serialized per connection (tabs interleave, they don't run in parallel).
+See [`docs/multi-tab.md`](docs/multi-tab.md).
 
 ## CLI commands
 
