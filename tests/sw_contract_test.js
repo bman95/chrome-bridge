@@ -8,6 +8,7 @@ const storageChanges = [];
 const alarmEvents = [];
 const removed = [];
 const detached = [];
+const sent = [];
 let activeTab = null;
 let nextTabId = 1;
 // When set, the next chrome.debugger.attach throws this error once —
@@ -42,7 +43,7 @@ global.chrome = {
       }
     },
     detach: async ({ tabId }) => { detached.push(tabId); },
-    sendCommand: async () => ({}),
+    sendCommand: async ({ tabId }) => { sent.push(tabId); return {}; },
     onEvent: { addListener: (fn) => debuggerEvents.push(fn) },
     onDetach: { addListener: (fn) => debuggerDetaches.push(fn) },
   },
@@ -63,29 +64,30 @@ const tests = String.raw`
 
   const id = (generation, original) => [RELAY_SESSION_ID_MARKER, generation, original];
   await onPythonMessage({ id: id(1, 1), op: "open", url: "https://example.com" }, fakePort);
-  assert.equal(dbgTabId, 1);
-  assert.equal(dbgTabOwned, true);
-  assert.equal(dbgTabSessionGeneration, 1);
+  assert.deepEqual([...sessions.keys()], [1]);
+  assert.equal(sessions.get(1).bridgeCreated, true);
+  assert.equal(sessions.get(1).sessionGeneration, 1);
 
   // Attaching the already-focused bridge tab hands ownership to the user and
   // transfers the session generation. Closing must detach but never remove it.
   activeTab = { id: 1 };
   await onPythonMessage({ id: id(2, 1), op: "attach" }, fakePort);
-  assert.equal(dbgTabOwned, false);
-  assert.equal(dbgTabSessionGeneration, 2);
+  assert.equal(sessions.get(1).bridgeCreated, false);
+  assert.equal(sessions.get(1).sessionGeneration, 2);
   await onPythonMessage({ id: id(2, 2), op: "close" }, fakePort);
   assert.deepEqual(detached, [1]);
   assert.deepEqual(removed, []);
 
   // An owned tab is reaped by onDetach and its event retains the tab-bound
-  // generation used by nmh.py's event fence.
+  // generation used by nmh.py's event fence — and carries the source tabId.
   await onPythonMessage({ id: id(3, 1), op: "open", url: "https://example.org" }, fakePort);
-  assert.equal(dbgTabId, 2);
+  assert.ok(sessions.has(2));
   debuggerDetaches[0]({ tabId: 2 }, "target_closed");
   await Promise.resolve();
   assert.deepEqual(removed, [2]);
   const event = replies.find((msg) => msg.event && msg.type === "detached");
   assert.equal(event.sessionGeneration, 3);
+  assert.equal(event.tabId, 2);
 
   // attach with NO active tab replies ok:false with the structured errorCode
   // the CLI's nav fallback keys on (cli.py branches on "no_active_tab").
@@ -93,21 +95,21 @@ const tests = String.raw`
   await onPythonMessage({ id: id(4, 1), op: "attach" }, fakePort);
   assert.equal(replies.at(-1).ok, false);
   assert.equal(replies.at(-1).errorCode, "no_active_tab");
-  assert.equal(dbgTabId, null);
+  assert.equal(sessions.size, 0);
 
   // "detach" with no tab attached is idempotent ok:true even for a fenced
-  // caller, whose generation cannot match the (null) session generation.
+  // caller, whose generation cannot match any table entry.
   await onPythonMessage({ id: id(4, 2), op: "detach" }, fakePort);
   assert.equal(replies.at(-1).ok, true);
 
   // Attaching a DIFFERENT active tab while an owned bridge tab is held: the
   // single-tab teardown removes the owned tab; the user tab attaches unowned.
   await onPythonMessage({ id: id(5, 1), op: "open", url: "https://example.net" }, fakePort);
-  const ownedTab = dbgTabId;
+  const ownedTab = replies.at(-1).tabId;
   activeTab = { id: 90 };
   await onPythonMessage({ id: id(6, 1), op: "attach" }, fakePort);
-  assert.equal(dbgTabId, 90);
-  assert.equal(dbgTabOwned, false);
+  assert.deepEqual([...sessions.keys()], [90]);
+  assert.equal(sessions.get(90).bridgeCreated, false);
   assert.ok(removed.includes(ownedTab));
   assert.ok(!removed.includes(90));
 
@@ -118,39 +120,40 @@ const tests = String.raw`
     { id: id(7, 1), op: "open", url: "https://example.com/keep" },
     fakePort
   );
-  const keptTab = dbgTabId;
+  const keptTab = replies.at(-1).tabId;
   assert.ok(!removed.includes(90)); // the unowned tab 90 was detached, not removed
   activeTab = { id: 91 };
   attachFailure = new Error("Cannot attach to this target");
   await onPythonMessage({ id: id(8, 1), op: "attach" }, fakePort);
   assert.equal(replies.at(-1).ok, false);
-  assert.equal(dbgTabId, keptTab); // prior session intact
-  assert.equal(dbgTabOwned, true);
-  assert.equal(dbgTabSessionGeneration, 7);
+  assert.deepEqual([...sessions.keys()], [keptTab]); // prior session intact
+  assert.equal(sessions.get(keptTab).bridgeCreated, true);
+  assert.equal(sessions.get(keptTab).sessionGeneration, 7);
   assert.ok(!removed.includes(keptTab));
   assert.ok(!removed.includes(91)); // the user's tab is never removed on failure
 
   // The onDetach reaper must NEVER remove a merely-attached user tab; it
-  // still emits the detached event and clears the reference.
+  // still emits the detached event and clears only that tab's entry.
   await onPythonMessage({ id: id(9, 1), op: "attach" }, fakePort);
-  assert.equal(dbgTabId, 91);
+  assert.ok(sessions.has(91));
   debuggerDetaches[0]({ tabId: 91 }, "target_closed");
   await Promise.resolve();
   assert.ok(!removed.includes(91));
   const userDetach = replies.filter((m) => m.event && m.type === "detached").at(-1);
   assert.equal(userDetach.reason, "target_closed");
   assert.equal(userDetach.sessionGeneration, 9);
-  assert.equal(dbgTabId, null);
+  assert.equal(userDetach.tabId, 91);
+  assert.equal(sessions.size, 0);
 
   // An onDetach for the JUST-ATTACHED tab landing during the prior tab's
   // teardown must be seen: the new session is committed before the teardown,
-  // so the event is relayed under the new generation and the reference is
-  // cleared — never a silent ok:true for an already-detached tab.
+  // so the event is relayed under the new generation and the entry is
+  // dropped — never a silent ok:true for an already-detached tab.
   await onPythonMessage(
     { id: id(10, 1), op: "open", url: "https://example.com/prior" },
     fakePort
   );
-  const priorTab = dbgTabId;
+  const priorTab = replies.at(-1).tabId;
   activeTab = { id: 92 };
   const originalRemove = chrome.tabs.remove;
   chrome.tabs.remove = async (tabId) => {
@@ -162,11 +165,149 @@ const tests = String.raw`
   chrome.tabs.remove = originalRemove;
   assert.ok(removed.includes(priorTab)); // prior owned tab torn down
   assert.ok(!removed.includes(92)); // the user's tab is never removed
-  assert.equal(dbgTabId, null); // the mid-teardown detach was recognized
+  assert.equal(sessions.size, 0); // the mid-teardown detach was recognized
   const midTeardown = replies.filter((m) => m.event && m.type === "detached").at(-1);
   assert.equal(midTeardown.reason, "target_closed");
   assert.equal(midTeardown.sessionGeneration, 11);
+  assert.equal(midTeardown.tabId, 92);
   assert.equal(replies.at(-1).ok, false); // never ok:true for a dead session
+
+  // --- Multi-tab: "open" with replace:false adds an ADDITIONAL tab without
+  // touching the existing one; ops route by tabId; closing one tab leaves
+  // the other attached and responsive.
+  activeTab = null;
+  const removedBefore = removed.length;
+  await onPythonMessage({ id: id(12, 1), op: "open", url: "https://a.example" }, fakePort);
+  const tabA = replies.at(-1).tabId;
+  await onPythonMessage(
+    { id: id(12, 2), op: "open", url: "https://b.example", replace: false },
+    fakePort
+  );
+  const tabB = replies.at(-1).tabId;
+  assert.notEqual(tabA, tabB);
+  assert.equal(sessions.size, 2);
+  assert.equal(removed.length, removedBefore); // tabA untouched by the second open
+  assert.equal(sessions.get(tabA).bridgeCreated, true);
+  assert.equal(sessions.get(tabB).bridgeCreated, true);
+
+  // "tabs" lists every attached tab.
+  await onPythonMessage({ id: id(12, 3), op: "tabs" }, fakePort);
+  assert.deepEqual(replies.at(-1), {
+    id: id(12, 3),
+    ok: true,
+    tabs: [{ tabId: tabA }, { tabId: tabB }],
+  });
+
+  // cdp routes by tabId to the requested tab.
+  await onPythonMessage(
+    { id: id(12, 4), op: "cdp", method: "Page.enable", tabId: tabB },
+    fakePort
+  );
+  assert.equal(replies.at(-1).ok, true);
+  assert.equal(sent.at(-1), tabB);
+  await onPythonMessage(
+    { id: id(12, 5), op: "cdp", method: "Page.enable", tabId: tabA },
+    fakePort
+  );
+  assert.equal(sent.at(-1), tabA);
+
+  // Without tabId and several tabs attached, cdp/close refuse to guess.
+  await onPythonMessage({ id: id(12, 6), op: "cdp", method: "Page.enable" }, fakePort);
+  assert.equal(replies.at(-1).ok, false);
+  assert.match(replies.at(-1).error, /ambiguous/);
+  await onPythonMessage({ id: id(12, 7), op: "close" }, fakePort);
+  assert.equal(replies.at(-1).ok, false);
+  assert.match(replies.at(-1).error, /ambiguous/);
+
+  // Unknown/unattached tabId -> actionable error.
+  await onPythonMessage(
+    { id: id(12, 8), op: "cdp", method: "Page.enable", tabId: 999 },
+    fakePort
+  );
+  assert.equal(replies.at(-1).ok, false);
+  assert.match(replies.at(-1).error, /999/);
+
+  // CDP events carry the source tabId and that entry's own generation.
+  debuggerEvents[0]({ tabId: tabB }, "Page.loadEventFired", {});
+  const routed = replies.at(-1);
+  assert.equal(routed.type, "cdp");
+  assert.equal(routed.tabId, tabB);
+  assert.equal(routed.sessionGeneration, 12);
+
+  // Closing ONE tab by tabId tears down only that tab; the other stays
+  // attached and responsive (single tab again -> implicit target).
+  await onPythonMessage({ id: id(12, 9), op: "close", tabId: tabA }, fakePort);
+  assert.ok(removed.includes(tabA));
+  assert.ok(!removed.includes(tabB));
+  assert.deepEqual([...sessions.keys()], [tabB]);
+  await onPythonMessage({ id: id(12, 10), op: "cdp", method: "Page.enable" }, fakePort);
+  assert.equal(replies.at(-1).ok, true);
+  assert.equal(sent.at(-1), tabB);
+
+  // Default "open" (replace:true) restores the single-tab mode: every
+  // attached tab is torn down first, bridge-created ones removed.
+  await onPythonMessage(
+    { id: id(13, 1), op: "open", url: "https://c.example", replace: false },
+    fakePort
+  );
+  const tabC = replies.at(-1).tabId;
+  assert.equal(sessions.size, 2); // tabB + tabC
+  await onPythonMessage({ id: id(14, 1), op: "open", url: "https://fresh.example" }, fakePort);
+  const freshTab = replies.at(-1).tabId;
+  assert.ok(removed.includes(tabB));
+  assert.ok(removed.includes(tabC));
+  assert.deepEqual([...sessions.keys()], [freshTab]);
+
+  // "close" with no tabId and NO attached tab is a successful no-op even for
+  // a fenced caller (nothing a stale client could clobber).
+  await onPythonMessage({ id: id(14, 2), op: "close" }, fakePort);
+  assert.equal(sessions.size, 0);
+  await onPythonMessage({ id: id(15, 1), op: "close" }, fakePort);
+  assert.equal(replies.at(-1).ok, true);
+
+  // "tabs" with none attached replies an empty list.
+  await onPythonMessage({ id: id(15, 2), op: "tabs" }, fakePort);
+  assert.deepEqual(replies.at(-1).tabs, []);
+
+  // Per-entry staleness: a later client generation cannot drive a tab
+  // attached under an earlier one — but "tabs" is not fenced, so the new
+  // generation can still list leftovers before re-"open"ing.
+  await onPythonMessage({ id: id(16, 1), op: "open", url: "https://gen.example" }, fakePort);
+  const genTab = replies.at(-1).tabId;
+  await onPythonMessage(
+    { id: id(17, 1), op: "cdp", method: "Page.enable", tabId: genTab },
+    fakePort
+  );
+  assert.equal(replies.at(-1).ok, false);
+  assert.match(replies.at(-1).error, /stale/);
+  await onPythonMessage({ id: id(17, 2), op: "tabs" }, fakePort);
+  assert.deepEqual(replies.at(-1).tabs, [{ tabId: genTab }]);
+  await onPythonMessage({ id: id(17, 3), op: "open", url: "https://gen2.example" }, fakePort);
+  assert.ok(removed.includes(genTab)); // replace:true recovered the leftover
+  assert.equal(sessions.size, 1);
+  await onPythonMessage({ id: id(17, 4), op: "close" }, fakePort);
+  assert.equal(sessions.size, 0);
+
+  // "attach" keeps the single-tab invariant even from a multi-tab state:
+  // every OTHER attached tab is torn down once the new attachment is secured.
+  await onPythonMessage({ id: id(18, 1), op: "open", url: "https://x.example" }, fakePort);
+  const multiA = replies.at(-1).tabId;
+  await onPythonMessage(
+    { id: id(18, 2), op: "open", url: "https://y.example", replace: false },
+    fakePort
+  );
+  const multiB = replies.at(-1).tabId;
+  activeTab = { id: 93 };
+  await onPythonMessage({ id: id(19, 1), op: "attach" }, fakePort);
+  assert.equal(replies.at(-1).ok, true);
+  assert.deepEqual([...sessions.keys()], [93]);
+  assert.equal(sessions.get(93).bridgeCreated, false);
+  assert.ok(removed.includes(multiA));
+  assert.ok(removed.includes(multiB));
+  await onPythonMessage({ id: id(19, 2), op: "close" }, fakePort);
+  assert.ok(!removed.includes(93)); // merely-attached: detached, never removed
+  assert.equal(sessions.size, 0);
+  activeTab = null;
 
   // Exercise dial()'s real listener-level requestChain. A postMessage failure
   // makes the first handler reject; the chain must recover and process the
