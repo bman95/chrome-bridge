@@ -1850,3 +1850,109 @@ def test_default_tab_close_raises(bridge):
             cdp._default_tab.close()
     finally:
         cdp.close()
+
+
+def test_lone_tab_reattach_keeps_wire_default_replace(bridge):
+    # With NOTHING else attached, a re-open keeps the key-less wire-default
+    # replace:true shape: it is the only reaper for generation-fenced leftover
+    # tabs, and there are no siblings it could tear down.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        tab = cdp.new_tab("https://b", timeout=0.2)
+        assert tab.tab_id == 100
+        bridge.send_event(
+            {"event": True, "type": "detached", "reason": "gone", "tabId": 100}
+        )
+        deadline = time.monotonic() + 2
+        while not tab._detached.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        bridge.received.clear()
+        assert tab.banner_present(".x") is True
+        reopen = next(f for f in bridge.received if f.get("op") == "open")
+        assert "replace" not in reopen
+        assert tab.tab_id == 101
+    finally:
+        cdp.close()
+
+
+def test_detach_racing_open_reply_is_not_lost(bridge):
+    # The extension can emit the new tab's detached event BEFORE the client's
+    # op thread has published the tabId from the open reply (routing by id
+    # then matches nothing). The detach must not be dropped: the open fails
+    # with DetachedError and the handle stays detached, instead of believing
+    # itself attached to a session the extension already discarded.
+    def on_open(frame):
+        bridge.send_event(
+            {"event": True, "type": "detached", "reason": "early_gone",
+             "tabId": 100}
+        )
+        return {"ok": True, "tabId": 100}
+
+    bridge.on("open", on_open)
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        with pytest.raises(DetachedError, match="early_gone"):
+            cdp.open("https://a", timeout=0.2)
+        assert cdp._detached.is_set()
+        assert cdp._tab_id is None
+    finally:
+        cdp.close()
+
+
+def test_tab_cdp_refuses_untargeted_frames(bridge):
+    # If the reader nulls tab_id between a primitive's _ensure_attached and
+    # the send (detach event / sibling facade open), the frame must NOT go out
+    # without tabId — the extension would resolve it onto whatever single tab
+    # remains, executing on the wrong tab. DetachedError instead.
+    bridge.on("open", _ok_open())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab = cdp._default_tab
+        tab.tab_id = None  # simulate the race window
+        sent_before = len(bridge.received)
+        with pytest.raises(DetachedError):
+            tab._cdp("Runtime.evaluate", {"expression": "1"})
+        assert len(bridge.received) == sent_before  # nothing hit the wire
+    finally:
+        cdp.close()
+
+
+def test_new_tab_page_enable_failure_closes_created_tab(bridge):
+    # open succeeds but the follow-up Page.enable fails: the half-created tab
+    # must be best-effort closed (with ITS tabId) and the handle unregistered.
+    bridge.on("open", _sequential_opens())
+
+    def default(frame):
+        if frame.get("method") == "Page.enable":
+            return {"ok": False, "error": "attach lost"}
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge)
+    try:
+        with pytest.raises(BridgeError, match="attach lost"):
+            cdp.new_tab("https://b", timeout=0.2)
+        closes = [f for f in bridge.received if f.get("op") == "close"]
+        assert closes and closes[0]["tabId"] == 100
+        assert cdp._tabs == [cdp._default_tab]
+    finally:
+        cdp.close()
+
+
+def test_bridge_close_retires_new_tab_handles(bridge):
+    # After a connection teardown, an additional-tab handle is permanently
+    # retired (like Tab.close) rather than lingering in the registry and
+    # silently re-opening a tab on a future connection.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    tab = cdp.new_tab("https://b", timeout=0.2)
+    cdp.close()
+    with pytest.raises(BridgeError, match="closed"):
+        tab.banner_present(".x")
+    assert cdp._tabs == [cdp._default_tab]

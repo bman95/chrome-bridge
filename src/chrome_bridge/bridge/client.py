@@ -99,6 +99,11 @@ DEFAULT_CONNECT_TIMEOUT = 8.0      # dial the loopback host
 # nav timeout so a missed re-attach load event cannot stall the caller.
 DEFAULT_REATTACH_TIMEOUT = 5.0
 
+# Sentinel for Tab._open's `replace` param: "compute it adaptively via
+# Tab._reopen_replace()" — distinct from None, which is a meaningful value
+# there (omit the key -> the wire default replace:true).
+_ADAPTIVE_REPLACE = object()
+
 # Default CSS selector outer_html reads when the caller doesn't specify a
 # container: the document's <body>. Chrome's 1 MB Native-Messaging cap applies
 # only host->extension (the small command frames), NOT to replies: a large
@@ -269,6 +274,16 @@ class ChromeBridge:
         # routing lives on Tab.on_event).
         self._event_listeners: dict[str, list] = {}
 
+        # tabId -> reason for targeted "detached" events that matched no handle
+        # when the reader processed them. The one legitimate producer is a
+        # detach racing its own open/attach reply: the op thread has not
+        # published the new tab_id yet, so routing by id finds nothing — and
+        # without this map the handle would believe itself attached to a
+        # session the extension already discarded, forever. _open/_attach
+        # consume entries atomically when publishing the id. Guarded by _lock;
+        # cleared on every (re)connect (a new browser session may reuse ids).
+        self._undispatched_detaches: dict[int, str] = {}
+
         # Tab registry, used to route tabId-tagged events to their handles.
         # The FIRST entry is the default tab backing the legacy single-tab
         # facade; new_tab() appends. Guarded by _lock.
@@ -375,6 +390,9 @@ class ChromeBridge:
             self._generation += 1
             my_gen = self._generation
             self._closed.clear()
+            # Parked detaches belong to the dead connection; a fresh browser
+            # session may even reuse its tab ids, so never let them leak.
+            self._undispatched_detaches.clear()
         # Pass this connection's rfile + generation explicitly: a stale reader
         # from a prior socket must read ITS OWN rfile and only touch shared state
         # while still current, so a reconnect's new reader is never corrupted.
@@ -504,18 +522,31 @@ class ChromeBridge:
             return
         with self._lock:
             tabs = list(self._tabs)
+        # One shared op-timeout budget across ALL tab teardowns: with a wedged
+        # worker, per-tab timeouts would stack (N tabs -> N x op_timeout inside
+        # __exit__); the shared deadline keeps the worst case at the legacy
+        # single-tab bound.
+        deadline = time.monotonic() + self._op_timeout
         for tab in tabs:
+            # Snapshot the id: the reader thread (a detach event) can null it
+            # mid-loop, and a close that then went out WITHOUT tabId would be
+            # resolved by the extension onto whatever single tab remains —
+            # closing the wrong tab.
+            tab_id = tab.tab_id
             # Try to close each tab cleanly; never let teardown errors propagate.
-            if tab.tab_id is not None and not self._closed.is_set():
+            if tab_id is not None and not self._closed.is_set():
                 try:
                     self._request(
-                        {"op": "close"}, timeout=self._op_timeout, tab_id=tab.tab_id
+                        {"op": "close"},
+                        timeout=max(0.0, deadline - time.monotonic()),
+                        tab_id=tab_id,
                     )
                 except BridgeError as exc:
                     log.debug("chrome-bridge close op failed (ignored): %s", exc)
             tab.tab_id = None
             tab._owned = False
             tab.current_url = None
+        self._retire_extra_tabs()
         self._teardown_socket()
 
     def detach(self) -> None:
@@ -533,17 +564,23 @@ class ChromeBridge:
             return
         with self._lock:
             tabs = list(self._tabs)
+        # Same shared teardown budget + id snapshot rationale as close().
+        deadline = time.monotonic() + self._op_timeout
         for tab in tabs:
-            if tab.tab_id is not None and not self._closed.is_set():
+            tab_id = tab.tab_id
+            if tab_id is not None and not self._closed.is_set():
                 try:
                     self._request(
-                        {"op": "detach"}, timeout=self._op_timeout, tab_id=tab.tab_id
+                        {"op": "detach"},
+                        timeout=max(0.0, deadline - time.monotonic()),
+                        tab_id=tab_id,
                     )
                 except BridgeError as exc:
                     log.debug("chrome-bridge detach op failed (ignored): %s", exc)
             tab.tab_id = None
             tab._owned = False
             tab.current_url = None
+        self._retire_extra_tabs()
         self._teardown_socket()
 
     def _teardown_socket(self) -> None:
@@ -712,6 +749,14 @@ class ChromeBridge:
                     targets = list(self._tabs)
                 else:
                     targets = [t for t in self._tabs if t.tab_id == tab_id]
+                    if not targets:
+                        # No handle has published this tabId (yet): an
+                        # open/attach reply may still be crossing the op
+                        # thread, whose handle would otherwise never learn of
+                        # this detach and believe itself attached forever.
+                        # Park it; _open/_attach consume it atomically (under
+                        # this same lock) when publishing the id.
+                        self._undispatched_detaches[tab_id] = reason
             # The tab is gone; mark so the next primitive on it re-opens.
             for tab in targets:
                 tab._mark_detached()
@@ -877,19 +922,23 @@ class ChromeBridge:
         with self._lock:
             self._tabs.append(tab)
         try:
-            tab._open(url, timeout=timeout)
-        except BaseException:
+            tab._open(url, timeout=timeout, replace=False)
+        except BaseException as exc:
             # A failed open must not leak a half-alive handle: if the tab was
             # created server-side before the failure (e.g. Page.enable died),
-            # best-effort close it, then unregister the handle.
-            if tab.tab_id is not None and self.is_alive():
+            # best-effort close it, then unregister the handle. The network
+            # cleanup runs only for ordinary Exceptions — a KeyboardInterrupt/
+            # SystemExit must not block on another op round-trip first.
+            tab_id = tab.tab_id  # snapshot: the reader may null it concurrently
+            if isinstance(exc, Exception) and tab_id is not None and self.is_alive():
                 try:
                     self._request(
-                        {"op": "close"}, timeout=self._op_timeout, tab_id=tab.tab_id
+                        {"op": "close"}, timeout=self._op_timeout, tab_id=tab_id
                     )
-                except BridgeError as exc:
+                except BridgeError as cleanup_exc:
                     log.debug(
-                        "chrome-bridge new_tab cleanup close failed (ignored): %s", exc
+                        "chrome-bridge new_tab cleanup close failed (ignored): %s",
+                        cleanup_exc,
                     )
             with self._lock:
                 if tab in self._tabs:
@@ -901,6 +950,23 @@ class ChromeBridge:
         """True when any OTHER registered handle currently holds an attached tab."""
         with self._lock:
             return any(t is not tab and t.tab_id is not None for t in self._tabs)
+
+    def _retire_extra_tabs(self) -> None:
+        """Permanently retire every non-default handle and reset the registry.
+
+        A connection teardown (:meth:`close` / :meth:`detach`) invalidates
+        additional tabs for good — unlike the default tab, which backs the
+        facade and stays reusable across close()/connect() cycles, a stale
+        :meth:`new_tab` handle must not linger in the registry (leaking into
+        event routing and the sibling-liveness check) or silently re-open a
+        tab on a future connection. Touching one afterwards raises the same
+        "tab is closed" error as :meth:`Tab.close`.
+        """
+        with self._lock:
+            for tab in self._tabs:
+                if tab is not self._default_tab:
+                    tab._handle_closed = True
+            self._tabs = [self._default_tab]
 
     def _mark_other_tabs_detached(self, keep: Tab) -> None:
         """Mark every handle except ``keep`` detached.
@@ -1119,14 +1185,21 @@ class Tab:
             raise BridgeError(
                 "the default tab cannot be closed; use ChromeBridge.close()"
             )
-        if self._handle_closed:
-            return
-        self._handle_closed = True
         bridge = self._bridge
-        if self.tab_id is not None and bridge.is_alive():
+        # Check-and-flip under the lock so concurrent close() calls stay
+        # idempotent (exactly one sends the close op).
+        with bridge._lock:
+            if self._handle_closed:
+                return
+            self._handle_closed = True
+        # Snapshot the id: the reader can null it concurrently, and a close
+        # that went out WITHOUT tabId would be resolved onto whatever single
+        # tab remains attached — closing the wrong tab.
+        tab_id = self.tab_id
+        if tab_id is not None and bridge.is_alive():
             try:
                 bridge._request(
-                    {"op": "close"}, timeout=bridge._op_timeout, tab_id=self.tab_id
+                    {"op": "close"}, timeout=bridge._op_timeout, tab_id=tab_id
                 )
             except BridgeError as exc:
                 log.debug("chrome-bridge tab close op failed (ignored): %s", exc)
@@ -1149,16 +1222,18 @@ class Tab:
         self._owned = False
 
     def _reopen_replace(self) -> bool | None:
-        """The ``replace`` flag for opens issued through this handle.
+        """The ``replace`` flag for re-opens issued through this handle.
 
         ``None`` means omit the key (the wire default, ``replace:true`` — the
-        single-tab reaper). The default tab keeps that legacy shape as long as
-        it is the only live handle; an open issued while OTHER tabs are
-        attached — and every open of a :meth:`ChromeBridge.new_tab` handle —
-        must be ``replace:false`` so it never tears siblings down.
+        single-tab reaper). A (re)open issued while OTHER tabs are attached
+        must be ``replace:false`` so it never tears siblings down; with
+        nothing else attached the reaper shape is kept, so the first re-open
+        after a detach or reconnect also reclaims generation-fenced leftover
+        tabs server-side (the wire designates a ``replace:true`` open as the
+        only reaper for a dead session's tabs). :meth:`ChromeBridge.new_tab`'s
+        INITIAL open bypasses this and is always explicit ``replace:false`` —
+        opening an additional tab is never a reaping event.
         """
-        if not self._is_default:
-            return False
         return False if self._bridge._other_tabs_attached(self) else None
 
     # ------------------------------------------------------------------ #
@@ -1196,11 +1271,25 @@ class Tab:
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Send a raw CDP command on this tab; return its ``result``."""
+        """Send a raw CDP command on this tab; return its ``result``.
+
+        ``tab_id`` is snapshotted ONCE: the reader thread (a detach event) or
+        a sibling facade ``open``/``attach`` can null it between a primitive's
+        ``_ensure_attached`` and this send, and a frame that then went out
+        WITHOUT ``tabId`` would be resolved by the extension onto whatever
+        single tab remains attached — silently executing on the wrong tab.
+        Raising :class:`DetachedError` instead lands the race on the
+        documented retry path (the next primitive re-attaches).
+        """
+        tab_id = self.tab_id
+        if tab_id is None:
+            raise DetachedError(
+                "debugger detached: this tab is no longer attached"
+            )
         reply = self._bridge._request(
             {"op": "cdp", "method": method, "params": params or {}},
             timeout=timeout,
-            tab_id=self.tab_id,
+            tab_id=tab_id,
         )
         return reply.get("result") or {}
 
@@ -1231,16 +1320,22 @@ class Tab:
     # Open / attach / navigate
     # ------------------------------------------------------------------ #
 
-    def _open(self, url: str, *, timeout: float = DEFAULT_NAV_TIMEOUT) -> None:
+    def _open(
+        self,
+        url: str,
+        *,
+        timeout: float = DEFAULT_NAV_TIMEOUT,
+        replace: Any = _ADAPTIVE_REPLACE,
+    ) -> None:
         """Open ``url`` in a fresh attached tab for this handle, await load.
 
         Mirrors a Playwright ``page.goto`` for a freshly opened page: it asks
         the extension to create+attach a background tab at ``url`` (so the
         first navigation is the open itself), enables ``Page`` events, and
-        waits for ``Page.loadEventFired``. The ``replace`` shape comes from
-        :meth:`_reopen_replace`: additional tabs (and any open with live
-        siblings) send ``replace:false``; the lone default tab keeps the
-        legacy key-less frame (wire default ``replace:true``).
+        waits for ``Page.loadEventFired``. ``replace`` defaults to the
+        adaptive :meth:`_reopen_replace` shape (``replace:false`` while
+        siblings are attached, the key-less reaper otherwise);
+        :meth:`ChromeBridge.new_tab` pins its initial open to ``False``.
         """
         self._check_usable()
         # The extension's "open" both creates the tab AND navigates it to `url`,
@@ -1262,7 +1357,8 @@ class Tab:
             # harmless extra re-attach, which is the safe direction to err.
             self._detached.clear()
             payload: dict[str, Any] = {"op": "open", "url": url}
-            replace = self._reopen_replace()
+            if replace is _ADAPTIVE_REPLACE:
+                replace = self._reopen_replace()
             if replace is not None:
                 payload["replace"] = replace
             reply = self._bridge._request(payload, timeout=self._bridge._op_timeout)
@@ -1271,7 +1367,7 @@ class Tab:
                 raise BridgeError(
                     "bridge 'open' reply carried no tabId; cannot attach to the tab"
                 )
-            self.tab_id = tab_id
+            self._publish_tab_id(tab_id, during="open")
             self._owned = True
             self.current_url = url
             self._cdp("Page.enable")
@@ -1281,6 +1377,30 @@ class Tab:
             self._wait_load(loaded, timeout)
         finally:
             self.off_event("Page.loadEventFired", _on_load)
+
+    def _publish_tab_id(self, tab_id: int, *, during: str) -> None:
+        """Set ``self.tab_id`` from an open/attach reply — unless its detach
+        already arrived.
+
+        The reader routes ``detached`` events by matching handles' published
+        ``tab_id``; an event that raced this reply (dispatched before the op
+        thread resumed) matched nothing and was parked in the bridge's
+        ``_undispatched_detaches``. Publish-or-consume must be atomic under
+        the same lock as the reader's route-or-park decision, or a detach
+        landing between the two would be lost and the handle would believe
+        itself attached to a session the extension already discarded —
+        permanently, since nothing would ever set ``_detached``. Consuming
+        raises :class:`DetachedError`; the handle stays detached so the next
+        primitive re-attaches (or the caller retries).
+        """
+        bridge = self._bridge
+        with bridge._lock:
+            reason = bridge._undispatched_detaches.pop(tab_id, None)
+            if reason is None:
+                self.tab_id = tab_id
+        if reason is not None:
+            self._detached.set()
+            raise DetachedError(f"debugger detached during {during}: {reason}")
 
     def _attach(self, *, timeout: float | None = None) -> None:
         """Attach this handle to the user's current active tab.
@@ -1300,16 +1420,18 @@ class Tab:
             raise BridgeError(
                 "bridge 'attach' reply carried no tabId; cannot attach to the tab"
             )
-        self.tab_id = tab_id
         self._owned = False
         # No URL bookkeeping: an attached user tab must never be silently
         # re-opened after a detach (see ChromeBridge.attach).
         self.current_url = None
         # attach is single-tab: on SUCCESS the extension tears down every
         # other attached tab (acquire-before-release — a failed attach leaves
-        # them intact, hence marking only now). It emits no detached events
-        # for its own teardown, so mirror it client-side.
+        # them intact, hence marking only now, and BEFORE the publish below,
+        # which may raise if the new tab's own detach raced the reply). It
+        # emits no detached events for its own teardown, so mirror it
+        # client-side.
         self._bridge._mark_other_tabs_detached(self)
+        self._publish_tab_id(tab_id, during="attach")
         self._cdp("Page.enable")
 
     def navigate(self, url: str, *, timeout: float = DEFAULT_NAV_TIMEOUT) -> None:
