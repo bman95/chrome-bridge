@@ -620,6 +620,7 @@ def test_reconnect_wedged_worker_is_bounded_by_shared_budget(rbridge, monkeypatc
         _wait(lambda: not cdp.is_alive())
 
         rbridge.open_hook = lambda frame: DROP  # wedged: opens never answered
+        rbridge.received.clear()
         started = time.monotonic()
         cdp.reconnect()  # must not raise; heals time out / skip per tab
         elapsed = time.monotonic() - started
@@ -628,6 +629,13 @@ def test_reconnect_wedged_worker_is_bounded_by_shared_budget(rbridge, monkeypatc
         # would burn >= one full op timeout PER tab (>= 4.0s).
         assert elapsed < 3.0, f"reconnect took {elapsed:.2f}s; budget not enforced"
         assert cdp._tab_id is None  # nothing healed against the wedged worker
+        # The _MIN_HEAL_BUDGET floor: only the FIRST (doomed) open ever hits
+        # the wire — after it burns the op allowance, the second tab has only
+        # ~0.4s of budget left (< the 0.5s floor) and is skipped BEFORE
+        # writing a frame, as are the rest. Without the floor, a second
+        # near-zero-grant open frame would also be written and abandoned.
+        opens_sent = sum(1 for f in rbridge.received if f.get("op") == "open")
+        assert opens_sent == 1, f"expected 1 wedged open on the wire, got {opens_sent}"
 
         # Worker recovers: an unhealed tab re-attaches on its next primitive.
         rbridge.open_hook = None

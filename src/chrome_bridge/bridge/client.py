@@ -584,8 +584,8 @@ class ChromeBridge:
                 # reply is dropped — an orphan. Skip instead; the handle
                 # re-attaches lazily with a full op timeout on its next use.
                 log.warning(
-                    "chrome-bridge: reconnect heal budget exhausted; %s "
-                    "re-attaches on its next use",
+                    "chrome-bridge: reconnect heal budget too low to start "
+                    "a re-open; %s re-attaches on its next use",
                     tab.current_url,
                 )
                 continue
@@ -605,7 +605,9 @@ class ChromeBridge:
                     # The open leg succeeded (id published); a LATER leg —
                     # the Page.enable ack — was cut short by the budget. The
                     # handle IS attached; only Page events may be missing
-                    # until its next navigate re-enables them.
+                    # until Page.enable next goes out on it (an in-place
+                    # navigate re-issues it; the early-return heal paths,
+                    # which see an attached handle, do not).
                     log.warning(
                         "chrome-bridge: re-attach of %s cut short after "
                         "attach (Page events may be missing): %s",
