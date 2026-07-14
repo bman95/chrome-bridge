@@ -1701,6 +1701,28 @@ def test_targeted_detach_fails_only_that_tabs_op_and_b_completes(bridge):
         cdp.close()
 
 
+def test_untagged_detach_marks_all_tabs_detached(bridge):
+    # Criterion-1 fallback at multi-tab scope: a detached event WITHOUT tabId
+    # (a single-tab-era peer) must fall back to fail-everything — every
+    # handle is marked detached, not just one.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        bridge.send_event({"event": True, "type": "detached", "reason": "gone"})
+        deadline = time.monotonic() + 2
+        while not (
+            cdp._detached.is_set() and tab_b._detached.is_set()
+        ) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert cdp._detached.is_set() and cdp._tab_id is None
+        assert tab_b._detached.is_set() and tab_b.tab_id is None
+    finally:
+        cdp.close()
+
+
 def test_stale_tagged_event_is_dropped(bridge):
     # An event tagged with a tabId no live handle has published (a late event
     # from a tab that already detached) must be dropped entirely — neither

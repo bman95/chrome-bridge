@@ -37,6 +37,11 @@ from chrome_bridge.bridge.client import (
 )
 
 
+# Sentinel an ``open_hook`` returns to send NO reply at all — simulating a
+# wedged worker whose ops hang until the client's own timeout fires.
+DROP = object()
+
+
 class ReconnectableBridge:
     """A loopback server whose client connection can be dropped and re-accepted.
 
@@ -70,9 +75,14 @@ class ReconnectableBridge:
         self.received: list[dict] = []
         self.opens = 0
         # Optional failure injection: a callable(frame) -> reply payload dict
-        # to send INSTEAD of the default ok:true open reply, or None to fall
-        # through to it. Lets tests fail one specific re-open.
+        # to send INSTEAD of the default ok:true open reply, DROP to send no
+        # reply at all (wedged worker), or None to fall through to the
+        # default. Lets tests fail or hang one specific re-open.
         self.open_hook = None
+        # Push Page.loadEventFired after acking each tagged Page.enable so
+        # opens/heals don't sleep out their full load wait. Tests that
+        # measure the silent-load ceiling set this to False.
+        self.emit_load_events = True
         self._connections = 0
         self._connected = threading.Event()
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -121,6 +131,8 @@ class ReconnectableBridge:
                 op = frame.get("op")
                 if op == "open":
                     override = self.open_hook(frame) if self.open_hook else None
+                    if override is DROP:
+                        continue  # wedged worker: the op is never answered
                     if override is not None:
                         self._reply(frame.get("id"), override)
                         continue
@@ -140,6 +152,19 @@ class ReconnectableBridge:
                         )
                     else:
                         self._reply(frame.get("id"), {"ok": True, "result": {}})
+                        if (
+                            self.emit_load_events
+                            and frame.get("method") == "Page.enable"
+                            and frame.get("tabId") is not None
+                        ):
+                            # By the time the client sends Page.enable its
+                            # tab_id is published, so the tagged load event
+                            # routes to the right handle deterministically.
+                            self.send_event(
+                                {"event": True, "type": "cdp",
+                                 "method": "Page.loadEventFired",
+                                 "params": {}, "tabId": frame["tabId"]}
+                            )
                 elif op == "close":
                     self._reply(frame.get("id"), {"ok": True})
                 else:
@@ -152,13 +177,14 @@ class ReconnectableBridge:
                     self._connected.clear()
 
     def _reply(self, msg_id, payload: dict) -> None:
+        # Write UNDER the lock so serve-thread replies and test-thread
+        # send_event calls can never interleave frame bytes.
         with self._lock:
-            wfile = self._wfile
-        if wfile is not None:
-            try:
-                write_frame(wfile, {"id": msg_id, **payload})
-            except OSError:
-                pass
+            if self._wfile is not None:
+                try:
+                    write_frame(self._wfile, {"id": msg_id, **payload})
+                except OSError:
+                    pass
 
     # ---- test controls -------------------------------------------------- #
 
@@ -166,12 +192,11 @@ class ReconnectableBridge:
         """Push an unsolicited event frame to the CURRENT client connection."""
         self._connected.wait(timeout=5)
         with self._lock:
-            wfile = self._wfile
-        if wfile is not None:
-            try:
-                write_frame(wfile, event)
-            except OSError:
-                pass
+            if self._wfile is not None:
+                try:
+                    write_frame(self._wfile, event)
+                except OSError:
+                    pass
 
     def wait_connected(self, timeout: float = 5.0) -> bool:
         return self._connected.wait(timeout=timeout)
@@ -472,6 +497,9 @@ def test_reconnect_restores_all_tabs_in_creation_order(rbridge):
     # tab that had a URL — the default tab first, then new_tab handles in
     # creation order — remapping each handle's tab_id onto its fresh Chrome
     # tab so existing Tab references keep working.
+    # Silent-load mode: no Page.loadEventFired, so each heal waits out its
+    # full load ceiling — this test MEASURES that ceiling below.
+    rbridge.emit_load_events = False
     cdp = _client(rbridge)
     try:
         cdp.open("https://a", timeout=0.3)
@@ -523,14 +551,78 @@ def test_reconnect_marks_urlless_default_tab_dead_until_reopened(rbridge):
         cdp.reconnect()
         # The new_tab handle was restored; the URL-less default tab is dead.
         assert tab_b.tab_id is not None
-        with pytest.raises(BridgeError, match="never had a URL to restore") as ei:
+        with pytest.raises(BridgeError, match="no URL to restore") as ei:
             cdp.banner_present(".x")
         assert not isinstance(ei.value, DetachedError)
         # The restored sibling is untouched by the dead handle.
         assert tab_b.banner_present(".y") is True
-        # An explicit open revives the dead handle with a fresh session.
+
+        # A FAILED revival keeps the actionable dead error in place...
+        armed = {"on": True}
+
+        def open_hook(frame):
+            if armed["on"]:
+                armed["on"] = False
+                return {"ok": False, "error": "tab creation failed"}
+            return None
+
+        rbridge.open_hook = open_hook
+        with pytest.raises(BridgeError, match="open failed"):
+            cdp.open("https://a", timeout=0.3)
+        with pytest.raises(BridgeError, match="no URL to restore"):
+            cdp.banner_present(".x")
+
+        # ...and a successful open revives the handle with a fresh session.
         cdp.open("https://a", timeout=0.3)
         assert cdp.banner_present(".x") is True
+    finally:
+        cdp.close()
+
+
+def test_stale_dead_mark_on_revived_handle_is_discarded(rbridge):
+    # White-box guard: a dead mark that raced a concurrent revival (the
+    # handle has a tab/URL again) must be discarded by the next primitive,
+    # never fail a healthy handle.
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        cdp._default_tab._dead_reason = "stale mark from a racing reconnect"
+        assert cdp.banner_present(".x") is True  # discarded, not raised
+        assert cdp._default_tab._dead_reason is None
+    finally:
+        cdp.close()
+
+
+def test_reconnect_wedged_worker_is_bounded_by_shared_budget(rbridge, monkeypatch):
+    # The shared heal budget: against a wedged worker (open ops never
+    # answered), reconnect() must return within roughly one op allowance plus
+    # the small per-tab load ceiling — never N stacked op timeouts — and the
+    # unhealed tabs must re-attach lazily once the worker recovers.
+    from chrome_bridge.bridge import client as client_mod
+
+    monkeypatch.setattr(client_mod, "DEFAULT_REATTACH_TIMEOUT", 0.1)
+    cdp = _client(rbridge, op_timeout=1.0)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        cdp.new_tab("https://b", timeout=0.3)
+        cdp.new_tab("https://c", timeout=0.3)
+        tab_d = cdp.new_tab("https://d", timeout=0.3)
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        rbridge.open_hook = lambda frame: DROP  # wedged: opens never answered
+        started = time.monotonic()
+        cdp.reconnect()  # must not raise; heals time out / skip per tab
+        elapsed = time.monotonic() - started
+        # Budget = op_timeout (1.0) + 4 tabs x 0.1 = 1.4s. Unbudgeted
+        # stacking would burn >= one full op timeout PER tab (>= 4.0s).
+        assert elapsed < 2.5, f"reconnect took {elapsed:.2f}s; budget not enforced"
+        assert cdp._tab_id is None  # nothing healed against the wedged worker
+
+        # Worker recovers: an unhealed tab re-attaches on its next primitive.
+        rbridge.open_hook = None
+        assert tab_d.banner_present(".x") is True
+        assert tab_d.tab_id is not None
     finally:
         cdp.close()
 

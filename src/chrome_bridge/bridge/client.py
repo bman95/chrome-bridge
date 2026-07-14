@@ -500,9 +500,11 @@ class ChromeBridge:
         :data:`DEFAULT_REATTACH_TIMEOUT` (non-fatal — the caller's own
         readiness check is the real gate), and ALL the heals share one
         budget — a single connection op allowance plus that load ceiling per
-        restorable tab — so a wedged worker cannot stack N full per-op
-        timeouts; a heal that misses the budget is skipped and runs lazily on
-        that tab's next primitive. The FIRST re-open goes out in the
+        restorable tab, with every heal leg re-clamped to what remains of it
+        as the leg starts — so a wedged worker cannot stack full per-op
+        timeouts, within one tab's heal or across N tabs; a heal that misses
+        the budget is skipped or cut short and runs lazily on that tab's
+        next primitive. The FIRST re-open goes out in the
         key-less reaper shape (``replace:true`` on the wire — nothing else is
         attached yet, and it reclaims the dead session's fenced leftover tabs
         server-side); every later one is ``replace:false`` so it never tears
@@ -552,17 +554,19 @@ class ChromeBridge:
                 # attach. The next primitive raises this as an actionable
                 # BridgeError instead of silently running against no tab.
                 # navigate() is the safe revival (adaptive replace:false);
-                # the facade open()/attach() also revive but are single-tab
-                # and tear down the siblings this reconnect just restored.
+                # attach() and the facade open() also revive but are
+                # single-tab and tear down the siblings this reconnect just
+                # restored.
                 tab._dead_reason = (
                     "bridge reconnected after a connection loss, but this tab "
-                    "never had a URL to restore; navigate() it to start a "
-                    "fresh session (the facade open()/attach() also revive "
-                    "it, but they are single-tab and tear down sibling tabs)"
+                    "had no URL to restore (attach()-joined sessions record "
+                    "none by design); navigate() it to open a fresh page, or "
+                    "attach() again to re-join the user's active tab — "
+                    "attach() and the facade open() are single-tab and tear "
+                    "down sibling tabs"
                 )
                 continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if deadline - time.monotonic() <= 0:
                 log.warning(
                     "chrome-bridge: reconnect heal budget exhausted; %s "
                     "re-attaches on its next use",
@@ -575,8 +579,8 @@ class ChromeBridge:
             try:
                 tab._open(
                     tab.current_url,
-                    timeout=min(DEFAULT_REATTACH_TIMEOUT, remaining),
-                    op_timeout=min(self._op_timeout, remaining),
+                    timeout=DEFAULT_REATTACH_TIMEOUT,
+                    deadline=deadline,
                 )
             except BridgeError as exc:
                 # Best-effort per tab: one tab's failed heal must not poison
@@ -1363,6 +1367,21 @@ class Tab:
         """
         return False if self._bridge._other_tabs_attached(self) else None
 
+    def _leg_timeout(self, deadline: float | None) -> float:
+        """One heal leg's op timeout: the connection default, re-clamped to
+        whatever remains of ``deadline`` at the moment the leg starts.
+
+        Re-clamping PER LEG (rather than granting each leg a clamp computed
+        once up front) is what makes :meth:`ChromeBridge.reconnect`'s shared
+        heal budget a real bound: an earlier leg that consumed most of the
+        budget leaves the later legs only the remainder, so two op timeouts
+        can never stack past the deadline within one tab's heal.
+        """
+        op_timeout = self._bridge._op_timeout
+        if deadline is None:
+            return op_timeout
+        return min(op_timeout, max(0.0, deadline - time.monotonic()))
+
     # ------------------------------------------------------------------ #
     # Per-tab event bus
     # ------------------------------------------------------------------ #
@@ -1453,7 +1472,7 @@ class Tab:
         *,
         timeout: float = DEFAULT_NAV_TIMEOUT,
         replace: Any = _ADAPTIVE_REPLACE,
-        op_timeout: float | None = None,
+        deadline: float | None = None,
     ) -> None:
         """Open ``url`` in a fresh attached tab for this handle, await load.
 
@@ -1465,11 +1484,13 @@ class Tab:
         siblings are attached, the key-less reaper otherwise);
         :meth:`ChromeBridge.new_tab` pins its initial open to ``False``.
 
-        ``timeout`` caps only the load wait. ``op_timeout`` — when given —
-        caps the two op round-trips (the ``open`` itself and the follow-up
-        ``Page.enable``) instead of the connection default;
+        ``timeout`` caps only the load wait. ``deadline`` — when given — is a
+        ``time.monotonic`` deadline that re-clamps EACH leg (the ``open`` op,
+        ``Page.enable``, and the load wait) to whatever remains of it as that
+        leg starts, an op leg never exceeding the connection default;
         :meth:`ChromeBridge.reconnect` passes its shared heal budget so a
-        wedged worker cannot stack full per-op timeouts across N tabs.
+        wedged worker cannot stack full per-op timeouts, within one tab's
+        heal or across N tabs.
         """
         self._check_usable()
         # The extension's "open" both creates the tab AND navigates it to `url`,
@@ -1505,8 +1526,7 @@ class Tab:
                 if replace is not None:
                     payload["replace"] = replace
                 reply = bridge._request(
-                    payload,
-                    timeout=bridge._op_timeout if op_timeout is None else op_timeout,
+                    payload, timeout=self._leg_timeout(deadline)
                 )
                 tab_id = reply.get("tabId")
                 if tab_id is None:
@@ -1525,11 +1545,16 @@ class Tab:
             self._dead_reason = None
             self._owned = True
             self.current_url = url
-            self._cdp("Page.enable", timeout=op_timeout)
+            self._cdp("Page.enable", timeout=self._leg_timeout(deadline))
             # The page may already have loaded between open and Page.enable; in
             # that case loadEventFired won't fire again, so a timeout here is not
             # fatal — wait_selector is the real readiness gate a script should use.
-            self._wait_load(loaded, timeout)
+            load_timeout = timeout
+            if deadline is not None:
+                load_timeout = min(
+                    load_timeout, max(0.0, deadline - time.monotonic())
+                )
+            self._wait_load(loaded, load_timeout)
         finally:
             self.off_event("Page.loadEventFired", _on_load)
 
@@ -1710,7 +1735,8 @@ class Tab:
             # honours `timeout` as a true upper bound. Otherwise a wedged op
             # (op_timeout, 20s) or a mid-loop re-attach could each block far
             # past `timeout`, stalling the caller in exactly the SW eviction
-            # conditions this bridge exists to survive.
+            # conditions this bridge exists to survive. (A re-attach's op
+            # legs are the documented exception — see _ensure_attached.)
             if _expired():
                 raise BridgeTimeoutError(
                     f"selector {selector!r} not present after {timeout:.0f}s"
@@ -2126,21 +2152,26 @@ class Tab:
           long-lived owner reusing one client thus self-heals an evicted
           worker without being discarded and rebuilt.
 
-        ``timeout`` caps the re-attach load wait; callers running on a deadline
-        (e.g. :meth:`wait_selector`) pass their remaining budget so a re-attach
-        cannot blow past their own bound. It is clamped to a small ceiling
-        (:data:`DEFAULT_REATTACH_TIMEOUT`) since the re-attach load event is
-        non-fatal anyway — the caller's own readiness check is the real gate.
-        The dead-socket leg is the exception: ``reconnect`` runs under its own
-        shared heal budget (one op allowance plus the short load ceiling per
+        ``timeout`` caps the re-attach LOAD wait; callers running on a
+        deadline (e.g. :meth:`wait_selector`) pass their remaining budget so
+        the load wait cannot blow past their bound. It is clamped to a small
+        ceiling (:data:`DEFAULT_REATTACH_TIMEOUT`) since the re-attach load
+        event is non-fatal anyway — the caller's own readiness check is the
+        real gate. The re-open's op round-trips still use the connection op
+        timeout, so against a wedged worker the heal can overshoot a small
+        caller ``timeout`` (bounded by two op timeouts — not caller-tight).
+        The dead-socket leg likewise runs under ``reconnect``'s own shared
+        heal budget (one op allowance plus the short load ceiling per
         restorable tab), which bounds it but can still exceed a small caller
         ``timeout``.
 
         Sessions joined via :meth:`ChromeBridge.attach` record no URL, so a
-        detach of the user's tab surfaces here as :class:`DetachedError` — by
-        design the bridge never silently re-opens a user tab. A handle a
-        reconnect marked dead (no URL to restore) surfaces its stored
-        :class:`BridgeError` here; an explicit open/navigate/attach revives it.
+        detach of the user's tab (socket still alive) surfaces here as
+        :class:`DetachedError` — by design the bridge never silently re-opens
+        a user tab. After a socket-death recovery the same no-URL situation
+        surfaces instead as the reconnect dead mark: a handle marked dead
+        raises its stored actionable :class:`BridgeError` here, and an
+        explicit open/navigate/attach revives it.
         """
         self._check_usable()
         if self._dead_reason is not None:
