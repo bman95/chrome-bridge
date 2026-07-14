@@ -109,9 +109,12 @@ class ReconnectableBridge:
                 self.received.append(frame)
                 op = frame.get("op")
                 if op == "open":
+                    # Sequential tab ids so multi-tab tests can tell handles
+                    # apart (no test depends on a specific id value).
                     with self._lock:
                         self.opens += 1
-                    self._reply(frame.get("id"), {"ok": True, "tabId": 7})
+                        tab_id = 100 + self.opens
+                    self._reply(frame.get("id"), {"ok": True, "tabId": tab_id})
                 elif op == "cdp":
                     # Default: ack with an empty result; Runtime.evaluate gets a
                     # truthy value so banner_present / wait_selector resolve.
@@ -359,6 +362,80 @@ def test_reattach_targets_the_last_url_not_an_earlier_one(rbridge):
         assert opens, "expected a re-attach op:open after the eviction"
         # The re-attach op:open carried the LAST url, not the first.
         assert opens[-1]["url"] == "https://example.com/item/42/"
+    finally:
+        cdp.close()
+
+
+def test_reconnect_heals_default_and_additional_tabs(rbridge):
+    # A socket death with BOTH the default tab and a new_tab handle open:
+    # touching the additional tab must rebuild the connection, eagerly re-open
+    # the default tab on its last URL (legacy resume, key-less reaper shape),
+    # then re-open the additional tab itself with replace:false so the healed
+    # default is not torn down.
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        rbridge.received.clear()
+        assert tab_b.banner_present(".x") is True
+        opens = [f for f in rbridge.received if f.get("op") == "open"]
+        assert [f["url"] for f in opens] == ["https://a", "https://b"]
+        assert "replace" not in opens[0]      # default tab: legacy reaper shape
+        assert opens[1]["replace"] is False   # additional tab: never reaps
+        assert cdp._tab_id is not None and tab_b.tab_id is not None
+        assert cdp._tab_id != tab_b.tab_id
+        # The default facade resumed too.
+        assert cdp.banner_present(".y") is True
+    finally:
+        cdp.close()
+
+
+def test_navigate_on_additional_tab_reconnects_after_socket_death(rbridge):
+    # navigate() on a new_tab handle over a dead socket must rebuild the
+    # connection (which eagerly re-opens the default tab on ITS last URL),
+    # then re-open THIS tab on the requested URL with replace:false.
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        rbridge.received.clear()
+        tab_b.navigate("https://b2", timeout=0.3)
+        assert cdp.is_alive()
+        opens = [f for f in rbridge.received if f.get("op") == "open"]
+        assert [f["url"] for f in opens] == ["https://a", "https://b2"]
+        assert "replace" not in opens[0]      # default tab: legacy reaper shape
+        assert opens[1]["replace"] is False   # additional tab: never reaps
+        assert tab_b.current_url == "https://b2"
+        assert tab_b.tab_id is not None and tab_b.tab_id != cdp._tab_id
+    finally:
+        cdp.close()
+
+
+def test_reconnect_new_tab_only_session_reaps_on_first_reopen(rbridge):
+    # A session that only ever used new_tab (default tab never opened) must
+    # still reap the dead session's leftover tabs after a socket death: with
+    # nothing else attached, the first re-open keeps the key-less wire-default
+    # replace:true — the designated reaper.
+    cdp = _client(rbridge)
+    try:
+        tab = cdp.new_tab("https://b", timeout=0.3)
+        first_id = tab.tab_id
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        rbridge.received.clear()
+        assert tab.banner_present(".x") is True
+        opens = [f for f in rbridge.received if f.get("op") == "open"]
+        assert len(opens) == 1                # no default-tab URL to resume
+        assert opens[0]["url"] == "https://b"
+        assert "replace" not in opens[0]      # the reaper shape
+        assert tab.tab_id is not None and tab.tab_id != first_id
     finally:
         cdp.close()
 

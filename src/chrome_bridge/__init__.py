@@ -13,10 +13,12 @@ from .bridge.client import (
     BridgeTimeoutError,
     ChromeBridge,
     DetachedError,
+    Tab,
 )
 
 __all__ = [
     "ChromeBridge",
+    "Tab",
     "BridgeError",
     "BridgeTimeoutError",
     "DetachedError",

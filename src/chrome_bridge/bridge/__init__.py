@@ -22,6 +22,7 @@ from .client import (
     BridgeTimeoutError,
     ChromeBridge,
     DetachedError,
+    Tab,
 )
 
 # Native Messaging host name prefix. Each profile gets its own full name
@@ -33,6 +34,7 @@ HOST_NAME_PREFIX = "com.chromebridge.bridge"
 __all__ = [
     "HOST_NAME_PREFIX",
     "ChromeBridge",
+    "Tab",
     "BridgeError",
     "BridgeTimeoutError",
     "DetachedError",
