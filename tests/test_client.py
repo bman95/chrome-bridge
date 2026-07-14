@@ -1985,6 +1985,31 @@ def test_detach_racing_attach_reply_is_not_lost(bridge):
         cdp.close()
 
 
+def test_attach_page_enable_failure_marks_handle_detached(bridge):
+    # attach succeeds but the follow-up Page.enable fails (e.g. the
+    # attach-handover alias: the reply's tabId belonged to a tab that just
+    # died, its racing detach having routed to the OLD holder rather than the
+    # parked map). The handle must land on the documented detached path — not
+    # keep a stale tab_id that wedges every later primitive on raw server
+    # errors.
+    bridge.on("attach", _ok_attach(tab_id=13))
+
+    def default(frame):
+        if frame.get("method") == "Page.enable":
+            return {"ok": False, "error": "no attached tab with tabId 13"}
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge)
+    try:
+        with pytest.raises(BridgeError, match="no attached tab"):
+            cdp.attach()
+        assert cdp._detached.is_set()
+        assert cdp._tab_id is None
+    finally:
+        cdp.close()
+
+
 def test_undispatched_detaches_cleared_on_connect(bridge):
     # A parked detach from a dead connection must never poison the next one:
     # a fresh browser session may reuse tab ids, so connect() clears the map
@@ -2001,6 +2026,26 @@ def test_undispatched_detaches_cleared_on_connect(bridge):
         assert not cdp._detached.is_set()
     finally:
         cdp.close()
+
+
+def test_bridge_detach_detaches_all_tabs_and_retires_handles(bridge):
+    # detach() mirrors close() for multi-tab: one tabId-stamped detach op per
+    # attached tab (never a close — tabs must stay open), then the additional
+    # handles are retired.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    cdp.open("https://a", timeout=0.2)
+    tab_b = cdp.new_tab("https://b", timeout=0.2)
+    bridge.received.clear()
+    cdp.detach()
+    detach_ids = {f["tabId"] for f in bridge.received if f.get("op") == "detach"}
+    assert detach_ids == {100, 101}
+    assert all(f.get("op") != "close" for f in bridge.received)
+    assert not cdp.is_alive()
+    with pytest.raises(BridgeError, match="closed"):
+        tab_b.banner_present(".x")
+    assert cdp._tabs == [cdp._default_tab]
 
 
 def test_bridge_close_teardown_budget_is_shared(bridge):

@@ -1386,12 +1386,16 @@ class Tab:
                 if replace is not None:
                     payload["replace"] = replace
                 reply = bridge._request(payload, timeout=bridge._op_timeout)
-            tab_id = reply.get("tabId")
-            if tab_id is None:
-                raise BridgeError(
-                    "bridge 'open' reply carried no tabId; cannot attach to the tab"
-                )
-            self._publish_tab_id(tab_id, during="open")
+                tab_id = reply.get("tabId")
+                if tab_id is None:
+                    raise BridgeError(
+                        "bridge 'open' reply carried no tabId; cannot attach to the tab"
+                    )
+                # Publish while STILL holding the op lock: a sibling's adaptive
+                # re-open computes its replace shape under this same lock, so
+                # it can never read this handle as unattached in the gap
+                # between our reply and our publish and go out as a reaper.
+                self._publish_tab_id(tab_id, during="open")
             self._owned = True
             self.current_url = url
             self._cdp("Page.enable")

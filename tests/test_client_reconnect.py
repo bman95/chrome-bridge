@@ -393,6 +393,30 @@ def test_reconnect_heals_default_and_additional_tabs(rbridge):
         cdp.close()
 
 
+def test_navigate_on_additional_tab_reconnects_after_socket_death(rbridge):
+    # navigate() on a new_tab handle over a dead socket must rebuild the
+    # connection (which eagerly re-opens the default tab on ITS last URL),
+    # then re-open THIS tab on the requested URL with replace:false.
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        rbridge.received.clear()
+        tab_b.navigate("https://b2", timeout=0.3)
+        assert cdp.is_alive()
+        opens = [f for f in rbridge.received if f.get("op") == "open"]
+        assert [f["url"] for f in opens] == ["https://a", "https://b2"]
+        assert "replace" not in opens[0]      # default tab: legacy reaper shape
+        assert opens[1]["replace"] is False   # additional tab: never reaps
+        assert tab_b.current_url == "https://b2"
+        assert tab_b.tab_id is not None and tab_b.tab_id != cdp._tab_id
+    finally:
+        cdp.close()
+
+
 def test_reconnect_new_tab_only_session_reaps_on_first_reopen(rbridge):
     # A session that only ever used new_tab (default tab never opened) must
     # still reap the dead session's leftover tabs after a socket death: with
