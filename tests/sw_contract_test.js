@@ -63,6 +63,13 @@ const tests = String.raw`
   port = fakePort;
 
   const id = (generation, original) => [RELAY_SESSION_ID_MARKER, generation, original];
+
+  // A fresh worker has no attached tab: implicit-target cdp fails with the
+  // legacy error.
+  await onPythonMessage({ id: id(1, 0), op: "cdp", method: "Page.enable" }, fakePort);
+  assert.equal(replies.at(-1).ok, false);
+  assert.equal(replies.at(-1).error, "no attached tab");
+
   await onPythonMessage({ id: id(1, 1), op: "open", url: "https://example.com" }, fakePort);
   assert.deepEqual([...sessions.keys()], [1]);
   assert.equal(sessions.get(1).bridgeCreated, true);

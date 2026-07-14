@@ -33,7 +33,10 @@
 //       are left untouched, and the caller addresses tabs explicitly via
 //       `tabId` from there on. A non-boolean `replace` is rejected
 //       (ok:false): a malformed flag must never pick the destructive
-//       teardown-all default.
+//       teardown-all default. The replace:true teardown runs BEFORE the
+//       new tab is created, so a failed open (tab creation / attach
+//       error) still leaves the prior tabs torn down — ok:false with
+//       zero tabs attached.
 //
 //   { "id": <id>, "op": "attach" }
 //       Attach to the ACTIVE tab — the page the user is looking at. A
@@ -132,8 +135,9 @@
 //     with "replace": false adds an entry without touching the rest; an op
 //     without "tabId" while several tabs are attached fails as ambiguous
 //     rather than guessing.
-//   * Generation fence, per entry: an op whose request generation does not
-//     match the target entry's fails. An explicit "tabId" does NOT bypass
+//   * Generation fence, per entry: a "cdp"/"close"/"detach" whose request
+//     generation does not match the target entry's fails ("open"/"attach"
+//     carry no target and are unfenced). An explicit "tabId" does NOT bypass
 //     the fence — a tab from a dead session may since have been adopted by
 //     a successor (the "attach" handover), and a queued stale frame must
 //     not touch it. The mismatch reply for an explicit tabId says the tab
