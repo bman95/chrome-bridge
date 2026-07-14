@@ -31,7 +31,9 @@
 //       `replace` keep the historical one-tab-at-a-time behavior. With
 //       "replace": false the new tab is ADDITIONAL: existing attachments
 //       are left untouched, and the caller addresses tabs explicitly via
-//       `tabId` from there on.
+//       `tabId` from there on. A non-boolean `replace` is rejected
+//       (ok:false): a malformed flag must never pick the destructive
+//       teardown-all default.
 //
 //   { "id": <id>, "op": "attach" }
 //       Attach to the ACTIVE tab — the page the user is looking at. A
@@ -79,7 +81,11 @@
 //       post-reconnect recovery. Read-only — touches no session state, and
 //       deliberately NOT generation-fenced: a reconnected client (whose
 //       generation cannot match entries created by its predecessor) may
-//       still list leftover tabs to decide whether to re-"open".
+//       still list leftover tabs to decide whether to re-"open". Listing is
+//       the full extent of cross-generation access: a predecessor's entries
+//       cannot be driven or individually closed by a successor (see the
+//       generation-fence note below) — a replace:true "open" is the reaper
+//       that reclaims them.
 //
 // ---- extension -> Python --------------------------------------------
 // Replies (exactly one per request, correlated by `id`):
@@ -96,12 +102,17 @@
 //
 // Unsolicited events (no `id`; `event:true` discriminator). Every event
 // carries the source `tabId` so a client holding several attached tabs can
-// route it to the right tab handle:
+// route it to the right tab handle, plus the `sessionGeneration` of the
+// entry that produced it — nmh.py's event fence consumes and STRIPS that
+// field (it never reaches chrome_bridge.bridge.client), dropping events
+// left over from a predecessor client session:
 //
-//   { "event": true, "type": "cdp",     "method": <string>, "params": <object>, "tabId": <number> }
+//   { "event": true, "type": "cdp",     "method": <string>, "params": <object>,
+//     "tabId": <number>, "sessionGeneration": <generation> }
 //       A chrome.debugger.onEvent from an attached tab (raw CDP event).
 //
-//   { "event": true, "type": "detached", "reason": <string>, "tabId": <number> }
+//   { "event": true, "type": "detached", "reason": <string>,
+//     "tabId": <number>, "sessionGeneration": <generation> }
 //       chrome.debugger.onDetach fired for that tab (target closed, devtools
 //       opened, SW evicted, etc.). After this that tab is no longer attached;
 //       other attached tabs are unaffected. Python must treat that tab's
@@ -121,6 +132,14 @@
 //     with "replace": false adds an entry without touching the rest; an op
 //     without "tabId" while several tabs are attached fails as ambiguous
 //     rather than guessing.
+//   * Generation fence, per entry: an op whose request generation does not
+//     match the target entry's fails. An explicit "tabId" does NOT bypass
+//     the fence — a tab from a dead session may since have been adopted by
+//     a successor (the "attach" handover), and a queued stale frame must
+//     not touch it. The mismatch reply for an explicit tabId says the tab
+//     belongs to a different client session and points at replace:true
+//     "open" as the reaper; implicit-target ops keep the historical "stale
+//     client session" strings.
 //   * Each entry records whether its tab was bridge-created ("open") or
 //     merely attached ("attach"). Teardown — the "close" op and the onDetach
 //     reaper — removes the tab only when bridge-created; a user tab the
@@ -312,6 +331,12 @@ async function onPythonMessage(msg, fromPort) {
   ) ? msg.id[1] : null;
   try {
     if (msg.op === "open") {
+      if (msg.replace !== undefined && typeof msg.replace !== "boolean") {
+        // Never let a malformed flag pick the DESTRUCTIVE default: a truthy
+        // non-boolean (e.g. the string "false") must not tear every tab down.
+        reply(msg.id, { ok: false, error: 'invalid "replace": expected a boolean' });
+        return;
+      }
       // Single-tab mode is the DEFAULT: unless the caller opts out with
       // "replace": false, tear down every attached tab so a re-open (e.g.
       // after a dropped detach) cannot orphan them. replace:false adds an
@@ -443,7 +468,10 @@ async function onPythonMessage(msg, fromPort) {
       const tabId = resolveTabId(msg, reply);
       if (tabId === null) return;
       if (requestGeneration !== sessions.get(tabId).sessionGeneration) {
-        reply(msg.id, { ok: false, error: "stale client session; open a tab first" });
+        reply(msg.id, {
+          ok: false,
+          error: staleSessionError(msg, tabId, "stale client session; open a tab first"),
+        });
         return;
       }
       const res = await chrome.debugger.sendCommand(
@@ -462,7 +490,10 @@ async function onPythonMessage(msg, fromPort) {
       const tabId = resolveTabId(msg, reply);
       if (tabId === null) return;
       if (requestGeneration !== sessions.get(tabId).sessionGeneration) {
-        reply(msg.id, { ok: false, error: "stale client session" });
+        reply(msg.id, {
+          ok: false,
+          error: staleSessionError(msg, tabId, "stale client session"),
+        });
         return;
       }
       await closeTab(tabId);
@@ -482,7 +513,10 @@ async function onPythonMessage(msg, fromPort) {
       const tabId = resolveTabId(msg, reply);
       if (tabId === null) return;
       if (requestGeneration !== sessions.get(tabId).sessionGeneration) {
-        reply(msg.id, { ok: false, error: "stale client session" });
+        reply(msg.id, {
+          ok: false,
+          error: staleSessionError(msg, tabId, "stale client session"),
+        });
         return;
       }
       sessions.delete(tabId);
@@ -536,6 +570,21 @@ function resolveTabId(msg, reply) {
     return null;
   }
   return sessions.keys().next().value;
+}
+
+// Message for a per-entry generation-fence failure. Implicit targets keep
+// the historical strings byte-identical; an explicit tabId gets an accurate,
+// actionable message instead — the caller is typically a FRESH client
+// probing a predecessor's leftover entry (found via the un-fenced "tabs"
+// op), not a stale one. The fence itself never yields to an explicit tabId:
+// see the contract notes.
+function staleSessionError(msg, tabId, legacyError) {
+  if (msg.tabId === undefined) return legacyError;
+  return (
+    "tab " +
+    String(tabId) +
+    ' belongs to a different client session; a replace:true "open" reclaims leftover tabs'
+  );
 }
 
 // Tear down ONE attached tab: drop its table entry first (so nothing else

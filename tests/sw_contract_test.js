@@ -279,7 +279,11 @@ const tests = String.raw`
     fakePort
   );
   assert.equal(replies.at(-1).ok, false);
-  assert.match(replies.at(-1).error, /stale/);
+  assert.match(replies.at(-1).error, /different client session/);
+  // The implicit-target fence keeps the historical string byte-identical.
+  await onPythonMessage({ id: id(17, 5), op: "cdp", method: "Page.enable" }, fakePort);
+  assert.equal(replies.at(-1).ok, false);
+  assert.equal(replies.at(-1).error, "stale client session; open a tab first");
   await onPythonMessage({ id: id(17, 2), op: "tabs" }, fakePort);
   assert.deepEqual(replies.at(-1).tabs, [{ tabId: genTab }]);
   await onPythonMessage({ id: id(17, 3), op: "open", url: "https://gen2.example" }, fakePort);
@@ -308,6 +312,82 @@ const tests = String.raw`
   assert.ok(!removed.includes(93)); // merely-attached: detached, never removed
   assert.equal(sessions.size, 0);
   activeTab = null;
+
+  // Mixed table teardown: a merely-attached user tab plus a bridge-created
+  // tab; the default "open" removes only the bridge-created one and merely
+  // detaches the user's.
+  activeTab = { id: 94 };
+  await onPythonMessage({ id: id(20, 1), op: "attach" }, fakePort);
+  assert.equal(replies.at(-1).ok, true);
+  await onPythonMessage(
+    { id: id(20, 2), op: "open", url: "https://mixed.example", replace: false },
+    fakePort
+  );
+  const mixedBridge = replies.at(-1).tabId;
+  assert.equal(sessions.get(94).bridgeCreated, false);
+  assert.equal(sessions.get(mixedBridge).bridgeCreated, true);
+  await onPythonMessage({ id: id(21, 1), op: "open", url: "https://after.example" }, fakePort);
+  const afterTab = replies.at(-1).tabId;
+  assert.ok(detached.includes(94));
+  assert.ok(!removed.includes(94)); // user tab: detached, never removed
+  assert.ok(removed.includes(mixedBridge)); // bridge tab: removed
+  assert.deepEqual([...sessions.keys()], [afterTab]);
+  activeTab = null;
+
+  // "detach" with an explicit tabId releases exactly that tab, leaving even
+  // a bridge-created one open; without tabId at >1 attached it is ambiguous.
+  await onPythonMessage(
+    { id: id(21, 2), op: "open", url: "https://second.example", replace: false },
+    fakePort
+  );
+  const secondTab = replies.at(-1).tabId;
+  await onPythonMessage({ id: id(21, 3), op: "detach" }, fakePort);
+  assert.equal(replies.at(-1).ok, false);
+  assert.match(replies.at(-1).error, /ambiguous/);
+  await onPythonMessage({ id: id(21, 4), op: "detach", tabId: afterTab }, fakePort);
+  assert.equal(replies.at(-1).ok, true);
+  assert.ok(detached.includes(afterTab));
+  assert.ok(!removed.includes(afterTab)); // bridge-created, but detach leaves it open
+  assert.deepEqual([...sessions.keys()], [secondTab]);
+
+  // A FRESH generation naming a predecessor's leftover entry gets the
+  // actionable cross-session error (an explicit tabId never bypasses the
+  // generation fence); an unknown tabId on "detach" errors rather than
+  // no-ops.
+  await onPythonMessage({ id: id(22, 1), op: "close", tabId: secondTab }, fakePort);
+  assert.equal(replies.at(-1).ok, false);
+  assert.match(replies.at(-1).error, /different client session/);
+  assert.ok(sessions.has(secondTab)); // fence held: entry untouched
+  await onPythonMessage({ id: id(22, 2), op: "detach", tabId: 12345 }, fakePort);
+  assert.equal(replies.at(-1).ok, false);
+  assert.match(replies.at(-1).error, /12345/);
+
+  // Non-boolean "replace" is rejected rather than silently tearing down.
+  await onPythonMessage(
+    { id: id(22, 3), op: "open", url: "https://bad.example", replace: "false" },
+    fakePort
+  );
+  assert.equal(replies.at(-1).ok, false);
+  assert.match(replies.at(-1).error, /replace/);
+  assert.deepEqual([...sessions.keys()], [secondTab]); // untouched
+
+  // Profile rename with a matching live port sweeps only entries owned by a
+  // DIFFERENT identity; tabs opened under the wanted identity survive.
+  sessions.set(500, {
+    sessionGeneration: 42,
+    owner: "com.chromebridge.bridge.old",
+    bridgeCreated: true,
+  });
+  chrome.storage.local.get = async () => ({ bridgeProfileName: "personal" });
+  await reconnectWithNewIdentity();
+  assert.ok(removed.includes(500)); // old identity's bridge tab reaped
+  assert.deepEqual([...sessions.keys()], [secondTab]); // wanted identity survives
+  chrome.storage.local.get = async () => ({});
+
+  // cleanup for the final dial case
+  await onPythonMessage({ id: id(21, 5), op: "close", tabId: secondTab }, fakePort);
+  assert.equal(replies.at(-1).ok, true);
+  assert.equal(sessions.size, 0);
 
   // Exercise dial()'s real listener-level requestChain. A postMessage failure
   // makes the first handler reject; the chain must recover and process the
