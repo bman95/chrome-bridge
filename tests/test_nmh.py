@@ -160,6 +160,87 @@ def test_serve_session_relays_both_directions():
         s.close()
 
 
+def test_serve_session_relays_tab_id_frames_byte_transparent():
+    # Multi-tab regression: frames whose payloads carry `tabId` — ops
+    # (client->extension) as well as replies and events (extension->client) —
+    # must pass through the host untouched apart from the relay's two
+    # documented transformations (id fencing on ops/replies, and the
+    # sessionGeneration strip on events). The relay must never rewrite or
+    # consume the tab-routing field.
+    ext_peer, ext_host = _make_socketpair()
+    client_peer, client_host = _make_socketpair()
+
+    ext_in = ext_host.makefile("rb")
+    ext_out = ext_host.makefile("wb")
+    client_in = client_host.makefile("rb")
+    client_out = client_host.makefile("wb")
+
+    ext_peer_w = ext_peer.makefile("wb")
+    ext_peer_r = ext_peer.makefile("rb")
+    client_peer_r = client_peer.makefile("rb")
+    client_peer_w = client_peer.makefile("wb")
+
+    ext_seen: list[dict] = []
+    client_seen: list[dict] = []
+
+    def extension_behaviour():
+        op = read_frame(ext_peer_r)
+        ext_seen.append(op)
+        # Reply to the tab-targeted op, echoing the fenced id and carrying a
+        # tabId of its own (the open/attach reply shape)...
+        write_frame(ext_peer_w, {"id": op["id"], "ok": True, "tabId": 314})
+        # ...then a tab-tagged event, with the sessionGeneration the
+        # extension stamps on every event.
+        write_frame(
+            ext_peer_w,
+            {
+                "event": True,
+                "type": "detached",
+                "reason": "target_closed",
+                "tabId": 42,
+                "sessionGeneration": 1,
+            },
+        )
+        ext_peer.shutdown(socket.SHUT_WR)
+
+    def client_behaviour():
+        write_frame(
+            client_peer_w,
+            {"id": 1, "op": "cdp", "method": "Page.enable", "params": {},
+             "tabId": 42},
+        )
+        client_seen.append(read_frame(client_peer_r))
+        client_seen.append(read_frame(client_peer_r))
+
+    te = threading.Thread(target=extension_behaviour, daemon=True)
+    tc = threading.Thread(target=client_behaviour, daemon=True)
+    tc.start()
+    te.start()
+    _serve_session(ext_in, ext_out, client_in, client_out, client_host)
+    te.join(timeout=5.0)
+    tc.join(timeout=5.0)
+
+    # The op reached the extension intact — tabId included; only the id was
+    # fenced.
+    assert len(ext_seen) == 1
+    op = ext_seen[0]
+    assert op["tabId"] == 42
+    assert op["op"] == "cdp" and op["method"] == "Page.enable"
+    assert op["params"] == {}
+    assert op["id"][0] == nmh._SESSION_ID_MARKER and op["id"][2] == 1
+
+    # The reply came back with the caller's id restored and its tabId intact;
+    # the event kept its tabId and lost ONLY the sessionGeneration.
+    assert client_seen == [
+        {"id": 1, "ok": True, "tabId": 314},
+        {"event": True, "type": "detached", "reason": "target_closed",
+         "tabId": 42},
+    ]
+
+    for s in (ext_host, client_host, client_peer):
+        s.close()
+
+
 def test_serve_session_returns_when_client_closes_first():
     # Client-first teardown must NOT hang on the still-open extension stdin pipe:
     # _serve_session returns once `closed` is set, because both pumps are daemons
