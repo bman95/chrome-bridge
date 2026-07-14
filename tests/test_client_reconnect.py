@@ -5,15 +5,17 @@ survive an MV3 service-worker eviction: when the worker is evicted, the native
 port Chrome spawned drops, the host's relay ends, and the script's loopback
 socket dies. A long-lived owner that reuses one client must then transparently
 re-dial the host (which Chrome respawns as soon as ``sw.js`` re-runs
-``connect()`` and re-binds the port) and re-attach to the last URL — with zero
+``connect()`` and re-binds the port) and re-attach EVERY tab on its last URL,
+in creation order, remapping tab ids onto the existing handles — with zero
 human interaction.
 
 These drive :class:`ChromeBridge` against a *reconnectable* fake bridge on a
 real loopback socket. The fake plays ``nmh.py`` + ``sw.js``: it can drop the
 current client connection (the worker eviction) and accept a fresh one on the
 SAME port (the respawned host), so the tests assert the client re-dials and
-resumes idempotently — re-``open`` on the last URL, fresh ``Page.enable`` —
-without the caller discarding it. No Chrome, no native host, no running script.
+resumes idempotently — re-``open`` per tab on its last URL, fresh
+``Page.enable`` — without the caller discarding it. No Chrome, no native
+host, no running script.
 """
 
 from __future__ import annotations
@@ -27,7 +29,12 @@ import pytest
 
 from chrome_bridge import profiles
 from chrome_bridge.bridge.frames import read_frame, write_frame
-from chrome_bridge.bridge.client import BridgeError, ChromeBridge, DetachedError
+from chrome_bridge.bridge.client import (
+    DEFAULT_REATTACH_TIMEOUT,
+    BridgeError,
+    ChromeBridge,
+    DetachedError,
+)
 
 
 class ReconnectableBridge:
@@ -62,6 +69,10 @@ class ReconnectableBridge:
         self._stop = threading.Event()
         self.received: list[dict] = []
         self.opens = 0
+        # Optional failure injection: a callable(frame) -> reply payload dict
+        # to send INSTEAD of the default ok:true open reply, or None to fall
+        # through to it. Lets tests fail one specific re-open.
+        self.open_hook = None
         self._connections = 0
         self._connected = threading.Event()
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -109,6 +120,10 @@ class ReconnectableBridge:
                 self.received.append(frame)
                 op = frame.get("op")
                 if op == "open":
+                    override = self.open_hook(frame) if self.open_hook else None
+                    if override is not None:
+                        self._reply(frame.get("id"), override)
+                        continue
                     # Sequential tab ids so multi-tab tests can tell handles
                     # apart (no test depends on a specific id value).
                     with self._lock:
@@ -146,6 +161,17 @@ class ReconnectableBridge:
                 pass
 
     # ---- test controls -------------------------------------------------- #
+
+    def send_event(self, event: dict) -> None:
+        """Push an unsolicited event frame to the CURRENT client connection."""
+        self._connected.wait(timeout=5)
+        with self._lock:
+            wfile = self._wfile
+        if wfile is not None:
+            try:
+                write_frame(wfile, event)
+            except OSError:
+                pass
 
     def wait_connected(self, timeout: float = 5.0) -> bool:
         return self._connected.wait(timeout=timeout)
@@ -456,7 +482,14 @@ def test_reconnect_restores_all_tabs_in_creation_order(rbridge):
         _wait(lambda: not cdp.is_alive())
 
         rbridge.received.clear()
+        started = time.monotonic()
         cdp.reconnect()
+        elapsed = time.monotonic() - started
+        # Criterion: the eager heal keeps the SHORT per-tab load-wait ceiling.
+        # The fake never sends Page.loadEventFired, so each re-open waits its
+        # full load timeout — two tabs must cost ~2x DEFAULT_REATTACH_TIMEOUT,
+        # never the 30s nav timeout per tab.
+        assert elapsed < 2 * DEFAULT_REATTACH_TIMEOUT + 5.0
 
         # Both tabs re-opened inside reconnect() itself, oldest first.
         opens = [f for f in rbridge.received if f.get("op") == "open"]
@@ -498,6 +531,96 @@ def test_reconnect_marks_urlless_default_tab_dead_until_reopened(rbridge):
         # An explicit open revives the dead handle with a fresh session.
         cdp.open("https://a", timeout=0.3)
         assert cdp.banner_present(".x") is True
+    finally:
+        cdp.close()
+
+
+def test_reconnect_heal_failure_does_not_poison_siblings(rbridge):
+    # Best-effort per tab: if one tab's eager re-open fails during
+    # reconnect(), reconnect must not raise, the SIBLINGS must still be
+    # restored, and the failed handle must heal transparently on its next
+    # primitive.
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        armed = {"on": True}
+
+        def open_hook(frame):
+            if armed["on"] and frame.get("url") == "https://a":
+                armed["on"] = False  # fail the default tab's heal exactly once
+                return {"ok": False, "error": "tab creation failed"}
+            return None
+
+        rbridge.open_hook = open_hook
+        cdp.reconnect()  # must NOT raise: the failure stays per-tab
+
+        # The sibling healed despite the default tab's failed re-open...
+        assert tab_b.tab_id is not None
+        assert tab_b.banner_present(".y") is True
+        # ...and the failed handle retries transparently on its next use.
+        assert cdp._tab_id is None
+        assert cdp.banner_present(".x") is True
+        assert cdp._tab_id is not None
+    finally:
+        cdp.close()
+
+
+def test_reconnect_order_skips_closed_tabs(rbridge):
+    # Creation order must hold across a Tab.close(): default, B, C with B
+    # closed before the socket death -> reconnect restores [default, C].
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        tab_c = cdp.new_tab("https://c", timeout=0.3)
+        tab_b.close()
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        rbridge.received.clear()
+        cdp.reconnect()
+        opens = [f for f in rbridge.received if f.get("op") == "open"]
+        assert [f["url"] for f in opens] == ["https://a", "https://c"]
+        assert cdp._tab_id is not None and tab_c.tab_id is not None
+        assert tab_c.banner_present(".x") is True
+    finally:
+        cdp.close()
+
+
+def test_stale_pre_eviction_event_is_dropped_after_remap(rbridge):
+    # Criterion 4's literal scenario: after an eviction + reconnect remaps
+    # tab ids, a late event tagged with a PRE-eviction id must be dropped,
+    # while an event tagged with the remapped id reaches the same handle.
+    cdp = _client(rbridge)
+    got: list[dict] = []
+    try:
+        tab = cdp.new_tab("https://b", timeout=0.3)
+        old_id = tab.tab_id
+        tab.on_event("Custom.evt", lambda p: got.append(p))
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        cdp.reconnect()
+        new_id = tab.tab_id
+        assert new_id is not None and new_id != old_id
+
+        # Stale first, then the live one as an ordering fence: the reader
+        # dispatches in order, so once the live event has fired we know the
+        # stale one was processed (and dropped) before it.
+        rbridge.send_event(
+            {"event": True, "type": "cdp", "method": "Custom.evt",
+             "params": {"stale": True}, "tabId": old_id}
+        )
+        rbridge.send_event(
+            {"event": True, "type": "cdp", "method": "Custom.evt",
+             "params": {"live": True}, "tabId": new_id}
+        )
+        _wait(lambda: bool(got))
+        assert got == [{"live": True}]
     finally:
         cdp.close()
 
