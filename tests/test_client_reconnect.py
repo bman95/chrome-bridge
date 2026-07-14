@@ -79,6 +79,9 @@ class ReconnectableBridge:
         # reply at all (wedged worker), or None to fall through to the
         # default. Lets tests fail or hang one specific re-open.
         self.open_hook = None
+        # Same shape for "cdp" ops (e.g. DROP a Page.enable to wedge the
+        # second heal leg).
+        self.cdp_hook = None
         # Push Page.loadEventFired after acking each tagged Page.enable so
         # opens/heals don't sleep out their full load wait. Tests that
         # measure the silent-load ceiling set this to False.
@@ -143,6 +146,12 @@ class ReconnectableBridge:
                         tab_id = 100 + self.opens
                     self._reply(frame.get("id"), {"ok": True, "tabId": tab_id})
                 elif op == "cdp":
+                    override = self.cdp_hook(frame) if self.cdp_hook else None
+                    if override is DROP:
+                        continue  # wedged worker: the op is never answered
+                    if override is not None:
+                        self._reply(frame.get("id"), override)
+                        continue
                     # Default: ack with an empty result; Runtime.evaluate gets a
                     # truthy value so banner_present / wait_selector resolve.
                     if frame.get("method") == "Runtime.evaluate":
@@ -614,15 +623,59 @@ def test_reconnect_wedged_worker_is_bounded_by_shared_budget(rbridge, monkeypatc
         started = time.monotonic()
         cdp.reconnect()  # must not raise; heals time out / skip per tab
         elapsed = time.monotonic() - started
-        # Budget = op_timeout (1.0) + 4 tabs x 0.1 = 1.4s. Unbudgeted
-        # stacking would burn >= one full op timeout PER tab (>= 4.0s).
-        assert elapsed < 2.5, f"reconnect took {elapsed:.2f}s; budget not enforced"
+        # Budget = op_timeout (1.0) + 4 tabs x 0.1 = 1.4s (heals below the
+        # minimal-share floor are skipped outright). Unbudgeted stacking
+        # would burn >= one full op timeout PER tab (>= 4.0s).
+        assert elapsed < 3.0, f"reconnect took {elapsed:.2f}s; budget not enforced"
         assert cdp._tab_id is None  # nothing healed against the wedged worker
 
         # Worker recovers: an unhealed tab re-attaches on its next primitive.
         rbridge.open_hook = None
         assert tab_d.banner_present(".x") is True
         assert tab_d.tab_id is not None
+    finally:
+        cdp.close()
+
+
+def test_reconnect_budget_reclamps_each_heal_leg(rbridge, monkeypatch):
+    # The per-leg re-clamp: a slow (but answered) open leg must SHRINK the
+    # grant of the following Page.enable leg, so two op timeouts can never
+    # stack within one tab's heal. Here open is answered only after 1.8s and
+    # Page.enable is never answered: with per-leg re-clamping the enable leg
+    # gets only the ~0.4s that remains of the 2.2s budget; a once-per-heal
+    # clamp would grant it a fresh 2.0s (1.8 + 2.0 = 3.8s total).
+    from chrome_bridge.bridge import client as client_mod
+
+    monkeypatch.setattr(client_mod, "DEFAULT_REATTACH_TIMEOUT", 0.1)
+    cdp = _client(rbridge, op_timeout=2.0)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        def slow_open(frame):
+            time.sleep(1.8)
+            return None  # then answer normally
+
+        rbridge.open_hook = slow_open
+        rbridge.cdp_hook = (
+            lambda frame: DROP if frame.get("method") == "Page.enable" else None
+        )
+        started = time.monotonic()
+        cdp.reconnect()  # must not raise
+        elapsed = time.monotonic() - started
+        # Budget = op_timeout (2.0) + 2 tabs x 0.1 = 2.2s; the stacked-clamp
+        # regression costs >= 3.8s.
+        assert elapsed < 3.0, f"reconnect took {elapsed:.2f}s; leg re-clamp broken"
+
+        # Worker recovers: tab_b (skipped, still unattached) heals on its
+        # next primitive.
+        rbridge.open_hook = None
+        rbridge.cdp_hook = None
+        assert tab_b.tab_id is None
+        assert tab_b.banner_present(".x") is True
+        assert tab_b.tab_id is not None
     finally:
         cdp.close()
 

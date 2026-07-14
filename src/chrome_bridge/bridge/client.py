@@ -114,6 +114,13 @@ DEFAULT_CONNECT_TIMEOUT = 8.0      # dial the loopback host
 # wait_selector is the real readiness gate), so bound it well below the 30 s
 # nav timeout so a missed re-attach load event cannot stall the caller.
 DEFAULT_REATTACH_TIMEOUT = 5.0
+# Minimum share of the reconnect heal budget worth STARTING a heal with
+# (seconds). An "open" sent with a near-zero timeout is worse than none: the
+# client gives up immediately, but a slow-but-live worker still creates and
+# attaches the tab — whose late reply is then dropped as an unknown id — so
+# the tab is orphaned server-side until the next key-less reaper open. Not
+# starting hopeless heals keeps that window small.
+_MIN_HEAL_BUDGET = 0.5
 
 # Sentinel for Tab._open's `replace` param: "compute it adaptively via
 # Tab._reopen_replace()" — distinct from None, which is a meaningful value
@@ -504,7 +511,12 @@ class ChromeBridge:
         as the leg starts — so a wedged worker cannot stack full per-op
         timeouts, within one tab's heal or across N tabs; a heal that misses
         the budget is skipped or cut short and runs lazily on that tab's
-        next primitive. The FIRST re-open goes out in the
+        next primitive. Heals are never STARTED with less than a minimal
+        budget share (:data:`_MIN_HEAL_BUDGET`): an ``open`` the worker
+        answers only after the client's clamp expired still creates a tab
+        server-side that no handle owns (its late reply is dropped) — the
+        next key-less reaper open reclaims such leftovers, and the floor
+        keeps that window small. The FIRST re-open goes out in the
         key-less reaper shape (``replace:true`` on the wire — nothing else is
         attached yet, and it reclaims the dead session's fenced leftover tabs
         server-side); every later one is ``replace:false`` so it never tears
@@ -559,14 +571,18 @@ class ChromeBridge:
                 # restored.
                 tab._dead_reason = (
                     "bridge reconnected after a connection loss, but this tab "
-                    "had no URL to restore (attach()-joined sessions record "
-                    "none by design); navigate() it to open a fresh page, or "
-                    "attach() again to re-join the user's active tab — "
-                    "attach() and the facade open() are single-tab and tear "
-                    "down sibling tabs"
+                    "had no URL to restore (it was never opened, or was "
+                    "attach()-joined — attach records no URL by design); "
+                    "navigate() it to open a fresh page, or attach() to join "
+                    "the user's active tab — attach() and the facade open() "
+                    "are single-tab and tear down sibling tabs"
                 )
                 continue
-            if deadline - time.monotonic() <= 0:
+            if deadline - time.monotonic() < _MIN_HEAL_BUDGET:
+                # Starting a heal with a near-zero grant would still WRITE the
+                # open frame; a slow worker then creates a tab whose late
+                # reply is dropped — an orphan. Skip instead; the handle
+                # re-attaches lazily with a full op timeout on its next use.
                 log.warning(
                     "chrome-bridge: reconnect heal budget exhausted; %s "
                     "re-attaches on its next use",
@@ -584,14 +600,27 @@ class ChromeBridge:
                 )
             except BridgeError as exc:
                 # Best-effort per tab: one tab's failed heal must not poison
-                # the siblings. The handle stays unattached; its next
-                # primitive retries via _ensure_attached.
-                log.warning(
-                    "chrome-bridge: re-attach of %s failed (will retry on "
-                    "next use): %s",
-                    tab.current_url,
-                    exc,
-                )
+                # the siblings.
+                if tab.tab_id is not None:
+                    # The open leg succeeded (id published); a LATER leg —
+                    # the Page.enable ack — was cut short by the budget. The
+                    # handle IS attached; only Page events may be missing
+                    # until its next navigate re-enables them.
+                    log.warning(
+                        "chrome-bridge: re-attach of %s cut short after "
+                        "attach (Page events may be missing): %s",
+                        tab.current_url,
+                        exc,
+                    )
+                else:
+                    # The handle stays unattached; its next primitive
+                    # retries via _ensure_attached.
+                    log.warning(
+                        "chrome-bridge: re-attach of %s failed (will retry "
+                        "on next use): %s",
+                        tab.current_url,
+                        exc,
+                    )
 
     def close(self) -> None:
         """Best-effort end the session — closing all open tabs — then tear down
@@ -1645,8 +1674,9 @@ class Tab:
         so the rebuilt session lands on it, reconnect (which re-opens EVERY
         tab that had a URL, this one included), and the page is then open and
         loaded on a fresh tab. On that heal path ``timeout`` does not govern
-        the re-attach load waits (``reconnect`` uses the short
-        :data:`DEFAULT_REATTACH_TIMEOUT` ceiling per tab), which is harmless:
+        ``reconnect``'s eager re-attach load waits (those use the short
+        :data:`DEFAULT_REATTACH_TIMEOUT` ceiling per tab; only the in-call
+        fallback retry below honours ``timeout``), which is harmless:
         the re-attach load wait is non-fatal and ``wait_selector`` is the real
         readiness gate a script should apply next.
         """
