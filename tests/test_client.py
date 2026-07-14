@@ -29,6 +29,7 @@ from chrome_bridge.bridge.client import (
     BridgeTimeoutError,
     ChromeBridge,
     DetachedError,
+    Tab,
 )
 
 
@@ -1415,5 +1416,437 @@ def test_fill_sets_value_and_dispatches_events(bridge):
         assert "Event('change'" in fill_expr
         # Filling an absent element returns False.
         assert cdp.fill("textarea.absent", "x") is False
+    finally:
+        cdp.close()
+
+
+# --------------------------------------------------------------------------- #
+# Multi-tab: Tab handles over the multi-tab wire protocol (issue #16).
+#
+# The extension's session table (sw.js) lets one connection hold N attached
+# tabs: "open" with replace:false adds a tab, cdp/close ops carry an explicit
+# tabId, and events are tagged with their source tabId. These tests drive
+# ChromeBridge.new_tab()/Tab against the FakeBridge and assert the frames and
+# the per-tab routing.
+# --------------------------------------------------------------------------- #
+
+
+def _sequential_opens(start: int = 100):
+    """An open handler assigning tab ids start, start+1, ... per open frame."""
+    state = {"next": start}
+
+    def handler(frame):
+        tab_id = state["next"]
+        state["next"] += 1
+        return {"ok": True, "tabId": tab_id}
+
+    return handler
+
+
+def test_new_tab_sends_replace_false_and_enables_page(bridge):
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        tab = cdp.new_tab("https://b", timeout=0.2)
+        assert isinstance(tab, Tab)
+        assert tab.tab_id == 100
+        assert tab.current_url == "https://b"
+        open_frames = [f for f in bridge.received if f.get("op") == "open"]
+        assert open_frames == [
+            {"id": open_frames[0]["id"], "op": "open", "url": "https://b",
+             "replace": False}
+        ]
+        # Page.enable went out stamped with the NEW tab's id.
+        enables = [
+            f for f in bridge.received
+            if f.get("op") == "cdp" and f.get("method") == "Page.enable"
+        ]
+        assert enables and all(f.get("tabId") == 100 for f in enables)
+        # The default (facade) tab was never touched.
+        assert cdp._tab_id is None
+    finally:
+        cdp.close()
+
+
+def test_facade_open_keeps_legacy_frame_shape(bridge):
+    # The single-tab facade must stay wire-identical: no "replace" key (the
+    # wire default, replace:true) and no tabId on the open frame.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        open_frame = next(f for f in bridge.received if f.get("op") == "open")
+        assert "replace" not in open_frame
+        assert "tabId" not in open_frame
+    finally:
+        cdp.close()
+
+
+def test_two_tabs_hold_independent_state(bridge):
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        assert cdp._tab_id == 100
+        assert tab_b.tab_id == 101
+        assert cdp._current_url == "https://a"
+        assert tab_b.current_url == "https://b"
+    finally:
+        cdp.close()
+
+
+def test_tab_ops_carry_their_tab_id(bridge):
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        bridge.received.clear()
+
+        assert cdp.banner_present(".x") is True   # default tab -> tabId 100
+        assert tab_b.banner_present(".x") is True  # new tab -> tabId 101
+        assert tab_b.fill("input", "v") is True
+        assert cdp.get_cookies() == []
+
+        cdp_frames = [f for f in bridge.received if f.get("op") == "cdp"]
+        assert cdp_frames, "expected cdp frames"
+        assert cdp_frames[0]["tabId"] == 100      # facade banner_present
+        assert cdp_frames[1]["tabId"] == 101      # tab_b banner_present
+        assert cdp_frames[2]["tabId"] == 101      # tab_b fill
+        assert cdp_frames[3]["tabId"] == 100      # facade get_cookies
+    finally:
+        cdp.close()
+
+
+def test_tab_navigate_targets_its_tab(bridge):
+    bridge.on("open", _sequential_opens())
+
+    def default(frame):
+        if frame.get("method") == "Page.navigate":
+            return {"ok": True, "result": {"frameId": "f1"}}
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        bridge.received.clear()
+        tab_b.navigate("https://b2", timeout=0.2)
+        navs = [f for f in bridge.received if f.get("method") == "Page.navigate"]
+        assert navs and all(f["tabId"] == 101 for f in navs)
+        assert tab_b.current_url == "https://b2"
+        assert cdp._current_url == "https://a"  # the default tab is untouched
+        assert all(f.get("op") != "open" for f in bridge.received)
+    finally:
+        cdp.close()
+
+
+def test_events_route_to_their_tab_listener(bridge):
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    got_a, got_b, got_conn = [], [], []
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        cdp._default_tab.on_event("Custom.evt", lambda p: got_a.append(p))
+        tab_b.on_event("Custom.evt", lambda p: got_b.append(p))
+        cdp.on_event("Custom.evt", lambda p: got_conn.append(p))
+
+        bridge.send_event(
+            {"event": True, "type": "cdp", "method": "Custom.evt",
+             "params": {"n": 1}, "tabId": 101}
+        )
+        deadline = time.monotonic() + 2
+        while not got_b and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert got_b == [{"n": 1}]
+        assert got_a == []                # not this tab's event
+        assert got_conn == [{"n": 1}]     # the connection-wide bus sees it all
+    finally:
+        cdp.close()
+
+
+def test_untagged_events_broadcast_to_all_tabs(bridge):
+    # A single-tab-era peer sends events without tabId; they must reach every
+    # handle (this is what keeps the legacy load-event tests working).
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    got_a, got_b = [], []
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        cdp._default_tab.on_event("Custom.evt", lambda p: got_a.append(p))
+        tab_b.on_event("Custom.evt", lambda p: got_b.append(p))
+        bridge.send_event(
+            {"event": True, "type": "cdp", "method": "Custom.evt", "params": {}}
+        )
+        deadline = time.monotonic() + 2
+        while not (got_a and got_b) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert got_a == [{}] and got_b == [{}]
+    finally:
+        cdp.close()
+
+
+def test_targeted_detach_marks_only_that_tab(bridge):
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    seen_b = []
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        tab_b.on_event("__detached__", lambda p: seen_b.append(p))
+
+        bridge.send_event(
+            {"event": True, "type": "detached", "reason": "target_closed",
+             "tabId": 101}
+        )
+        deadline = time.monotonic() + 2
+        while not tab_b._detached.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert tab_b.tab_id is None
+        assert seen_b == [{"reason": "target_closed", "tabId": 101}]
+        # The default tab is untouched and still usable without a re-open.
+        assert cdp._tab_id == 100
+        assert not cdp._detached.is_set()
+        opens_before = sum(1 for f in bridge.received if f.get("op") == "open")
+        assert cdp.banner_present(".x") is True
+        assert sum(1 for f in bridge.received if f.get("op") == "open") == opens_before
+    finally:
+        cdp.close()
+
+
+def test_targeted_detach_does_not_fail_other_tabs_inflight_op(bridge):
+    # While tab A's op awaits its reply, a detach of tab B must NOT fail it:
+    # only the detached tab's in-flight ops are woken.
+    bridge.on("open", _sequential_opens())
+
+    def default(frame):
+        if frame.get("method") == "Runtime.evaluate":
+            # Detach tab B while A's evaluate is in flight, then answer it.
+            bridge.send_event(
+                {"event": True, "type": "detached", "reason": "gone", "tabId": 101}
+            )
+            time.sleep(0.2)  # let the reader process the detach first
+            return {"ok": True, "result": {"result": {"value": True}}}
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        assert cdp.banner_present(".x") is True  # NOT DetachedError
+        assert tab_b._detached.is_set()
+    finally:
+        cdp.close()
+
+
+def test_tab_reattach_after_detach_uses_replace_false(bridge):
+    # A detached new_tab handle must re-open transparently on its next
+    # primitive — with replace:false, so the re-attach never tears down the
+    # other live tabs.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        bridge.send_event(
+            {"event": True, "type": "detached", "reason": "gone", "tabId": 101}
+        )
+        deadline = time.monotonic() + 2
+        while not tab_b._detached.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        bridge.received.clear()
+        assert tab_b.banner_present(".x") is True
+        reopen = next(f for f in bridge.received if f.get("op") == "open")
+        assert reopen["url"] == "https://b"
+        assert reopen["replace"] is False
+        assert tab_b.tab_id == 102  # the fresh tab
+        assert cdp._tab_id == 100   # the default tab was never re-opened
+    finally:
+        cdp.close()
+
+
+def test_default_tab_reattach_uses_replace_false_when_other_tabs_live(bridge):
+    # The DEFAULT tab's automatic re-attach must also not reap live siblings:
+    # with a new_tab attached, its re-open goes out replace:false.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        cdp.open("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        bridge.send_event(
+            {"event": True, "type": "detached", "reason": "gone", "tabId": 100}
+        )
+        deadline = time.monotonic() + 2
+        while not cdp._detached.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        bridge.received.clear()
+        assert cdp.banner_present(".x") is True
+        reopen = next(f for f in bridge.received if f.get("op") == "open")
+        assert reopen["url"] == "https://a"
+        assert reopen["replace"] is False
+        assert tab_b.tab_id == 101  # sibling untouched
+    finally:
+        cdp.close()
+
+
+def test_close_tab_a_leaves_tab_b_usable(bridge):
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        tab_a = cdp.new_tab("https://a", timeout=0.2)
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        bridge.received.clear()
+
+        tab_a.close()
+        closes = [f for f in bridge.received if f.get("op") == "close"]
+        assert closes and closes[0]["tabId"] == 100
+
+        # The closed handle is permanently unusable...
+        with pytest.raises(BridgeError, match="closed"):
+            tab_a.banner_present(".x")
+        with pytest.raises(BridgeError, match="closed"):
+            tab_a.navigate("https://a2", timeout=0.2)
+        # ...and idempotent: a second close sends nothing more.
+        tab_a.close()
+        assert sum(1 for f in bridge.received if f.get("op") == "close") == 1
+
+        # Tab B is unaffected and its ops still carry its own id.
+        assert tab_b.banner_present(".x") is True
+        last_cdp = [f for f in bridge.received if f.get("op") == "cdp"][-1]
+        assert last_cdp["tabId"] == 101
+    finally:
+        cdp.close()
+
+
+def test_bridge_close_closes_all_tabs(bridge):
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    cdp.open("https://a", timeout=0.2)
+    cdp.new_tab("https://b", timeout=0.2)
+    bridge.received.clear()
+    cdp.close()
+    close_ids = {f["tabId"] for f in bridge.received if f.get("op") == "close"}
+    assert close_ids == {100, 101}
+    assert not cdp.is_alive()
+
+
+def test_facade_open_after_new_tab_marks_extra_tab_detached(bridge):
+    # The facade open() is single-tab mode (wire default replace:true): the
+    # extension tears down every other attached tab WITHOUT emitting detached
+    # events, so the client must mark new_tab handles detached itself. The
+    # handle then re-opens (replace:false) on its next use.
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge)
+    try:
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        assert tab_b.tab_id == 100
+        cdp.open("https://a", timeout=0.2)
+        assert tab_b.tab_id is None
+        assert tab_b._detached.is_set()
+        # The facade open kept the legacy reaper shape (no replace key).
+        facade_open = [f for f in bridge.received if f.get("op") == "open"][-1]
+        assert "replace" not in facade_open
+
+        bridge.received.clear()
+        assert tab_b.banner_present(".x") is True  # transparently re-opened
+        reopen = next(f for f in bridge.received if f.get("op") == "open")
+        assert reopen["replace"] is False and reopen["url"] == "https://b"
+    finally:
+        cdp.close()
+
+
+def test_attach_after_new_tab_marks_extra_tab_detached(bridge):
+    # attach() is single-tab too, but tears the others down only on SUCCESS
+    # (acquire-before-release): a failed attach leaves them intact.
+    bridge.on("open", _sequential_opens())
+    attach_ok = {"v": False}
+
+    def on_attach(frame):
+        if attach_ok["v"]:
+            return {"ok": True, "tabId": 55}
+        return {"ok": False, "error": "no active tab"}
+
+    bridge.on("attach", on_attach)
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        tab_b = cdp.new_tab("https://b", timeout=0.2)
+        with pytest.raises(BridgeError, match="no active tab"):
+            cdp.attach()
+        assert tab_b.tab_id == 100  # failed attach left the sibling intact
+
+        attach_ok["v"] = True
+        cdp.attach()
+        assert cdp._tab_id == 55
+        assert tab_b.tab_id is None and tab_b._detached.is_set()
+    finally:
+        cdp.close()
+
+
+def test_new_tab_open_failure_unregisters_handle(bridge):
+    calls = {"n": 0}
+
+    def on_open(frame):
+        calls["n"] += 1
+        if frame.get("replace") is False:
+            return {"ok": False, "error": "tab creation failed"}
+        return {"ok": True, "tabId": 7}
+
+    bridge.on("open", on_open)
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        with pytest.raises(BridgeError, match="tab creation failed"):
+            cdp.new_tab("https://b", timeout=0.2)
+        # The failed handle was not registered: only the default tab remains.
+        assert cdp._tabs == [cdp._default_tab]
+    finally:
+        cdp.close()
+
+
+def test_new_tab_awaits_its_tagged_load_event(bridge):
+    bridge.on("open", _sequential_opens())
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        threading.Timer(
+            0.1,
+            lambda: bridge.send_event(
+                {"event": True, "type": "cdp", "method": "Page.loadEventFired",
+                 "params": {}, "tabId": 100}
+            ),
+        ).start()
+        started = time.monotonic()
+        tab = cdp.new_tab("https://b", timeout=5.0)
+        # Resolved on the tagged load event, well before the 5 s ceiling.
+        assert time.monotonic() - started < 2.0
+        assert tab.tab_id == 100
+    finally:
+        cdp.close()
+
+
+def test_default_tab_close_raises(bridge):
+    bridge.set_default(_cdp_result({}))
+    cdp = _client(bridge)
+    try:
+        with pytest.raises(BridgeError, match="default tab"):
+            cdp._default_tab.close()
     finally:
         cdp.close()
