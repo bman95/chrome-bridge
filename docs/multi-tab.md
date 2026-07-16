@@ -172,7 +172,11 @@ The extension mirrors the same discipline: `open` (any `replace` shape),
 chain that first drains every per-tab chain and blocks later ops until it
 settles — two concurrent `open`s can never race the session table. The
 chains order one native port's requests and reset when a new port is
-dialed, so a hung CDP command from a dead session can never wedge its
-successor; the port-replacement teardown deliberately runs *off* the chains
-(protected by the per-op port-staleness gates) because detaching every
-debuggee is what settles such a hang.
+dialed, so a hung CDP command from a dead session cannot wedge the sessions
+that follow a port swap (a successor loopback client on the *same*
+still-live port shares that port's chains, as it always shared the single
+pre-split chain; a wedge there ends when worker eviction drops the port).
+Stale ops from a replaced port are fenced by per-op port-currency checks at
+— and, for the multi-tab teardown loops, between — their await boundaries.
+The port-replacement teardown itself deliberately runs *off* the chains,
+because detaching every debuggee is what settles such a hang.

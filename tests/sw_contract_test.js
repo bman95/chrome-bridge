@@ -590,6 +590,81 @@ const tests = String.raw`
   assert.equal(renameDone, true); // completed despite the wedged op
   assert.ok(detached.includes(recoveredTab)); // teardown released the tab
   assert.equal(sessions.size, 0);
+
+  // --- Stale teardown loops must not cross a port swap: a replace:true
+  // open's teardown suspended in an await (tabs.remove held up by e.g. a
+  // beforeunload dialog) resumes AFTER the chains reset let a successor
+  // session run — its remaining iterations must not destroy an entry the
+  // successor just adopted (the per-iteration port gates).
+  const replies5 = [];
+  let receive5;
+  const nativePort5 = {
+    onMessage: { addListener: (fn) => { receive5 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies5.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort5;
+  port = null;
+  await dial();
+  receive5({ id: id(40, 1), op: "open", url: "https://stale-a.example" });
+  await flush();
+  const staleA = replies5.at(-1).tabId;
+  receive5({ id: id(40, 2), op: "open", url: "https://stale-b.example", replace: false });
+  await flush();
+  const staleB = replies5.at(-1).tabId;
+  assert.equal(sessions.size, 2);
+  // Park the removal of staleA so the replace:true teardown loop (snapshot
+  // [staleA, staleB]) suspends after its first iteration.
+  const parkedRemoves = new Map();
+  const realRemove = chrome.tabs.remove;
+  chrome.tabs.remove = (tabId) => {
+    if (tabId === staleA) {
+      return new Promise((resolve) => {
+        parkedRemoves.set(tabId, () => { removed.push(tabId); resolve(); });
+      });
+    }
+    return realRemove(tabId);
+  };
+  receive5({ id: id(40, 3), op: "open", url: "https://stale-reaper.example" });
+  await flush();
+  assert.ok(parkedRemoves.has(staleA)); // loop suspended mid-teardown
+  assert.ok(sessions.has(staleB)); // second iteration has not run yet
+  // Port swap while the loop is suspended; the successor session adopts
+  // staleB via the attach handover.
+  const replies6 = [];
+  let receive6;
+  const nativePort6 = {
+    onMessage: { addListener: (fn) => { receive6 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies6.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort6;
+  port = null;
+  await dial();
+  activeTab = { id: staleB };
+  receive6({ id: id(41, 1), op: "attach" }, );
+  await flush();
+  assert.equal(replies6.at(-1).ok, true);
+  assert.equal(sessions.get(staleB).sessionGeneration, 41); // handover done
+  // Resume the stale loop: its next iteration must hit the port gate and
+  // walk away — NOT closeTab(staleB), which would silently destroy the
+  // successor's adopted entry with no detached event.
+  parkedRemoves.get(staleA)();
+  parkedRemoves.delete(staleA);
+  chrome.tabs.remove = realRemove;
+  await flush();
+  assert.ok(sessions.has(staleB)); // successor entry intact
+  assert.equal(sessions.get(staleB).sessionGeneration, 41);
+  assert.ok(!removed.includes(staleB));
+  // The stale open never replied into the successor's stream.
+  assert.equal(replies6.some((m) => Array.isArray(m.id) && m.id[1] === 40), false);
+  // cleanup
+  receive6({ id: id(41, 2), op: "close", tabId: staleB });
+  await flush();
+  assert.equal(sessions.size, 0);
+  activeTab = null;
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

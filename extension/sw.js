@@ -241,13 +241,19 @@ const sessions = new Map();
 // Lifetime: the chains order ONE port's requests. dial() resets them when it
 // installs a new port, because an entry can legitimately never settle — a
 // sendCommand awaiting a promise the page never resolves (Runtime.evaluate
-// with awaitPromise) outlives the client's own timeout — and a new session's
-// ops must not queue behind a dead session's wedge. In particular the
-// replace:true reaper "open", the designated recovery op, is what CLEARS
-// such a wedge (its teardown's debugger.detach settles the hung command);
-// parked behind it, recovery would be impossible. Already-queued old-port
-// ops still run in their original order and bail at onPythonMessage's
-// port-staleness gate; mid-flight ones are covered by their rollback paths.
+// with awaitPromise) outlives the client's own timeout — and a session that
+// FOLLOWS A PORT SWAP must not queue behind the dead port's wedge. In
+// particular the replace:true reaper "open", the designated recovery op, is
+// what CLEARS such a wedge (its teardown's debugger.detach settles the hung
+// command); parked behind it, recovery would be impossible. (A successor
+// loopback client on the SAME still-live port shares that port's chains, as
+// it always shared the single pre-split chain; a wedge there ends with the
+// worker's eviction dropping the port.) Already-queued old-port ops still
+// run in their original order and bail at onPythonMessage's entry
+// port-staleness gate; mid-flight ones re-check port currency at — and,
+// for the multi-tab teardown loops, between — their await boundaries, so a
+// resumed stale op can neither reply nor touch entries the successor
+// session created or adopted.
 let globalChain = Promise.resolve();
 const tabChains = new Map();
 
@@ -418,8 +424,19 @@ async function onPythonMessage(msg, fromPort) {
       // Single-tab mode is the DEFAULT: unless the caller opts out with
       // "replace": false, tear down every attached tab so a re-open (e.g.
       // after a dropped detach) cannot orphan them. replace:false adds an
-      // ADDITIONAL tab, leaving existing attachments untouched.
-      if (msg.replace !== false) await closeAllTabs();
+      // ADDITIONAL tab, leaving existing attachments untouched. Torn down
+      // one tab at a time with a port-currency gate BETWEEN iterations: the
+      // ordering chains reset when a new port is dialed, so a successor
+      // session's ops can run while this loop is suspended in an await
+      // (e.g. tabs.remove held up by a beforeunload dialog) — and closeTab
+      // re-reads the table, so a stale iteration could otherwise destroy an
+      // entry the successor just created or adopted.
+      if (msg.replace !== false) {
+        for (const priorTabId of [...sessions.keys()]) {
+          if (port !== fromPort) return; // replaced mid-teardown: walk away
+          await closeTab(priorTabId);
+        }
+      }
       if (port !== fromPort) return; // replaced while closing prior tabs
       // active:false opens the tab in the current window without focusing it,
       // sharing the real profile's cookies/login state. We deliberately use
@@ -510,8 +527,13 @@ async function onPythonMessage(msg, fromPort) {
         bridgeCreated: false,
       });
       // Single-tab invariant, same as a replace:true "open": tear down every
-      // OTHER attached tab (each removed only if bridge-created).
+      // OTHER attached tab (each removed only if bridge-created). Same
+      // per-iteration port gate as the "open" teardown loop — a stale
+      // iteration after a port swap must not destroy entries the successor
+      // session created or adopted; breaking falls into the rollback below,
+      // which already handles the replaced-port case.
       for (const priorTabId of [...sessions.keys()]) {
+        if (port !== fromPort) break;
         if (priorTabId !== tab.id) await closeTab(priorTabId);
       }
       if (port !== fromPort) {

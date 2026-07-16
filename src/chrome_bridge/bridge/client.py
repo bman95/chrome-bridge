@@ -641,9 +641,9 @@ class ChromeBridge:
         with self._conn_lock.exclusive():
             self._reconnect_locked()
 
-    def _reconnect_if_dead(self) -> None:
+    def _reconnect_if_dead(self) -> bool:
         """:meth:`reconnect`, unless another thread already rebuilt the
-        connection.
+        connection. Returns ``True`` iff THIS call ran the rebuild.
 
         The transparent-heal paths (:meth:`Tab.navigate`'s dead-socket branch,
         ``_ensure_attached``) call this instead of :meth:`reconnect`: with one
@@ -653,13 +653,17 @@ class ChromeBridge:
         re-open) the winner just built. Checking liveness under the exclusive
         grip makes the decision race-free: by the time a loser gets the grip,
         the winner's heal is complete, so a live connection means the rebuild
-        this caller wanted has already happened. The public :meth:`reconnect`
-        keeps its unconditional force-rebuild semantics for direct callers.
+        this caller wanted has already happened. The return value tells the
+        caller WHO rebuilt — a loser must not infer from shared state what
+        the winner's heal did (see :meth:`Tab.navigate`'s fall-through). The
+        public :meth:`reconnect` keeps its unconditional force-rebuild
+        semantics for direct callers.
         """
         with self._conn_lock.exclusive():
             if self.is_alive():
-                return
+                return False
             self._reconnect_locked()
+            return True
 
     def _reconnect_locked(self) -> None:
         # Drop the dead socket without trying its close-op (the peer is gone).
@@ -1306,14 +1310,15 @@ class ChromeBridge:
         which also makes this the reaper for leftover tabs from a dead
         session. Any :meth:`new_tab` handles are therefore marked detached
         client-side (the extension emits no events for its own teardown);
-        touching one afterwards re-opens it in a fresh tab.
+        touching one afterwards re-opens it in a fresh tab. The mark happens
+        inside ``_open``'s exclusive section (``single_tab=True``), atomically
+        with the ``replace`` computation, so a concurrent ``new_tab`` can
+        never be silently spared or orphaned. The teardown mirror still
+        applies even when the open then fails (server-side the replace:true
+        teardown runs BEFORE the tab is created); a spurious mark only costs
+        a handle one harmless extra re-attach, the safe direction to err.
         """
-        # The replace:true teardown runs server-side BEFORE the new tab is
-        # created — even when the open then fails — so mirror it client-side up
-        # front. A spurious mark (e.g. the send itself fails) only costs a
-        # handle one harmless extra re-attach, the safe direction to err.
-        self._mark_other_tabs_detached(self._default_tab)
-        self._default_tab._open(url, timeout=timeout)
+        self._default_tab._open(url, timeout=timeout, single_tab=True)
 
     def attach(self, *, timeout: float | None = None) -> None:
         """Attach the debugger to the user's current active tab.
@@ -1678,6 +1683,7 @@ class Tab:
         timeout: float = DEFAULT_NAV_TIMEOUT,
         replace: Any = _ADAPTIVE_REPLACE,
         deadline: float | None = None,
+        single_tab: bool = False,
     ) -> None:
         """Open ``url`` in a fresh attached tab for this handle, await load.
 
@@ -1695,7 +1701,12 @@ class Tab:
         leg starts, an op leg never exceeding the connection default;
         :meth:`ChromeBridge.reconnect` passes its shared heal budget so a
         wedged worker cannot stack full per-op timeouts, within one tab's
-        heal or across N tabs.
+        heal or across N tabs. ``single_tab`` is the facade
+        :meth:`ChromeBridge.open` contract: mark every sibling handle
+        detached INSIDE the exclusive section, atomically with the ``replace``
+        computation, so the open goes out as the reaper and no interleaving
+        with a concurrent ``new_tab`` can downgrade it to ``replace:false``
+        or leave a marked-but-still-attached orphan tab behind.
         """
         self._check_usable()
         # The extension's "open" both creates the tab AND navigates it to `url`,
@@ -1708,14 +1719,6 @@ class Tab:
 
         self.on_event("Page.loadEventFired", _on_load)
         try:
-            # Clear the detach flag BEFORE issuing the open so that a detach the
-            # reader observes for the NEW tab *during* this open (e.g. the SW is
-            # evicted again mid-re-attach) survives and forces another re-attach.
-            # Clearing it after the request — as an earlier draft did — could erase
-            # a fresh detach the reader had just set, leaving tab_id stale and the
-            # session falsely "attached". A spuriously-set flag only costs one
-            # harmless extra re-attach, which is the safe direction to err.
-            self._detached.clear()
             payload: dict[str, Any] = {"op": "open", "url": url}
             bridge = self._bridge
             # An "open" mutates the session table (its replace:true shape is
@@ -1733,6 +1736,31 @@ class Tab:
             # section deliberately ends BEFORE the Page.enable leg and the
             # load wait below, so a slow page never stalls other tabs.
             with bridge._conn_lock.exclusive():
+                # Clear the detach flag BEFORE issuing the open so that a
+                # detach the reader observes for the NEW tab *during* this
+                # open (e.g. the SW is evicted again mid-re-attach) survives
+                # and forces another re-attach. Clearing it after the request
+                # could erase a fresh detach the reader had just set, leaving
+                # tab_id stale and the session falsely "attached"; a
+                # spuriously-set flag only costs one harmless extra
+                # re-attach. Cleared UNDER the grip so a sibling's single-tab
+                # mark can never land between this clear and the publish
+                # below — that interleaving would leave a healthy handle
+                # flagged detached while its live tab stays attached
+                # server-side, an orphan no handle (and no close()) reclaims.
+                self._detached.clear()
+                if single_tab:
+                    # The facade open's single-tab contract, applied
+                    # atomically with the replace computation: mark every
+                    # sibling detached (the server-side replace:true teardown
+                    # emits no events for its own teardown), which makes the
+                    # adaptive shape below the reaper. A concurrent new_tab
+                    # either published first — and is marked and reaped here,
+                    # consistently — or opens after this reaper as an
+                    # additional replace:false tab; it can never be silently
+                    # spared (downgrading this open to replace:false was the
+                    # old unlocked-mark race) or orphaned.
+                    bridge._mark_other_tabs_detached(self)
                 if replace is _ADAPTIVE_REPLACE:
                     replace = self._reopen_replace()
                 if replace is not None:
@@ -1807,14 +1835,17 @@ class Tab:
         facade, whose docstring carries the caller-facing contract.
         """
         self._check_usable()
-        # Same rationale as _open(): clear the detach flag BEFORE the request so
-        # a detach observed for the new tab during this attach survives.
-        self._detached.clear()
         # An "attach" mutates the session table (its success tears down every
         # other attached tab), so its round-trip + publish are a lifecycle op
         # under the exclusive grip, like _open's. The Page.enable leg below
         # runs outside it, as an ordinary per-tab op.
         with self._bridge._conn_lock.exclusive():
+            # Same rationale (and same under-the-grip placement) as _open():
+            # clear the detach flag BEFORE the request so a detach observed
+            # for the new tab during this attach survives, and so a sibling's
+            # single-tab mark can never land between this clear and the
+            # publish, falsely flagging the fresh attachment detached.
+            self._detached.clear()
             reply = self._bridge._request({"op": "attach"}, timeout=timeout)
             tab_id = reply.get("tabId")
             if tab_id is None:
@@ -1878,7 +1909,7 @@ class Tab:
             # prior one. _reconnect_if_dead coalesces with a concurrent
             # thread's reconnect rather than tearing down what it just built.
             self.current_url = url
-            bridge._reconnect_if_dead()
+            healed_by_us = bridge._reconnect_if_dead()
             if self.tab_id is None:
                 # The heal is best-effort per tab; if this tab's eager
                 # re-open failed (or a coalesced reconnect ran before our
@@ -1886,12 +1917,18 @@ class Tab:
                 # (if any) surfaces on this call.
                 self._open(url, timeout=timeout)
                 return
-            if self.current_url == url:
-                return  # the heal re-opened this tab on `url`
-            # A concurrent thread's reconnect healed this tab onto its PRIOR
-            # url (its heal loop read current_url before our write landed,
-            # and _open wrote the healed url back). The tab is attached and
-            # live — fall through to an ordinary in-place navigate.
+            if healed_by_us:
+                # OUR rebuild's heal loop read the current_url written above
+                # (no other thread writes this tab's current_url under the
+                # one-thread-per-tab pattern), so the tab is freshly open on
+                # `url`.
+                return
+            # A concurrent thread's reconnect rebuilt the connection. Whether
+            # its heal read this tab's PRIOR url or the one written above is
+            # a race we must not guess from current_url (this thread just
+            # wrote it, so equality proves nothing). Fall through to an
+            # ordinary in-place navigate — worst case one redundant same-URL
+            # load; correct in every interleaving.
         elif self.tab_id is None or self._detached.is_set():
             self._open(url, timeout=timeout)
             return
@@ -2370,9 +2407,11 @@ class Tab:
         * **socket dead** — eviction also dropped the native port Chrome spawned,
           so the host's relay ended and this client's loopback socket died. A
           dead socket cannot carry an ``open``; rebuild the whole connection via
-          :meth:`ChromeBridge.reconnect` (which re-dials and eagerly re-opens
-          EVERY tab that had a URL, in creation order, remapping tab ids —
-          including this one, so it normally returns ready) before any op. If
+          the coalescing ``_reconnect_if_dead`` (one rebuild even when N tab
+          threads observe the same dead socket; the winner re-dials and eagerly
+          re-opens EVERY tab that had a URL, in creation order, remapping tab
+          ids — including this one, so it normally returns ready) before any
+          op. If
           this tab's eager re-open failed (reconnect heals best-effort per
           tab), it falls through to the re-open below as the retry. A
           long-lived owner reusing one client thus self-heals an evicted

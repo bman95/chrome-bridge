@@ -1107,9 +1107,14 @@ def test_ops_on_different_tabs_pipeline_in_parallel(bridge):
 
 
 def test_two_threads_two_tabs_interleave_with_per_tab_fifo(bridge):
-    # Two threads drive two tabs concurrently. The fake's request log must
-    # show each tab's ops in issue order (per-tab FIFO) even though the two
-    # tabs' request streams may interleave arbitrarily with each other.
+    # Two threads drive two tabs concurrently; the fake's request log must
+    # show each tab's ops in issue order while the two streams interleave.
+    # NOTE the ordering assertions alone cannot fail while each thread awaits
+    # its own replies — per-tab log order is then structural. The FIFO
+    # enforcement itself is pinned by the parking tests
+    # (test_same_tab_ops_serialise_concurrent_callers for cross-thread
+    # same-tab ordering); this test is the end-to-end smoke that two live
+    # interleaved streams keep id correlation, routing, and results intact.
     _open_tabs_by_url(bridge)
 
     def default(frame):
