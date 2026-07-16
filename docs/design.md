@@ -78,7 +78,7 @@ your REAL everyday Chrome (running normally, one profile per script target)
 
 The bridge is **single-tab by default, multi-tab opt-in**: the legacy facade
 (`cdp.open(...)` / `cdp.navigate(...)` / ...) drives one tab at a time (each
-facade `open` replaces the previous tab), while `ChromeBridge.new_tab(url)`
+facade `open` replaces every currently attached tab), while `ChromeBridge.new_tab(url)`
 opens additional attached tabs, each addressed by `tabId` on the wire. One
 connection can hold N attached tabs, but its operations stay serialized —
 see [`docs/multi-tab.md`](multi-tab.md).

@@ -35,7 +35,8 @@ Playwright-style split, one class per concern:
 
 `Tab.close()` closes that one tab (the extension removes it only if it was
 bridge-created) and permanently retires the handle; other tabs are untouched.
-`ChromeBridge.close()` ends the whole session, closing every open tab.
+`ChromeBridge.close()` ends the whole session — bridge-created tabs are
+removed; an `attach()`-joined tab is detached but left open.
 
 ## Open semantics: `replace`
 
@@ -46,8 +47,9 @@ The wire `open` op takes an optional `replace` flag (default **true**):
   *first* (removing each only if bridge-created), then creates and attaches
   the new one. Callers that never pass `replace` keep the historical
   one-tab-at-a-time behavior and cannot leak tabs by re-opening. This shape
-  is also the **reaper**: it is the only op that reclaims leftover tabs from
-  a dead client session (see "Generation fencing" below).
+  is also the designated **reaper** for leftover tabs from a dead client
+  session (a successful `attach`'s teardown reclaims them too — see
+  "Generation fencing" below).
 - **`replace:false`** (what `new_tab` sends) opens an *additional* tab:
   existing attachments are left untouched, and the caller addresses tabs
   explicitly by `tabId` from there on.
@@ -79,8 +81,9 @@ per-tab `"__detached__"` pseudo-event reports detaches). An event whose
 `tabId` no live handle claims — a late event from an already-detached tab, or
 from a pre-eviction session — is dropped (debug-logged) rather than routed,
 so it can never fire a listener on the wrong handle. The one exception is a
-`detached` event racing its own open/attach reply: it is *parked* and
-re-dispatched once the reply publishes the `tabId`, so the race cannot lose a
+`detached` event racing its own open/attach reply: it is *parked*, then
+consumed when the reply tries to publish the `tabId` — the open/attach raises
+`DetachedError` and the handle stays detached — so the race cannot lose a
 detach.
 
 ## Detach and recovery
