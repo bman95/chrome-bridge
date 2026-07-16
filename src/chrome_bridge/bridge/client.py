@@ -2406,12 +2406,12 @@ class Tab:
           siblings are live (:meth:`_reopen_replace`).
         * **socket dead** — eviction also dropped the native port Chrome spawned,
           so the host's relay ended and this client's loopback socket died. A
-          dead socket cannot carry an ``open``; rebuild the whole connection via
-          the coalescing ``_reconnect_if_dead`` (one rebuild even when N tab
-          threads observe the same dead socket; the winner re-dials and eagerly
-          re-opens EVERY tab that had a URL, in creation order, remapping tab
-          ids — including this one, so it normally returns ready) before any
-          op. If
+          dead socket cannot carry an ``open``; rebuild the whole connection
+          via the coalescing ``_reconnect_if_dead`` before any op: one rebuild
+          even when N tab threads observe the same dead socket — the winner
+          re-dials and eagerly re-opens EVERY tab that had a URL, in creation
+          order, remapping tab ids (including this one, so it normally
+          returns ready). If
           this tab's eager re-open failed (reconnect heals best-effort per
           tab), it falls through to the re-open below as the retry. A
           long-lived owner reusing one client thus self-heals an evicted

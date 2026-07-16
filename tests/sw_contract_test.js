@@ -665,6 +665,114 @@ const tests = String.raw`
   await flush();
   assert.equal(sessions.size, 0);
   activeTab = null;
+
+  // --- Stale ATTACH rollback must key on entry IDENTITY, not generation:
+  // generations are per-host counters, so a successor client on a fresh
+  // host can carry the SAME number (both first sessions are generation 1).
+  // A stale attach suspended in its teardown, resumed after the port swap,
+  // must not roll back (delete + silently detach) the successor's adopted
+  // entry just because the numbers collide.
+  receive6({ id: id(50, 1), op: "open", url: "https://ident-p.example" });
+  await flush();
+  const identP = replies6.at(-1).tabId;
+  activeTab = { id: 900 };
+  const parkedRemoves2 = new Map();
+  const realRemove2 = chrome.tabs.remove;
+  chrome.tabs.remove = (tabId) => {
+    if (tabId === identP) {
+      return new Promise((resolve) => {
+        parkedRemoves2.set(tabId, () => { removed.push(tabId); resolve(); });
+      });
+    }
+    return realRemove2(tabId);
+  };
+  receive6({ id: id(50, 2), op: "attach" }); // stale attach, generation 50
+  await flush();
+  assert.ok(parkedRemoves2.has(identP)); // teardown loop suspended
+  assert.equal(sessions.get(900).sessionGeneration, 50);
+  const replies7 = [];
+  let receive7;
+  const nativePort7 = {
+    onMessage: { addListener: (fn) => { receive7 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies7.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort7;
+  port = null;
+  await dial();
+  // Successor attaches to the SAME tab with the SAME (colliding) generation.
+  receive7({ id: id(50, 3), op: "attach" });
+  await flush();
+  assert.equal(replies7.at(-1).ok, true);
+  assert.equal(replies7.at(-1).tabId, 900); // handover to the successor
+  parkedRemoves2.get(identP)();
+  parkedRemoves2.delete(identP);
+  chrome.tabs.remove = realRemove2;
+  await flush();
+  // The stale rollback must have skipped the successor's entry: identity
+  // differs even though the generation number matches.
+  assert.ok(sessions.has(900));
+  assert.equal(sessions.get(900).sessionGeneration, 50);
+  receive7({ id: id(50, 4), op: "close", tabId: 900 });
+  await flush();
+  assert.equal(sessions.size, 0);
+
+  // --- The attach teardown loop's per-iteration port gate: a stale attach
+  // suspended mid-teardown resumes after the port swap; its REMAINING
+  // iterations must not closeTab an entry the successor session adopted.
+  receive7({ id: id(51, 1), op: "open", url: "https://gate-p.example" });
+  await flush();
+  const gateP = replies7.at(-1).tabId;
+  receive7({ id: id(51, 2), op: "open", url: "https://gate-q.example", replace: false });
+  await flush();
+  const gateQ = replies7.at(-1).tabId;
+  activeTab = { id: 901 };
+  const parkedRemoves3 = new Map();
+  const realRemove3 = chrome.tabs.remove;
+  chrome.tabs.remove = (tabId) => {
+    if (tabId === gateP) {
+      return new Promise((resolve) => {
+        parkedRemoves3.set(tabId, () => { removed.push(tabId); resolve(); });
+      });
+    }
+    return realRemove3(tabId);
+  };
+  receive7({ id: id(51, 3), op: "attach" }); // teardown snapshot [gateP, gateQ, 901]
+  await flush();
+  assert.ok(parkedRemoves3.has(gateP)); // suspended on gateP's removal
+  const replies8 = [];
+  let receive8;
+  const nativePort8 = {
+    onMessage: { addListener: (fn) => { receive8 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies8.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort8;
+  port = null;
+  await dial();
+  // Successor adopts gateQ (attach handover) — a snapshot member the stale
+  // loop has not reached yet.
+  activeTab = { id: gateQ };
+  receive8({ id: id(52, 1), op: "attach" });
+  await flush();
+  assert.equal(replies8.at(-1).ok, true);
+  assert.equal(replies8.at(-1).tabId, gateQ);
+  assert.equal(sessions.get(gateQ).sessionGeneration, 52);
+  parkedRemoves3.get(gateP)();
+  parkedRemoves3.delete(gateP);
+  chrome.tabs.remove = realRemove3;
+  await flush();
+  // The resumed stale loop must have broken at the port gate before its
+  // gateQ iteration: the successor's adopted entry survives, untouched.
+  assert.ok(sessions.has(gateQ));
+  assert.equal(sessions.get(gateQ).sessionGeneration, 52);
+  assert.ok(!removed.includes(gateQ));
+  receive8({ id: id(52, 2), op: "close", tabId: gateQ });
+  await flush();
+  assert.equal(sessions.size, 0);
+  activeTab = null;
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

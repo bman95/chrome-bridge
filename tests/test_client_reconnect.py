@@ -497,6 +497,29 @@ def test_concurrent_dead_socket_recovery_reconnects_once(rbridge):
         cdp.close()
 
 
+def test_reconnect_if_dead_reports_who_rebuilt(rbridge):
+    # navigate()'s dead-socket branch keys its "already on the right page"
+    # early return off WHO rebuilt: True only when this call ran the rebuild
+    # (its heal then read the current_url the caller just wrote); a False
+    # (coalesced loser, or the connection was never dead) must fall through
+    # to an in-place navigate. Pin the return contract.
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        # Alive: no rebuild happened, and none may be reported.
+        connections_before = rbridge.connections()
+        assert cdp._reconnect_if_dead() is False
+        assert rbridge.connections() == connections_before
+
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+        # Dead: this call must run (and report) the rebuild.
+        assert cdp._reconnect_if_dead() is True
+        assert rbridge.connections() == connections_before + 1
+    finally:
+        cdp.close()
+
+
 def test_navigate_on_additional_tab_reconnects_after_socket_death(rbridge):
     # navigate() on a new_tab handle over a dead socket must rebuild the
     # connection, which re-opens the default tab on ITS last URL and then

@@ -520,12 +520,18 @@ async function onPythonMessage(msg, fromPort) {
       // active tab was ALREADY attached (e.g. the user focused a
       // bridge-created one) this commit is the ownership handover: it is the
       // user's tab now (bridgeCreated: false), so teardown must never
-      // remove it.
-      sessions.set(tab.id, {
+      // remove it. Keep a reference to OUR entry object: the post-teardown
+      // checks below compare by identity, not by generation — generations
+      // are per-host-process counters, so a successor client on a fresh
+      // host after a port swap can carry the SAME number (both first
+      // sessions are generation 1), and a value compare would let the
+      // stale rollback destroy the successor's just-secured attachment.
+      const ourEntry = {
         sessionGeneration: requestGeneration,
         owner: fromPort.bridgeHostName,
         bridgeCreated: false,
-      });
+      };
+      sessions.set(tab.id, ourEntry);
       // Single-tab invariant, same as a replace:true "open": tear down every
       // OTHER attached tab (each removed only if bridge-created). Same
       // per-iteration port gate as the "open" teardown loop — a stale
@@ -537,11 +543,12 @@ async function onPythonMessage(msg, fromPort) {
         if (priorTabId !== tab.id) await closeTab(priorTabId);
       }
       if (port !== fromPort) {
-        // This session died mid-teardown. Roll back only what is still OURS:
-        // a successor may already have taken the entry over (e.g. its own
-        // "attach" to this same active tab re-generations the session).
-        const entry = sessions.get(tab.id);
-        if (entry !== undefined && entry.sessionGeneration === requestGeneration) {
+        // This session died mid-teardown. Roll back only what is still OURS
+        // — by OBJECT IDENTITY (see the ourEntry note above): a successor
+        // may already have taken the entry over (its own "attach" to this
+        // same active tab replaces the entry object), and its generation
+        // number can collide with ours across a host swap.
+        if (sessions.get(tab.id) === ourEntry) {
           sessions.delete(tab.id);
           try {
             await chrome.debugger.detach({ tabId: tab.id });
@@ -551,11 +558,11 @@ async function onPythonMessage(msg, fromPort) {
         }
         return;
       }
-      const entry = sessions.get(tab.id);
-      if (entry === undefined || entry.sessionGeneration !== requestGeneration) {
+      if (sessions.get(tab.id) !== ourEntry) {
         // A mid-teardown onDetach for the just-attached tab already ended
         // this session (the detached event was relayed above) — replying
-        // ok:true would claim a tab whose debugger is gone.
+        // ok:true would claim a tab whose debugger is gone. Identity, not
+        // generation, for the same collision-proofing as the rollback.
         reply(msg.id, { ok: false, error: "debugger detached during attach" });
         return;
       }
