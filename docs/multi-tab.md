@@ -45,7 +45,9 @@ The wire `open` op takes an optional `replace` flag (default **true**):
 - **`replace:true`** (the default, what the facade `open` sends) is
   single-tab mode: the extension tears down every currently attached tab
   *first* (removing each only if bridge-created), then creates and attaches
-  the new one. Callers that never pass `replace` keep the historical
+  the new one. Because the teardown runs before the create, a *failed* open
+  (tab creation or attach error) still leaves the prior tabs torn down —
+  `ok:false` with zero tabs attached. Callers that never pass `replace` keep the historical
   one-tab-at-a-time behavior and cannot leak tabs by re-opening. This shape
   is also the designated **reaper** for leftover tabs from a dead client
   session (a successful `attach`'s teardown reclaims them too — see
@@ -135,9 +137,13 @@ session table records, per attached tab, the generation that created it; a
 can never drive a tab its successor has since adopted. Events are stamped
 with the generation of the entry that produced them, and the host drops any
 event that doesn't match the live client session (the field never reaches
-the Python client). A successor may *list* a predecessor's leftover tabs
-(the read-only `tabs` op is deliberately unfenced) but not drive them; a
-`replace:true` open is the reaper that reclaims them.
+the Python client). Replies are fenced the same way: the host tags every
+request id with the client session's generation and drops a reply whose tag
+doesn't match the live session, so a reply still in flight when a connection
+is torn down can never land in its successor. A successor may *list* a
+predecessor's leftover tabs (the read-only `tabs` op is deliberately
+unfenced) but not drive them; a `replace:true` open — or a successful
+`attach`, whose teardown is equally generation-blind — reclaims them.
 
 ## Concurrency: serialized per connection
 
