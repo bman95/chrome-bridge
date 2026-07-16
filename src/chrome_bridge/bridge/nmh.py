@@ -14,9 +14,13 @@ Topology::
 
 Chrome owns the host's lifetime, so a script cannot be its parent. The host
 therefore listens on a loopback TCP socket (``127.0.0.1``) that the client
-dials into. Exactly one client connection is served at a time (the bridge
-drives a single Chrome tab; concurrent clients would interleave ops the
-single-tab model forbids — see the sw.js WIRE PROTOCOL note).
+dials into. Exactly one client connection is served at a time: the wire
+protocol serializes ops per connection — one request in flight, awaited
+before the next; the extension's session table relies on it (see the sw.js
+WIRE PROTOCOL note) — and a second concurrent client would interleave its
+frames into that single serialized stream. The rule is about the relay
+being one stream, not about tab count: the one client may hold several
+attached tabs at once (see ``docs/multi-tab.md``).
 
 Client authentication (client -> host only; the sw.js wire contract is
 unchanged)
@@ -534,7 +538,7 @@ def _accept_client(listener: socket.socket) -> tuple[socket.socket, BinaryIO, Bi
     same port (the MV3 service worker reconnects on an alarm, so overlapping
     host processes are a normal occurrence). Without it, the second ``bind``
     fails with ``EADDRINUSE`` and that host exits cleanly, leaving a single
-    owner of the port and preserving the single-tab invariant.
+    owner of the port and preserving the one-relay-per-profile invariant.
     """
     client, addr = listener.accept()
     logger.info("client connected from %s", addr)

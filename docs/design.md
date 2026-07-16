@@ -76,6 +76,13 @@ your REAL everyday Chrome (running normally, one profile per script target)
   └────────────────────────────────────────────────────────┘
 ```
 
+The bridge is **single-tab by default, multi-tab opt-in**: the legacy facade
+(`cdp.open(...)` / `cdp.navigate(...)` / ...) drives one tab at a time (each
+facade `open` replaces every currently attached tab), while `ChromeBridge.new_tab(url)`
+opens additional attached tabs, each addressed by `tabId` on the wire. One
+connection can hold N attached tabs, but its operations stay serialized —
+see [`docs/multi-tab.md`](multi-tab.md).
+
 ## The core primitives
 
 | Need | CDP |
@@ -122,11 +129,14 @@ already carry.
    (fail-fast `BridgeError`), so the relay drop only covers raw clients. Keep
    command payloads (e.g. large `fill` values or injected scripts) under
    1 MB.
-2. **MV3 service-worker eviction mid-job** (workers die ~30s idle).
+2. **MV3 service-worker eviction mid-job** (workers die ~30s idle). An
+   eviction drops the native port and with it **every** attached tab at once.
    Mitigated by a `chrome.alarms` keepalive + `ChromeBridge.reconnect()`
-   rebuilding the dead loopback connection and re-attaching idempotently
-   (re-open the last URL, fresh `Page.enable`). `sw.js` re-dials on every
-   worker spin-up plus a post-drop reconnect alarm. `Input.dispatchMouseEvent`
+   rebuilding the dead loopback connection and then re-opening every tab
+   that had a URL — in creation order, under one shared heal budget so a
+   wedged worker cannot stack N tabs' full timeouts (see
+   [`docs/multi-tab.md`](multi-tab.md)). `sw.js` re-dials on every worker
+   spin-up plus a post-drop reconnect alarm. `Input.dispatchMouseEvent`
    keeps realistic coordinates (not synthetic `el.click()`).
 3. **The host's script-facing channel is a loopback socket — now
    authenticated by a shared-secret token (baseline).** Loopback is not a

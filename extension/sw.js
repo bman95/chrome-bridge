@@ -15,7 +15,8 @@
 // request and awaits its reply before sending the next. The session table
 // below relies on this — do not interleave ops from the Python side.
 // (Several tabs may be ATTACHED at once — see "open" replace:false — but
-// requests are still serialized; per-tab pipelining is a non-goal here.)
+// requests are still serialized; per-tab pipelining is not part of this
+// contract today — it is tracked separately as future work.)
 //
 // ---- Python -> extension (requests) ----------------------------------
 // Every request carries a mandatory caller-chosen correlation id `id` (number
