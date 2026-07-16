@@ -44,7 +44,10 @@ class FakeBridge:
     Bind it, point a :class:`ChromeBridge` at its ``host``/``port``, and
     register per-op handlers. Each handler receives the decoded op frame and
     returns the reply payload dict (without the echoed ``id``, which the
-    bridge adds), or ``None`` to send no reply (simulating a lost reply).
+    bridge adds), or ``None`` to send no reply (simulating a lost reply — or,
+    when the test later calls :meth:`_reply` with the frame's id itself, an
+    op deliberately HELD IN FLIGHT, which is how the per-tab pipelining tests
+    park one tab's op while another tab makes progress).
     Handlers may also push unsolicited events via :meth:`send_event`.
     """
 
@@ -982,11 +985,13 @@ def test_wait_selector_honours_timeout_with_slow_evaluate(bridge):
         cdp.close()
 
 
-def test_op_lock_serialises_concurrent_callers(bridge):
-    # Two threads issue cdp ops simultaneously. _op_lock must hold the whole
-    # round-trip so the ops do NOT overlap on the wire (sw.js processes ops
-    # serially). We record server-side enter/exit timestamps and assert the two
-    # op windows are disjoint — deterministic, not wall-clock-threshold based.
+def test_same_tab_ops_serialise_concurrent_callers(bridge):
+    # Two threads issue cdp ops on the SAME tab simultaneously. The tab's op
+    # lock must hold the whole round-trip so its ops do NOT overlap on the
+    # wire (per-tab FIFO — ops on DIFFERENT tabs may pipeline; see the
+    # per-tab pipelining tests below). We record server-side enter/exit
+    # timestamps and assert the two op windows are disjoint — deterministic,
+    # not wall-clock-threshold based.
     bridge.on("open", _ok_open())
 
     windows: list[tuple[str, float, float]] = []
@@ -1024,6 +1029,219 @@ def test_op_lock_serialises_concurrent_callers(bridge):
         windows.sort(key=lambda w: w[1])
         (_, _e0, x0), (_, e1, _x1) = windows
         assert e1 >= x0, f"ops overlapped on the wire: {windows}"
+    finally:
+        cdp.close()
+
+
+# --------------------------------------------------------------------------- #
+# Per-tab pipelining (issue #19): ops on one tab are FIFO; ops on different
+# tabs interleave and run in parallel; tab-lifecycle ops serialize against
+# everything.
+# --------------------------------------------------------------------------- #
+
+
+def _open_tabs_by_url(bridge: FakeBridge) -> None:
+    """Answer "open" with tabId 1 for a.example URLs and 2 otherwise."""
+
+    def handler(frame):
+        return {"ok": True, "tabId": 1 if "a.example" in frame.get("url", "") else 2}
+
+    bridge.on("open", handler)
+
+
+def test_ops_on_different_tabs_pipeline_in_parallel(bridge):
+    # The point of the lock split: a slow op on tab A must not block an op on
+    # tab B. Park A's evaluate server-side (no reply) and prove B's evaluate
+    # completes while A's is still in flight — impossible under the old
+    # per-connection op lock, which held the wire across A's whole round-trip.
+    _open_tabs_by_url(bridge)
+    parked: dict = {}
+    a_parked = threading.Event()
+
+    def default(frame):
+        if frame.get("method") == "Runtime.evaluate":
+            if frame.get("tabId") == 1:
+                parked["frame"] = frame
+                a_parked.set()
+                return None  # A's op stays in flight until the test replies
+            return {"ok": True, "result": {"result": {"value": "fast"}}}
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge)
+    try:
+        a = cdp.new_tab("https://a.example", timeout=0.2)
+        b = cdp.new_tab("https://b.example", timeout=0.2)
+        results: dict = {}
+        t = threading.Thread(
+            target=lambda: results.update(a=a.evaluate("slow probe")),
+            daemon=True,
+        )
+        t.start()
+        assert a_parked.wait(timeout=5)  # A's op is on the wire, unanswered
+        # B completes while A's op is still in flight.
+        assert b.evaluate("fast probe") == "fast"
+        assert "a" not in results  # A is still pending — B did not queue on it
+        bridge._reply(
+            parked["frame"]["id"],
+            {"ok": True, "result": {"result": {"value": "slow"}}},
+        )
+        t.join(timeout=5)
+        assert results.get("a") == "slow"
+    finally:
+        cdp.close()
+
+
+def test_two_threads_two_tabs_interleave_with_per_tab_fifo(bridge):
+    # Two threads drive two tabs concurrently. The fake's request log must
+    # show each tab's ops in issue order (per-tab FIFO) even though the two
+    # tabs' request streams may interleave arbitrarily with each other.
+    _open_tabs_by_url(bridge)
+
+    def default(frame):
+        if frame.get("method") == "Runtime.evaluate":
+            time.sleep(0.005)  # widen the round-trip so streams can interleave
+            return {"ok": True, "result": {"result": {"value": True}}}
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge)
+    try:
+        a = cdp.new_tab("https://a.example", timeout=0.2)
+        b = cdp.new_tab("https://b.example", timeout=0.2)
+        bridge.received.clear()
+        n = 8
+
+        def drive(tab: Tab, marker: str) -> None:
+            for i in range(n):
+                tab.evaluate(f"probe_{marker}_{i}")
+
+        t1 = threading.Thread(target=drive, args=(a, "A"), daemon=True)
+        t2 = threading.Thread(target=drive, args=(b, "B"), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive() and not t2.is_alive()
+        per_tab: dict[int, list[str]] = {1: [], 2: []}
+        for frame in bridge.received:
+            if frame.get("method") == "Runtime.evaluate":
+                per_tab[frame["tabId"]].append(frame["params"]["expression"])
+        assert per_tab[1] == [f"probe_A_{i}" for i in range(n)]
+        assert per_tab[2] == [f"probe_B_{i}" for i in range(n)]
+    finally:
+        cdp.close()
+
+
+def test_detach_of_one_tab_mid_op_leaves_sibling_op_intact(bridge):
+    # The per-tab detach isolation holds under real concurrency: two threads
+    # drive two tabs, both ops in flight, then tab A detaches. A's op must
+    # fail with DetachedError; B's op must stay in flight, untouched, and
+    # complete normally once its reply arrives.
+    _open_tabs_by_url(bridge)
+    a_parked = threading.Event()
+    b_parked = threading.Event()
+    b_frame: dict = {}
+
+    def default(frame):
+        if frame.get("method") == "Runtime.evaluate":
+            if frame.get("tabId") == 1:
+                a_parked.set()
+                return None  # A's op hangs; the detach below must fail it
+            b_frame["frame"] = frame
+            b_parked.set()
+            return None  # B's op stays in flight ACROSS A's detach
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge, op_timeout=10.0)
+    try:
+        a = cdp.new_tab("https://a.example", timeout=0.2)
+        b = cdp.new_tab("https://b.example", timeout=0.2)
+        outcome: dict = {}
+
+        def drive_a() -> None:
+            try:
+                outcome["a"] = a.evaluate("probe A")
+            except BridgeError as exc:
+                outcome["a_error"] = exc
+
+        def drive_b() -> None:
+            outcome["b"] = b.evaluate("probe B")
+
+        ta = threading.Thread(target=drive_a, daemon=True)
+        tb = threading.Thread(target=drive_b, daemon=True)
+        ta.start()
+        tb.start()
+        assert a_parked.wait(timeout=5) and b_parked.wait(timeout=5)
+        # Tab A detaches mid-op (tabId-tagged, as the extension sends it).
+        bridge.send_event(
+            {"event": True, "type": "detached", "reason": "gone", "tabId": 1}
+        )
+        ta.join(timeout=5)
+        assert not ta.is_alive()
+        assert isinstance(outcome.get("a_error"), DetachedError)
+        # B's op is untouched by A's detach: still in flight...
+        assert "b" not in outcome
+        assert tb.is_alive()
+        # ...and completes normally once its reply lands.
+        bridge._reply(
+            b_frame["frame"]["id"],
+            {"ok": True, "result": {"result": {"value": "bee"}}},
+        )
+        tb.join(timeout=5)
+        assert outcome.get("b") == "bee"
+        assert a.tab_id is None  # A marked detached
+        assert b.tab_id == 2  # B untouched
+    finally:
+        cdp.close()
+
+
+def test_new_tab_open_waits_for_in_flight_ops(bridge):
+    # A tab-lifecycle op (new_tab -> a wire "open", a session-table mutation)
+    # must not hit the wire while another tab's op round-trip is in flight:
+    # it runs under the exclusive side of the connection lock.
+    _open_tabs_by_url(bridge)
+    parked: dict = {}
+    a_parked = threading.Event()
+
+    def default(frame):
+        if frame.get("method") == "Runtime.evaluate":
+            parked["frame"] = frame
+            a_parked.set()
+            return None
+        return {"ok": True, "result": {}}
+
+    bridge.set_default(default)
+    cdp = _client(bridge)
+    try:
+        a = cdp.new_tab("https://a.example", timeout=0.2)
+        t = threading.Thread(target=lambda: a.evaluate("slow probe"), daemon=True)
+        t.start()
+        assert a_parked.wait(timeout=5)
+        holder: dict = {}
+        tn = threading.Thread(
+            target=lambda: holder.update(
+                b=cdp.new_tab("https://b.example", timeout=0.2)
+            ),
+            daemon=True,
+        )
+        tn.start()
+        # Give a (wrongly) unblocked new_tab ample time to send its open.
+        time.sleep(0.3)
+        assert all(
+            "b.example" not in f.get("url", "") for f in bridge.received
+        ), "new_tab's open hit the wire while another op was in flight"
+        # Release A: the open must now go out and new_tab complete.
+        bridge._reply(
+            parked["frame"]["id"],
+            {"ok": True, "result": {"result": {"value": True}}},
+        )
+        t.join(timeout=5)
+        tn.join(timeout=5)
+        assert not tn.is_alive()
+        assert holder["b"].tab_id == 2
+        assert any("b.example" in f.get("url", "") for f in bridge.received)
     finally:
         cdp.close()
 

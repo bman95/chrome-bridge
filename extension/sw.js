@@ -11,12 +11,17 @@
 // length-prefixed with a 4-byte little-endian uint32 (handled by Chrome /
 // nmh.py, never by this file). Two directions:
 //
-// Requests are processed one at a time (no pipelining): Python sends a
-// request and awaits its reply before sending the next. The session table
-// below relies on this — do not interleave ops from the Python side.
-// (Several tabs may be ATTACHED at once — see "open" replace:false — but
-// requests are still serialized; per-tab pipelining is not part of this
-// contract today — it is tracked separately as future work.)
+// Request ordering (per-tab pipelining): requests that target ONE attached
+// tab — "cdp"/"close"/"detach" carrying an explicit `tabId` — are processed
+// FIFO per tab, in arrival order, and MAY be processed concurrently across
+// different tabs; Python may therefore keep one request in flight per tab
+// at a time (it still awaits a tab's reply before sending that tab's next
+// request). Requests that mutate or read the session table as a whole —
+// "open" (any `replace` shape), "attach", "tabs", and any op WITHOUT a
+// `tabId` — are barriers: they run only after every in-flight request has
+// settled, and every later request waits for them. This is what lets two
+// concurrent "open"s never race the table while independent tabs still make
+// progress in parallel.
 //
 // ---- Python -> extension (requests) ----------------------------------
 // Every request carries a mandatory caller-chosen correlation id `id` (number
@@ -198,7 +203,9 @@ let port = null;
 let connectPromise = null;
 // Session table: one entry per attached tab (chrome.debugger natively keys
 // every attach/sendCommand/onEvent/onDetach by tabId, so holding several
-// concurrent debuggees is safe; requests stay serialized regardless).
+// concurrent debuggees is safe; requests are ordered per tab, with
+// table-level ops serialized against everything — see the request chains
+// below).
 // Map<tabId, { sessionGeneration, owner, bridgeCreated }>:
 //   sessionGeneration — generation injected into request ids by nmh.py.
 //       Events have no correlation id, so each entry carries the generation
@@ -216,6 +223,57 @@ let connectPromise = null;
 //       it merely attached to the user's active tab ("attach"). Teardown
 //       removes the tab only when true — see the WIRE PROTOCOL contract notes.
 const sessions = new Map();
+
+// Request ordering (the WIRE PROTOCOL "per-tab pipelining" contract).
+// Native Messaging listeners do not await async callbacks, so ordering is
+// imposed here with promise chains: one chain per targeted tab, plus one
+// GLOBAL chain for everything that mutates or reads the session table as a
+// whole — "open" (its replace:true shape is the tear-everything-down
+// reaper), "attach" (tears down every other tab on success), "tabs", any op
+// without a tabId (implicit-target resolution reads the whole table), and
+// the port-replacement teardown. A global op first drains every chain
+// (in-flight per-tab ops included), and every later op — per-tab or global —
+// queues behind it; per-tab ops on different tabs otherwise interleave
+// freely while ops on one tab stay FIFO. Two overlapping `open` calls can
+// therefore never both see no tab, create one each, and race to overwrite
+// the shared session state. Module-scoped (not per-port): queued ops from a
+// replaced port bail at onPythonMessage's staleness gate, and the new
+// port's ops queue behind them harmlessly.
+let globalChain = Promise.resolve();
+const tabChains = new Map();
+
+// Chain `fn` after every queued op, global and per-tab, and make every later
+// op wait for it. Stored tails never reject: `fn` is wrapped with a catch so
+// one failed request cannot suppress every later one (a disconnect can make
+// postMessage throw even inside the handler's error path).
+function enqueueGlobal(fn) {
+  const barrier = Promise.all([globalChain, ...tabChains.values()]);
+  const run = barrier.then(fn).catch((error) => {
+    console.warn("chrome-bridge: request failed:", error);
+  });
+  globalChain = run;
+  // The old per-tab tails are absorbed into the barrier; later per-tab ops
+  // must chain on the new global tail, not slip past it via a stale entry.
+  tabChains.clear();
+  return run;
+}
+
+// Chain `fn` after the target tab's last queued op (or the last global op,
+// whichever is later — enqueueGlobal cleared the map, so a surviving entry
+// already queues after the last global op). Same never-rejects wrapping as
+// enqueueGlobal. The entry self-cleans once its chain drains, so closed
+// tabs do not accumulate map entries.
+function enqueueTab(tabId, fn) {
+  const prev = tabChains.get(tabId) || globalChain;
+  const run = prev.then(fn).catch((error) => {
+    console.warn("chrome-bridge: request failed:", error);
+  });
+  tabChains.set(tabId, run);
+  run.then(() => {
+    if (tabChains.get(tabId) === run) tabChains.delete(tabId);
+  });
+  return run;
+}
 
 async function nativeHostName() {
   const { bridgeProfileName } = await chrome.storage.local.get("bridgeProfileName");
@@ -271,20 +329,21 @@ async function dial() {
   // Remember which host this port dialed so the profile-rename path can tell
   // whether an in-flight dial already landed on the wanted identity.
   p.bridgeHostName = hostName;
-  // Native Messaging listeners do not await async callbacks themselves.
-  // Serialize operations explicitly: two loopback client sessions share this
-  // same native port, and overlapping `open` calls could otherwise both see
-  // no tab, create one, then race to overwrite the global attachment state.
-  let requestChain = Promise.resolve();
+  // Route each request onto the ordering chains (see their comment block):
+  // an explicit tabId on a tab-targeted op pins it to that tab's chain
+  // (same-tab FIFO, cross-tab interleave); everything else — "open",
+  // "attach", "tabs", implicit-target ops, unknown ops — is a session-table
+  // op and takes the global barrier chain.
   p.onMessage.addListener((msg) => {
-    requestChain = requestChain
-      .then(() => onPythonMessage(msg, p))
-      .catch((error) => {
-        // A disconnect can make postMessage throw even inside the handler's
-        // error path. Recover the chain so one failed request cannot suppress
-        // every later request delivered on a still-live port.
-        console.warn("chrome-bridge: request failed:", error);
-      });
+    const run = () => onPythonMessage(msg, p);
+    if (
+      msg.tabId !== undefined &&
+      (msg.op === "cdp" || msg.op === "close" || msg.op === "detach")
+    ) {
+      enqueueTab(msg.tabId, run);
+    } else {
+      enqueueGlobal(run);
+    }
   });
   p.onDisconnect.addListener(() => {
     // chrome.runtime.lastError is set here when the host died/was missing
@@ -700,7 +759,16 @@ connect();
 // If the user (re)configures the profile name from the options page while
 // this worker is alive, reconnect under the new identity immediately rather
 // than waiting for the next spin-up trigger.
-async function reconnectWithNewIdentity() {
+function reconnectWithNewIdentity() {
+  // The port-replacement teardown swaps the global port and reaps session
+  // entries — a session-table mutation, so it runs on the global chain,
+  // serialized against every in-flight request (which either finishes first
+  // or bails on its port-staleness gate) with every later request queued
+  // behind it.
+  return enqueueGlobal(reconnectWithNewIdentityNow);
+}
+
+async function reconnectWithNewIdentityNow() {
   // Let any in-flight dial settle first: it may have read the OLD profile name
   // before the storage write landed, so whatever it produced must be torn down
   // and re-dialed under the now-current name. (dial() never rejects, and the

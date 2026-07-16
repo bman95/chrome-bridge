@@ -80,7 +80,8 @@ The bridge is **single-tab by default, multi-tab opt-in**: the legacy facade
 (`cdp.open(...)` / `cdp.navigate(...)` / ...) drives one tab at a time (each
 facade `open` replaces every currently attached tab), while `ChromeBridge.new_tab(url)`
 opens additional attached tabs, each addressed by `tabId` on the wire. One
-connection can hold N attached tabs, but its operations stay serialized —
+connection can hold N attached tabs and drive them in parallel (ops on one
+tab are FIFO; ops across tabs interleave — one thread per tab) —
 see [`docs/multi-tab.md`](multi-tab.md).
 
 ## The core primitives

@@ -396,13 +396,14 @@ const tests = String.raw`
   assert.equal(replies.at(-1).ok, true);
   assert.equal(sessions.size, 0);
 
-  // Exercise dial()'s real listener-level requestChain. A postMessage failure
-  // makes the first handler reject; the chain must recover and process the
-  // following request instead of remaining permanently rejected.
-  // KEEP THIS THE FINAL CASE: it permanently swaps the global port,
-  // storage.local.get, and connectNative — tab-op cases appended below it
-  // would misroute their replies into chainedReplies instead of replies.
-  // (No backticks in this template literal.)
+  // Exercise dial()'s real listener-level request chains. A postMessage
+  // failure makes the first handler reject; the chain must recover and
+  // process the following request instead of remaining permanently rejected.
+  // NOTE: this case and everything after it run against a dial()-installed
+  // port — it permanently swaps the global port, storage.local.get, and
+  // connectNative, so cases appended below must bring their own port +
+  // reply sink (as the per-tab pipelining section does) rather than reuse
+  // the plain "replies" array. (No backticks in this template literal.)
   let receive;
   // Throw on the first TWO postMessage calls: the first kills the try-path
   // reply, the second kills onPythonMessage's own catch-path reply, so the
@@ -430,6 +431,108 @@ const tests = String.raw`
   receive({ id: id(4, 2), op: "unknown-second" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(chainedReplies.at(-1).id[2], 2);
+
+  // --- Per-tab pipelining (issue #19): ops with an explicit tabId run on
+  // per-tab chains — same-tab FIFO, cross-tab interleave — while
+  // session-table ops ("open", tabless ops, ...) are barriers that drain
+  // every chain first and hold later ops back. Re-dial with a fresh port +
+  // reply sink (see the note on the previous case).
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const replies2 = [];
+  let receive2;
+  const nativePort2 = {
+    onMessage: { addListener: (fn) => { receive2 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    postMessage: (msg) => replies2.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort2;
+  port = null;
+  await dial();
+  const findReply = (original) =>
+    replies2.find((m) => Array.isArray(m.id) && m.id[2] === original);
+
+  // Deferred sendCommand: "Park.me" cdp ops hold their tab's chain until the
+  // test releases them, so overlap (or its absence) is observable.
+  const parkedSends = new Map(); // tabId -> release()
+  chrome.debugger.sendCommand = ({ tabId }, method) => {
+    sent.push(tabId);
+    if (method === "Park.me") {
+      return new Promise((resolve) => {
+        parkedSends.set(tabId, () => resolve({}));
+      });
+    }
+    return Promise.resolve({});
+  };
+
+  receive2({ id: id(30, 1), op: "open", url: "https://pipe-a.example" });
+  await flush();
+  const pipeA = replies2.at(-1).tabId;
+  receive2({ id: id(30, 2), op: "open", url: "https://pipe-b.example", replace: false });
+  await flush();
+  const pipeB = replies2.at(-1).tabId;
+  assert.equal(sessions.size, 2);
+
+  // Cross-tab interleave: park an op on tab A, then run one on tab B — B's
+  // reply must land while A's op is still in flight.
+  receive2({ id: id(30, 3), op: "cdp", method: "Park.me", tabId: pipeA });
+  receive2({ id: id(30, 4), op: "cdp", method: "Fast.op", tabId: pipeB });
+  await flush();
+  assert.ok(parkedSends.has(pipeA)); // A's op started and is parked...
+  assert.equal(findReply(3), undefined); // ...unreplied...
+  assert.equal(findReply(4).ok, true); // ...while B's op completed.
+
+  // Same-tab FIFO: a second op on tab A must not even START (no sendCommand)
+  // while the first is parked; once released, both reply in issue order.
+  const sentBefore = sent.length;
+  receive2({ id: id(30, 5), op: "cdp", method: "Fast.op", tabId: pipeA });
+  await flush();
+  assert.equal(sent.length, sentBefore); // queued behind the parked op
+  assert.equal(findReply(5), undefined);
+  parkedSends.get(pipeA)();
+  parkedSends.delete(pipeA);
+  await flush();
+  assert.equal(findReply(3).ok, true);
+  assert.equal(findReply(5).ok, true);
+  const aReplies = replies2
+    .filter((m) => Array.isArray(m.id) && [3, 5].includes(m.id[2]))
+    .map((m) => m.id[2]);
+  assert.deepEqual(aReplies, [3, 5]); // FIFO on tab A
+
+  // Global barrier: with an op parked on tab A, an "open" (session-table op)
+  // must not run until A's chain drains, and an op queued after the open —
+  // even one targeting tab B, whose own chain is idle — waits behind it.
+  receive2({ id: id(30, 6), op: "cdp", method: "Park.me", tabId: pipeA });
+  await flush();
+  assert.ok(parkedSends.has(pipeA));
+  const removedBeforeBarrier = removed.length;
+  receive2({ id: id(31, 1), op: "open", url: "https://barrier.example" }); // replace:true
+  receive2({ id: id(31, 2), op: "cdp", method: "Fast.op", tabId: pipeB });
+  await flush();
+  assert.equal(findReply(6), undefined); // A still parked
+  assert.equal(replies2.some((m) => Array.isArray(m.id) && m.id[1] === 31), false);
+  assert.equal(removed.length, removedBeforeBarrier); // teardown has not run
+  assert.equal(sessions.size, 2); // table untouched while ops are in flight
+  parkedSends.get(pipeA)();
+  parkedSends.delete(pipeA);
+  await flush();
+  assert.equal(findReply(6).ok, true); // parked op finished first
+  const barrierReply = replies2.find(
+    (m) => Array.isArray(m.id) && m.id[1] === 31 && m.id[2] === 1
+  );
+  assert.equal(barrierReply.ok, true); // then the reaper open ran...
+  assert.ok(removed.includes(pipeA));
+  assert.ok(removed.includes(pipeB)); // ...tearing down both tabs...
+  const afterBarrier = replies2.find(
+    (m) => Array.isArray(m.id) && m.id[1] === 31 && m.id[2] === 2
+  );
+  assert.equal(afterBarrier.ok, false); // ...and B's queued op ran AFTER it
+  assert.match(afterBarrier.error, /no attached tab with tabId/);
+  assert.deepEqual([...sessions.keys()], [barrierReply.tabId]);
+
+  // cleanup
+  receive2({ id: id(31, 3), op: "close", tabId: barrierReply.tabId });
+  await flush();
+  assert.equal(sessions.size, 0);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

@@ -23,7 +23,8 @@ Playwright-style split, one class per concern:
 
 - **`ChromeBridge` owns the connection**: the loopback socket to the native
   host, the background reader thread, request-id correlation, a
-  connection-wide event bus, and the per-connection op lock (`_op_lock`).
+  connection-wide event bus, and the connection-level lifecycle lock
+  (`_conn_lock`).
 - **`Tab` owns one attached page**: `tab_id`, `current_url`, a per-tab
   detached flag, a per-tab event bus, and all the page primitives
   (`navigate`, `wait_selector`, `outer_html`, `click_selector`, `fill`,
@@ -145,13 +146,24 @@ predecessor's leftover tabs (the read-only `tabs` op is deliberately
 unfenced) but not drive them; a `replace:true` open — or a successful
 `attach`, whose teardown is equally generation-blind — reclaims them.
 
-## Concurrency: serialized per connection
+## Concurrency: per-tab pipelining
 
-**Operations are serialized per connection, across all tabs.** The wire
-protocol requires one request in flight at a time (the extension's session
-table relies on it), and the client enforces it with `_op_lock` held across
-each whole send→await round-trip. Holding N tabs therefore means callers
-*interleave* ops across tabs; tabs are never driven in parallel, and two
-threads sharing one `ChromeBridge` simply queue on the lock. Per-tab
-pipelining is future work, tracked separately in issue #19 — do not design
-against it existing today.
+**Operations are ordered per tab: ops on one tab are FIFO; ops on different
+tabs interleave and run in parallel.** Each `Tab` holds its own op lock
+across each whole send→await round-trip, so a slow `wait_selector` on tab A
+no longer blocks tab B. The wire supports this (every request carries a
+correlation `id` and a `tabId`; the extension processes requests on per-tab
+chains), so the natural driving pattern is **one thread per `Tab`** — the
+connection internals (reader thread, pending map, event routing) are safe
+under it. Two threads sharing one tab do not corrupt anything; their ops
+simply serialize on that tab's lock, in no guaranteed order.
+
+Tab-*lifecycle* operations still serialize against everything: `new_tab`'s
+wire `open`, `Tab.close`, `ChromeBridge.reconnect`/`close`/`detach`, and
+every `open`/`attach` round-trip take the exclusive side of the
+connection-level lock (`_conn_lock`), because they mutate the extension's
+session table or the client's tab registry. The extension mirrors the same
+discipline: `open` (any `replace` shape), `attach`, `tabs`, any op without a
+`tabId`, and the port-replacement teardown run on a global chain that first
+drains every per-tab chain and blocks later ops until it settles — two
+concurrent `open`s can never race the session table.

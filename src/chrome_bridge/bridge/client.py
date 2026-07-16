@@ -53,11 +53,18 @@ Split of responsibilities (Playwright-style):
 
 Concurrency / failure model:
 
-* One request at a time — per CONNECTION, across all tabs. ``sw.js`` requires
-  it and this client enforces it with ``_op_lock`` held across each whole
-  send->await round-trip. Holding N tabs therefore means callers INTERLEAVE
-  ops across tabs (each op strictly serialized on the wire); tabs are never
-  driven in parallel — per-tab pipelining is deliberately not attempted.
+* Per-tab pipelining — ops on ONE tab are strictly FIFO (each :class:`Tab`
+  holds its own op lock across the whole send->await round-trip); ops on
+  DIFFERENT tabs may interleave and run in parallel, which ``sw.js`` supports
+  with per-tab request chains. Tab-lifecycle ops — :meth:`ChromeBridge.new_tab`,
+  :meth:`Tab.close`, :meth:`ChromeBridge.reconnect` / :meth:`ChromeBridge.close`
+  / :meth:`ChromeBridge.detach`, and every ``open``/``attach`` round-trip —
+  serialize against EVERYTHING (the exclusive side of the connection lock),
+  because they mutate the session table / the tab registry. Thread-safety:
+  ONE THREAD PER TAB is the supported pattern; the connection internals
+  (reader thread, pending map, event buses, the lock split above) are safe
+  under it. Two threads sharing one tab do not corrupt anything — their ops
+  simply serialize on that tab's lock, in no guaranteed order.
 * ``open``/``navigate`` await the full ``load`` event but treat a miss as
   non-fatal: ``wait_selector`` is the real readiness gate, and a page can finish
   loading before ``Page.enable`` subscribes.
@@ -95,6 +102,7 @@ import threading
 import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
 from typing import Any, BinaryIO
 
 from .frames import FrameError, read_frame, write_frame
@@ -194,6 +202,96 @@ def _fire_listeners(
             log.exception("chrome-bridge: event listener for %s raised", method)
 
 
+class _RWLock:
+    """Reentrant reader-writer lock backing the connection's op discipline.
+
+    Ordinary per-tab op round-trips hold the SHARED side (many at once — this
+    is what lets independent tabs pipeline); tab-lifecycle ops (``new_tab``,
+    ``Tab.close``, ``reconnect``/``close``/``detach``, every ``open``/
+    ``attach`` round-trip) hold the EXCLUSIVE side, serializing against every
+    in-flight op because they mutate the extension's session table or the
+    client's tab registry.
+
+    Reentrancy: a thread may nest shared grips, nest exclusive grips, and
+    take shared grips while holding the exclusive one (lifecycle ops issue
+    ordinary op legs, e.g. ``reconnect`` -> ``_open`` -> ``Page.enable``).
+    Upgrading — taking the exclusive side while holding only the shared one —
+    would deadlock against another upgrader and raises instead; no code path
+    does it. Writers get preference: a first-time shared grip queues behind a
+    waiting exclusive one, so lifecycle ops cannot starve under steady
+    per-tab traffic. Lock order elsewhere in this module: the shared grip is
+    taken BEFORE a tab's own op lock, never after — an exclusive holder may
+    then take any tab lock without deadlock (all tab locks taken under a
+    shared grip are released before the grip is).
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0            # live shared grips, all threads, incl. nested
+        self._writer: int | None = None   # ident of the exclusive-side owner
+        self._writer_depth = 0
+        self._writers_waiting = 0
+        self._local = threading.local()   # per-thread shared-grip depth
+
+    def _shared_depth(self) -> int:
+        return getattr(self._local, "depth", 0)
+
+    @contextmanager
+    def shared(self):
+        me = threading.get_ident()
+        with self._cond:
+            # Bypass the queue when this thread already holds a grip: a nested
+            # shared grip must never block behind a WAITING writer (that would
+            # deadlock — the writer waits for this thread's outer grip), and
+            # the exclusive holder's own op legs must run.
+            if self._writer != me and self._shared_depth() == 0:
+                while self._writer is not None or self._writers_waiting > 0:
+                    self._cond.wait()
+            self._local.depth = self._shared_depth() + 1
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._local.depth -= 1
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def exclusive(self):
+        me = threading.get_ident()
+        with self._cond:
+            if self._writer == me:
+                self._writer_depth += 1
+            else:
+                if self._shared_depth() > 0:
+                    raise RuntimeError(
+                        "cannot take the exclusive connection lock while "
+                        "holding the shared side (lock upgrade would deadlock)"
+                    )
+                self._writers_waiting += 1
+                try:
+                    while self._writer is not None or self._readers > 0:
+                        self._cond.wait()
+                    self._writer = me
+                    self._writer_depth = 1
+                finally:
+                    self._writers_waiting -= 1
+                    if self._writers_waiting == 0 and self._writer is not me:
+                        # Interrupted while queued: wake the shared grips this
+                        # waiter's writer preference was holding back.
+                        self._cond.notify_all()
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer_depth -= 1
+                if self._writer_depth == 0:
+                    self._writer = None
+                    self._cond.notify_all()
+
+
 class ChromeBridge:
     """Raw page-CDP client over the bridge loopback socket.
 
@@ -214,14 +312,15 @@ class ChromeBridge:
 
     Thread-safety: a background reader thread fans replies/events out. ``_lock``
     guards the pending-future map, the tab registry, and the write side of the
-    socket (id correlation is race-free); ``_op_lock`` is held across each whole
-    op/reply round-trip, so the one-request-at-a-time wire discipline (sw.js
-    processes ops serially) holds even if two threads call public methods
-    concurrently — they serialise rather than pipeline. Serialization is
-    per-connection ACROSS ALL TABS, not per-tab: N tabs interleave ops on the
-    one wire, they never run in parallel. A script should drive one
-    ChromeBridge from one thread; the lock just makes the documented invariant
-    true rather than merely assumed.
+    socket (id correlation is race-free, and frames never interleave on the
+    wire). Op ordering is PER TAB: each :class:`Tab` holds its own op lock
+    across each whole op/reply round-trip, so ops on one tab are FIFO while
+    ops on different tabs pipeline in parallel (sw.js processes them on
+    per-tab chains). Tab-lifecycle ops — :meth:`new_tab`, :meth:`Tab.close`,
+    :meth:`reconnect`, :meth:`close`, :meth:`detach`, and every
+    ``open``/``attach`` round-trip — take the exclusive side of ``_conn_lock``
+    and serialize against everything. The supported pattern is ONE THREAD PER
+    TAB; two threads sharing a tab merely serialize on its lock.
     """
 
     def __init__(
@@ -272,17 +371,15 @@ class ChromeBridge:
         # by _lock; entries live and die with their _pending twin.
         self._pending_tab: dict[int, int | None] = {}
         self._lock = threading.Lock()        # guards _pending + the write side
-        # Serialises whole op round-trips (send -> await reply) PER CONNECTION,
-        # across all attached tabs. The wire is strictly one-request-at-a-time
-        # (see sw.js WIRE PROTOCOL) even when several tabs are attached:
-        # without this, two threads could each write their op and both await,
-        # pipelining ops onto the shared wire. Tabs therefore INTERLEAVE ops
-        # rather than run in parallel (per-tab pipelining is deliberately not
-        # attempted). Held for the full _request so a second caller blocks
-        # until the first reply lands. Re-entrant so a primitive issuing
-        # several ops (held per-op, not nested) and any future nested _request
-        # cannot self-deadlock.
-        self._op_lock = threading.RLock()
+        # Connection-level ordering lock. Ordinary per-tab op round-trips hold
+        # its SHARED side (plus their own Tab._op_lock — see Tab), so ops on
+        # one tab are FIFO while independent tabs pipeline in parallel (the
+        # wire supports it: sw.js runs per-tab request chains). Tab-lifecycle
+        # ops — new_tab, Tab.close, reconnect/close/detach, every open/attach
+        # round-trip — hold the EXCLUSIVE side, serializing against every
+        # in-flight op, because they mutate the extension's session table or
+        # this client's tab registry.
+        self._conn_lock = _RWLock()
         self._reader: threading.Thread | None = None
         self._closed = threading.Event()
         # Generation guards against a stale reader from a prior (dead) socket
@@ -534,6 +631,14 @@ class ChromeBridge:
         Raises :class:`BridgeError` if the socket cannot be re-dialled (host not
         back yet); the caller surfaces it and retries later.
         """
+        # A whole-connection rebuild is a tab-lifecycle op: hold the exclusive
+        # side of the connection lock so the teardown + redial + heals can
+        # never interleave with in-flight per-tab ops (the heals' own _open /
+        # Page.enable legs nest reentrantly).
+        with self._conn_lock.exclusive():
+            self._reconnect_locked()
+
+    def _reconnect_locked(self) -> None:
         # Drop the dead socket without trying its close-op (the peer is gone).
         self._teardown_socket()
         self.connect()
@@ -637,35 +742,39 @@ class ChromeBridge:
         """
         if self._sock is None:
             return
-        with self._lock:
-            tabs = list(self._tabs)
-        # One shared op-timeout budget across ALL tab teardowns: with a wedged
-        # worker, per-tab timeouts would stack (N tabs -> N x op_timeout inside
-        # __exit__); the shared deadline keeps the worst case at the legacy
-        # single-tab bound.
-        deadline = time.monotonic() + self._op_timeout
-        for tab in tabs:
-            # Snapshot the id: the reader thread (a detach event) can null it
-            # mid-loop, and a close that then went out WITHOUT tabId would be
-            # resolved by the extension onto whatever single tab remains —
-            # closing the wrong tab.
-            tab_id = tab.tab_id
-            # Try to close each tab cleanly; never let teardown errors propagate.
-            if tab_id is not None and not self._closed.is_set():
-                try:
-                    self._request(
-                        {"op": "close"},
-                        timeout=max(0.0, deadline - time.monotonic()),
-                        tab_id=tab_id,
-                    )
-                except BridgeError as exc:
-                    log.debug("chrome-bridge close op failed (ignored): %s", exc)
-            tab.tab_id = None
-            tab._owned = False
-            tab.current_url = None
-            tab._dead_reason = None  # explicit teardown supersedes a dead mark
-        self._retire_extra_tabs()
-        self._teardown_socket()
+        # Session teardown is a tab-lifecycle op: the exclusive grip waits out
+        # (and then excludes) every in-flight per-tab op, so the close ops and
+        # the registry reset below cannot interleave with concurrent drivers.
+        with self._conn_lock.exclusive():
+            with self._lock:
+                tabs = list(self._tabs)
+            # One shared op-timeout budget across ALL tab teardowns: with a
+            # wedged worker, per-tab timeouts would stack (N tabs -> N x
+            # op_timeout inside __exit__); the shared deadline keeps the worst
+            # case at the legacy single-tab bound.
+            deadline = time.monotonic() + self._op_timeout
+            for tab in tabs:
+                # Snapshot the id: the reader thread (a detach event) can null
+                # it mid-loop, and a close that then went out WITHOUT tabId
+                # would be resolved by the extension onto whatever single tab
+                # remains — closing the wrong tab.
+                tab_id = tab.tab_id
+                # Close each tab cleanly; never let teardown errors propagate.
+                if tab_id is not None and not self._closed.is_set():
+                    try:
+                        self._request(
+                            {"op": "close"},
+                            timeout=max(0.0, deadline - time.monotonic()),
+                            tab_id=tab_id,
+                        )
+                    except BridgeError as exc:
+                        log.debug("chrome-bridge close op failed (ignored): %s", exc)
+                tab.tab_id = None
+                tab._owned = False
+                tab.current_url = None
+                tab._dead_reason = None  # explicit teardown supersedes a dead mark
+            self._retire_extra_tabs()
+            self._teardown_socket()
 
     def detach(self) -> None:
         """End the session, always leaving the tabs open, then drop the socket.
@@ -680,27 +789,29 @@ class ChromeBridge:
         """
         if self._sock is None:
             return
-        with self._lock:
-            tabs = list(self._tabs)
-        # Same shared teardown budget + id snapshot rationale as close().
-        deadline = time.monotonic() + self._op_timeout
-        for tab in tabs:
-            tab_id = tab.tab_id
-            if tab_id is not None and not self._closed.is_set():
-                try:
-                    self._request(
-                        {"op": "detach"},
-                        timeout=max(0.0, deadline - time.monotonic()),
-                        tab_id=tab_id,
-                    )
-                except BridgeError as exc:
-                    log.debug("chrome-bridge detach op failed (ignored): %s", exc)
-            tab.tab_id = None
-            tab._owned = False
-            tab.current_url = None
-            tab._dead_reason = None  # explicit teardown supersedes a dead mark
-        self._retire_extra_tabs()
-        self._teardown_socket()
+        # Same lifecycle-op exclusion, shared teardown budget, and id-snapshot
+        # rationale as close().
+        with self._conn_lock.exclusive():
+            with self._lock:
+                tabs = list(self._tabs)
+            deadline = time.monotonic() + self._op_timeout
+            for tab in tabs:
+                tab_id = tab.tab_id
+                if tab_id is not None and not self._closed.is_set():
+                    try:
+                        self._request(
+                            {"op": "detach"},
+                            timeout=max(0.0, deadline - time.monotonic()),
+                            tab_id=tab_id,
+                        )
+                    except BridgeError as exc:
+                        log.debug("chrome-bridge detach op failed (ignored): %s", exc)
+                tab.tab_id = None
+                tab._owned = False
+                tab.current_url = None
+                tab._dead_reason = None  # explicit teardown supersedes a dead mark
+            self._retire_extra_tabs()
+            self._teardown_socket()
 
     def _teardown_socket(self) -> None:
         """Drop the socket + reader without issuing a tab-close op.
@@ -1022,8 +1133,12 @@ class ChromeBridge:
         if self._sock is None or self._closed.is_set():
             raise BridgeError("bridge is not connected")
         timeout = self._op_timeout if timeout is None else timeout
-        # Serialise the whole round-trip so ops never pipeline on the wire.
-        with self._op_lock:
+        # Hold the shared side of the connection lock across the round-trip:
+        # ops pipeline freely across tabs, but never fly while a lifecycle op
+        # (exclusive holder) is mutating the session table. Reentrant, so
+        # callers already holding a grip (Tab._cdp's shared, a lifecycle op's
+        # exclusive) nest harmlessly. Same-tab FIFO is Tab._op_lock's job.
+        with self._conn_lock.shared():
             msg_id = next(self._ids)
             frame = {"id": msg_id, **payload}
             if tab_id is not None:
@@ -1068,9 +1183,17 @@ class ChromeBridge:
         including the default tab, are left untouched — then enables ``Page``
         events on the new tab and awaits its load event (non-fatal, mirroring
         the facade :meth:`open` semantics per tab; ``timeout`` caps that load
-        wait). Ops on the returned :class:`Tab` are strictly serialized with
-        every other tab's ops on this connection (see ``_op_lock``): tabs
-        interleave, they do not run in parallel.
+        wait). Ops on the returned :class:`Tab` are FIFO among themselves and
+        pipeline in parallel with other tabs' ops — one thread per tab is the
+        supported driving pattern (see the module docstring).
+
+        The lifecycle-op exclusion lives in :meth:`Tab._open`: its open
+        round-trip + publish run under the exclusive side of the connection
+        lock, so it cannot interleave with in-flight ops or a concurrent
+        (re)open computing its ``replace`` shape. The registry append below is
+        ``_lock``-guarded and safe on its own — an unpublished handle (no
+        ``tab_id`` yet) is invisible to sibling-liveness checks and event
+        routing.
 
         Raises :class:`BridgeError` if the open fails; the handle is not
         registered in that case.
@@ -1290,9 +1413,10 @@ class Tab:
 
     Obtained from :meth:`ChromeBridge.new_tab` (additional tabs); the legacy
     single-tab facade drives an internal default Tab through the same
-    machinery. Every op stamps this tab's ``tabId`` into its wire frames and
-    is strictly serialized with other tabs' ops on the shared connection
-    (interleaving, not parallelism — see ``ChromeBridge._op_lock``).
+    machinery. Every op stamps this tab's ``tabId`` into its wire frames.
+    Ops on this tab are FIFO (its own ``_op_lock`` is held across each whole
+    round-trip) and pipeline in parallel with other tabs' ops; one thread per
+    tab is the supported driving pattern (see the module docstring).
 
     Public state: ``tab_id`` (``None`` while unattached) and ``current_url``
     (the last script-requested URL — the idempotent re-attach target).
@@ -1326,6 +1450,13 @@ class Tab:
         self._dead_reason: str | None = None
         # Flipped by close(): the handle is permanently unusable.
         self._handle_closed = False
+        # Per-tab op lock: held (with the connection lock's shared side, taken
+        # FIRST — see _RWLock's lock-order note) across each whole op/reply
+        # round-trip, so this tab's ops are FIFO while other tabs' ops
+        # pipeline in parallel. Reentrant for the same reason the old
+        # connection-wide op lock was: primitives issue several ops back to
+        # back, and a nested _request must never self-deadlock.
+        self._op_lock = threading.RLock()
         # Per-tab event bus: raw CDP events routed to this tab by tabId, plus
         # "__detached__". Guarded by the bridge's _lock.
         self._event_listeners: dict[str, list] = {}
@@ -1348,30 +1479,34 @@ class Tab:
                 "the default tab cannot be closed; use ChromeBridge.close()"
             )
         bridge = self._bridge
-        # Check-and-flip under the lock so concurrent close() calls stay
-        # idempotent (exactly one sends the close op).
-        with bridge._lock:
-            if self._handle_closed:
-                return
-            self._handle_closed = True
-        # Snapshot the id: the reader can null it concurrently, and a close
-        # that went out WITHOUT tabId would be resolved onto whatever single
-        # tab remains attached — closing the wrong tab.
-        tab_id = self.tab_id
-        if tab_id is not None and bridge.is_alive():
-            try:
-                bridge._request(
-                    {"op": "close"}, timeout=bridge._op_timeout, tab_id=tab_id
-                )
-            except BridgeError as exc:
-                log.debug("chrome-bridge tab close op failed (ignored): %s", exc)
-        self.tab_id = None
-        self._owned = False
-        self.current_url = None
-        # Unregister so events stop routing here and the handle can be GC'd.
-        with bridge._lock:
-            if self in bridge._tabs:
-                bridge._tabs.remove(self)
+        # Retiring a tab is a lifecycle op: the exclusive grip waits out this
+        # tab's own in-flight op (and everyone else's), so the close op and
+        # the registry removal cannot interleave with concurrent drivers.
+        with bridge._conn_lock.exclusive():
+            # Check-and-flip under the lock so concurrent close() calls stay
+            # idempotent (exactly one sends the close op).
+            with bridge._lock:
+                if self._handle_closed:
+                    return
+                self._handle_closed = True
+            # Snapshot the id: the reader can null it concurrently, and a
+            # close that went out WITHOUT tabId would be resolved onto
+            # whatever single tab remains attached — closing the wrong tab.
+            tab_id = self.tab_id
+            if tab_id is not None and bridge.is_alive():
+                try:
+                    bridge._request(
+                        {"op": "close"}, timeout=bridge._op_timeout, tab_id=tab_id
+                    )
+                except BridgeError as exc:
+                    log.debug("chrome-bridge tab close op failed (ignored): %s", exc)
+            self.tab_id = None
+            self._owned = False
+            self.current_url = None
+            # Unregister so events stop routing here and the handle can be GC'd.
+            with bridge._lock:
+                if self in bridge._tabs:
+                    bridge._tabs.remove(self)
 
     def _check_usable(self) -> None:
         if self._handle_closed:
@@ -1463,11 +1598,19 @@ class Tab:
             raise DetachedError(
                 "debugger detached: this tab is no longer attached"
             )
-        reply = self._bridge._request(
-            {"op": "cdp", "method": method, "params": params or {}},
-            timeout=timeout,
-            tab_id=tab_id,
-        )
+        bridge = self._bridge
+        # Shared connection grip FIRST, then this tab's own op lock (the
+        # module-wide lock order — see _RWLock): held across the whole
+        # round-trip, so this tab's ops are FIFO while other tabs' ops
+        # pipeline in parallel and lifecycle ops (exclusive holders) wait
+        # for the reply to land.
+        with bridge._conn_lock.shared():
+            with self._op_lock:
+                reply = bridge._request(
+                    {"op": "cdp", "method": method, "params": params or {}},
+                    timeout=timeout,
+                    tab_id=tab_id,
+                )
         return reply.get("result") or {}
 
     def _evaluate(
@@ -1544,14 +1687,21 @@ class Tab:
             self._detached.clear()
             payload: dict[str, Any] = {"op": "open", "url": url}
             bridge = self._bridge
-            # Compute the adaptive replace shape UNDER the op lock: with the
-            # lock held no sibling can BECOME attached before this frame is
-            # sent (attaching requires its own op round-trip through the same
-            # lock), so a key-less reaper open can never race a concurrent
-            # new_tab and silently destroy its fresh tab. Drift the other way
-            # (a sibling detaching after the snapshot) errs to replace:false,
-            # which is harmless. The RLock nests with _request's own hold.
-            with bridge._op_lock:
+            # An "open" mutates the session table (its replace:true shape is
+            # the tear-everything-down reaper), so the round-trip is a
+            # lifecycle op: the exclusive grip waits out every in-flight op
+            # and excludes concurrent opens/attaches. Computing the adaptive
+            # replace shape UNDER it means no sibling can BECOME attached
+            # before this frame is sent (attaching requires its own exclusive
+            # round-trip), so a key-less reaper open can never race a
+            # concurrent new_tab and silently destroy its fresh tab. Drift
+            # the other way (a sibling detaching after the snapshot) errs to
+            # replace:false, which is harmless. Reentrant: reconnect's heals
+            # and new_tab arrive here holding no grip or the exclusive one,
+            # and _request's shared grip nests under it. The exclusive
+            # section deliberately ends BEFORE the Page.enable leg and the
+            # load wait below, so a slow page never stalls other tabs.
+            with bridge._conn_lock.exclusive():
                 if replace is _ADAPTIVE_REPLACE:
                     replace = self._reopen_replace()
                 if replace is not None:
@@ -1564,10 +1714,10 @@ class Tab:
                     raise BridgeError(
                         "bridge 'open' reply carried no tabId; cannot attach to the tab"
                     )
-                # Publish while STILL holding the op lock: a sibling's adaptive
-                # re-open computes its replace shape under this same lock, so
-                # it can never read this handle as unattached in the gap
-                # between our reply and our publish and go out as a reaper.
+                # Publish while STILL holding the exclusive grip: a sibling's
+                # adaptive re-open computes its replace shape under this same
+                # lock, so it can never read this handle as unattached in the
+                # gap between our reply and our publish and go out as a reaper.
                 self._publish_tab_id(tab_id, during="open")
             # Revival of a dead handle is complete only once the new id is
             # published: a FAILED open must leave the dead mark in place so
@@ -1629,27 +1779,33 @@ class Tab:
         # Same rationale as _open(): clear the detach flag BEFORE the request so
         # a detach observed for the new tab during this attach survives.
         self._detached.clear()
-        reply = self._bridge._request({"op": "attach"}, timeout=timeout)
-        tab_id = reply.get("tabId")
-        if tab_id is None:
-            raise BridgeError(
-                "bridge 'attach' reply carried no tabId; cannot attach to the tab"
-            )
-        self._owned = False
-        # No URL bookkeeping: an attached user tab must never be silently
-        # re-opened after a detach (see ChromeBridge.attach).
-        self.current_url = None
-        # attach is single-tab: on SUCCESS the extension tears down every
-        # other attached tab (acquire-before-release — a failed attach leaves
-        # them intact, hence marking only now, and BEFORE the publish below,
-        # which may raise if the new tab's own detach raced the reply). It
-        # emits no detached events for its own teardown, so mirror it
-        # client-side.
-        self._bridge._mark_other_tabs_detached(self)
-        self._publish_tab_id(tab_id, during="attach")
-        # Revival of a dead handle is complete only once the id is published
-        # (see _open): a failed attach keeps the actionable dead error.
-        self._dead_reason = None
+        # An "attach" mutates the session table (its success tears down every
+        # other attached tab), so its round-trip + publish are a lifecycle op
+        # under the exclusive grip, like _open's. The Page.enable leg below
+        # runs outside it, as an ordinary per-tab op.
+        with self._bridge._conn_lock.exclusive():
+            reply = self._bridge._request({"op": "attach"}, timeout=timeout)
+            tab_id = reply.get("tabId")
+            if tab_id is None:
+                raise BridgeError(
+                    "bridge 'attach' reply carried no tabId; cannot attach to the tab"
+                )
+            self._owned = False
+            # No URL bookkeeping: an attached user tab must never be silently
+            # re-opened after a detach (see ChromeBridge.attach).
+            self.current_url = None
+            # attach is single-tab: on SUCCESS the extension tears down every
+            # other attached tab (acquire-before-release — a failed attach
+            # leaves them intact, hence marking only now, and BEFORE the
+            # publish below, which may raise if the new tab's own detach raced
+            # the reply). It emits no detached events for its own teardown, so
+            # mirror it client-side.
+            self._bridge._mark_other_tabs_detached(self)
+            self._publish_tab_id(tab_id, during="attach")
+            # Revival of a dead handle is complete only once the id is
+            # published (see _open): a failed attach keeps the actionable
+            # dead error.
+            self._dead_reason = None
         try:
             self._cdp("Page.enable")
         except BridgeError:
