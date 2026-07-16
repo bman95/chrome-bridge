@@ -155,15 +155,24 @@ no longer blocks tab B. The wire supports this (every request carries a
 correlation `id` and a `tabId`; the extension processes requests on per-tab
 chains), so the natural driving pattern is **one thread per `Tab`** — the
 connection internals (reader thread, pending map, event routing) are safe
-under it. Two threads sharing one tab do not corrupt anything; their ops
-simply serialize on that tab's lock, in no guaranteed order.
+under it. Two threads sharing one tab serialize on that tab's lock in no
+guaranteed order, and their *recovery* is not coordinated: both may re-open
+the same detached tab, leaking a duplicate server-side tab until the next
+`replace:true` open reclaims it. Stick to one thread per tab.
 
 Tab-*lifecycle* operations still serialize against everything: `new_tab`'s
 wire `open`, `Tab.close`, `ChromeBridge.reconnect`/`close`/`detach`, and
 every `open`/`attach` round-trip take the exclusive side of the
 connection-level lock (`_conn_lock`), because they mutate the extension's
-session table or the client's tab registry. The extension mirrors the same
-discipline: `open` (any `replace` shape), `attach`, `tabs`, any op without a
-`tabId`, and the port-replacement teardown run on a global chain that first
-drains every per-tab chain and blocks later ops until it settles — two
-concurrent `open`s can never race the session table.
+session table or the client's tab registry. Threads that observe the same
+dead socket coalesce on one rebuild: the transparent heal reconnects once,
+and losers find the winner's live connection instead of tearing it down.
+The extension mirrors the same discipline: `open` (any `replace` shape),
+`attach`, `tabs`, any op without a `tabId`, and unknown ops run on a global
+chain that first drains every per-tab chain and blocks later ops until it
+settles — two concurrent `open`s can never race the session table. The
+chains order one native port's requests and reset when a new port is
+dialed, so a hung CDP command from a dead session can never wedge its
+successor; the port-replacement teardown deliberately runs *off* the chains
+(protected by the per-op port-staleness gates) because detaching every
+debuggee is what settles such a hang.

@@ -453,6 +453,50 @@ def test_reconnect_heals_default_and_additional_tabs(rbridge):
         cdp.close()
 
 
+def test_concurrent_dead_socket_recovery_reconnects_once(rbridge):
+    # One thread per tab is the supported pattern, so N threads can observe
+    # the same dead socket at once. The transparent heal must coalesce: one
+    # thread rebuilds the connection (re-opening every tab); the losers must
+    # find the winner's live connection and SKIP — not tear down the fresh
+    # socket and heal every tab again (destroying the winner's fresh tabs
+    # via the reaper re-open). Pin: exactly one re-dial, one re-open per tab.
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://a", timeout=0.3)
+        tab_b = cdp.new_tab("https://b", timeout=0.3)
+        connections_before = rbridge.connections()
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        rbridge.received.clear()
+        opens_before = rbridge.opens
+        start = threading.Barrier(2)
+        results: dict = {}
+
+        def drive(key, fn):
+            start.wait(timeout=5)
+            results[key] = fn()
+
+        t1 = threading.Thread(
+            target=drive, args=("a", lambda: cdp.banner_present(".x")), daemon=True
+        )
+        t2 = threading.Thread(
+            target=drive, args=("b", lambda: tab_b.banner_present(".x")), daemon=True
+        )
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive() and not t2.is_alive()
+        assert results.get("a") is True and results.get("b") is True
+        # Exactly ONE rebuild: one fresh connection, one re-open per tab.
+        assert rbridge.connections() - connections_before == 1
+        assert rbridge.opens - opens_before == 2
+        assert cdp._tab_id is not None and tab_b.tab_id is not None
+    finally:
+        cdp.close()
+
+
 def test_navigate_on_additional_tab_reconnects_after_socket_death(rbridge):
     # navigate() on a new_tab handle over a dead socket must rebuild the
     # connection, which re-opens the default tab on ITS last URL and then

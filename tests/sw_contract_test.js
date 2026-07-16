@@ -533,6 +533,63 @@ const tests = String.raw`
   receive2({ id: id(31, 3), op: "close", tabId: barrierReply.tabId });
   await flush();
   assert.equal(sessions.size, 0);
+
+  // --- Wedge recovery: a never-settling op (a sendCommand awaiting a
+  // promise the page never resolves) must not brick later sessions. dial()
+  // resets the ordering chains per port, so after a port swap the NEW
+  // session's reaper open — the op that clears the wedge — runs immediately
+  // instead of queueing behind it forever.
+  receive2({ id: id(32, 1), op: "open", url: "https://wedge.example" });
+  await flush();
+  const wedgeTab = replies2.at(-1).tabId;
+  receive2({ id: id(32, 2), op: "cdp", method: "Park.me", tabId: wedgeTab });
+  await flush();
+  assert.ok(parkedSends.has(wedgeTab)); // hung op holds the old chain forever
+  const replies3 = [];
+  let receive3;
+  const nativePort3 = {
+    onMessage: { addListener: (fn) => { receive3 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies3.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort3;
+  port = null; // the old port dropped with the op still hung
+  await dial();
+  receive3({ id: id(33, 1), op: "open", url: "https://recovered.example" });
+  await flush();
+  const recoveredReply = replies3.find(
+    (m) => Array.isArray(m.id) && m.id[1] === 33 && m.id[2] === 1
+  );
+  assert.ok(recoveredReply && recoveredReply.ok); // the reaper open RAN
+  assert.ok(removed.includes(wedgeTab)); // and reclaimed the wedged tab
+  const recoveredTab = recoveredReply.tabId;
+  receive3({ id: id(33, 2), op: "cdp", method: "Fast.op", tabId: recoveredTab });
+  await flush();
+  assert.equal(replies3.at(-1).ok, true); // per-tab ops flow too
+
+  // The rename teardown is the other recovery valve: deliberately UNCHAINED,
+  // it must complete while an op is wedged (its closeAllTabs detach is what
+  // settles a hung sendCommand in real Chrome) — a chained teardown would
+  // park behind the wedge forever and never swap the identity.
+  receive3({ id: id(33, 3), op: "cdp", method: "Park.me", tabId: recoveredTab });
+  await flush();
+  assert.ok(parkedSends.has(recoveredTab));
+  const nativePort4 = {
+    onMessage: { addListener: () => {} },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: () => {},
+  };
+  chrome.storage.local.get = async () => ({ bridgeProfileName: "renamed" });
+  chrome.runtime.connectNative = () => nativePort4;
+  let renameDone = false;
+  reconnectWithNewIdentity().then(() => { renameDone = true; });
+  await flush();
+  await flush();
+  assert.equal(renameDone, true); // completed despite the wedged op
+  assert.ok(detached.includes(recoveredTab)); // teardown released the tab
+  assert.equal(sessions.size, 0);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

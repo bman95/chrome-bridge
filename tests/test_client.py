@@ -987,25 +987,25 @@ def test_wait_selector_honours_timeout_with_slow_evaluate(bridge):
 
 def test_same_tab_ops_serialise_concurrent_callers(bridge):
     # Two threads issue cdp ops on the SAME tab simultaneously. The tab's op
-    # lock must hold the whole round-trip so its ops do NOT overlap on the
-    # wire (per-tab FIFO — ops on DIFFERENT tabs may pipeline; see the
-    # per-tab pipelining tests below). We record server-side enter/exit
-    # timestamps and assert the two op windows are disjoint — deterministic,
-    # not wall-clock-threshold based.
+    # lock holds the whole round-trip, so the second op must not even reach
+    # the wire while the first is in flight (per-tab FIFO — ops on DIFFERENT
+    # tabs may pipeline; see the per-tab pipelining tests below). Parking the
+    # first op server-side makes this deterministic: without the lock, the
+    # second frame would hit the wire immediately. (A sleep-in-handler
+    # timestamp scheme cannot test this — the fake serves one frame at a
+    # time, so handler windows never overlap regardless of client locking.)
     bridge.on("open", _ok_open())
-
-    windows: list[tuple[str, float, float]] = []
-    windows_lock = threading.Lock()
+    parked: dict = {}
+    first_parked = threading.Event()
+    park_lock = threading.Lock()
 
     def default(frame):
         if frame.get("method") == "Runtime.evaluate":
-            enter = time.monotonic()
-            time.sleep(0.2)  # widen the window so an overlap would be obvious
-            exit_ = time.monotonic()
-            expr = frame["params"]["expression"]
-            tag = "A" if "A" in expr else "B"
-            with windows_lock:
-                windows.append((tag, enter, exit_))
+            with park_lock:
+                if not parked:
+                    parked["frame"] = frame
+                    first_parked.set()
+                    return None  # hold the FIRST evaluate in flight
             return {"ok": True, "result": {"result": {"value": True}}}
         return {"ok": True, "result": {}}
 
@@ -1013,6 +1013,7 @@ def test_same_tab_ops_serialise_concurrent_callers(bridge):
     cdp = _client(bridge)
     try:
         cdp.open("https://x", timeout=0.2)
+        bridge.received.clear()
 
         def call(sel):
             cdp.banner_present(sel)
@@ -1021,14 +1022,27 @@ def test_same_tab_ops_serialise_concurrent_callers(bridge):
         t2 = threading.Thread(target=call, args=("B",), daemon=True)
         t1.start()
         t2.start()
+        assert first_parked.wait(timeout=5)
+        # Give a (wrongly) unserialized second op ample time to hit the wire.
+        time.sleep(0.3)
+        in_flight = [
+            f for f in bridge.received if f.get("method") == "Runtime.evaluate"
+        ]
+        assert len(in_flight) == 1, (
+            "second same-tab op hit the wire while the first was in flight"
+        )
+        # Release the first op; only then may the second go out.
+        bridge._reply(
+            parked["frame"]["id"],
+            {"ok": True, "result": {"result": {"value": True}}},
+        )
         t1.join(timeout=5)
         t2.join(timeout=5)
-        assert len(windows) == 2, windows
-        # Order the two op windows by start time; the second must start only
-        # after the first finished — i.e. _op_lock serialised them.
-        windows.sort(key=lambda w: w[1])
-        (_, _e0, x0), (_, e1, _x1) = windows
-        assert e1 >= x0, f"ops overlapped on the wire: {windows}"
+        assert not t1.is_alive() and not t2.is_alive()
+        evaluates = [
+            f for f in bridge.received if f.get("method") == "Runtime.evaluate"
+        ]
+        assert len(evaluates) == 2  # the second went out after the first's reply
     finally:
         cdp.close()
 

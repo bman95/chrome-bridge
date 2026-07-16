@@ -17,11 +17,11 @@
 // different tabs; Python may therefore keep one request in flight per tab
 // at a time (it still awaits a tab's reply before sending that tab's next
 // request). Requests that mutate or read the session table as a whole —
-// "open" (any `replace` shape), "attach", "tabs", and any op WITHOUT a
-// `tabId` — are barriers: they run only after every in-flight request has
-// settled, and every later request waits for them. This is what lets two
-// concurrent "open"s never race the table while independent tabs still make
-// progress in parallel.
+// "open" (any `replace` shape), "attach", "tabs", any op WITHOUT a `tabId`,
+// and any unrecognized op — are barriers: they run only after every
+// in-flight request has settled, and every later request waits for them.
+// This is what lets two concurrent "open"s never race the table while
+// independent tabs still make progress in parallel.
 //
 // ---- Python -> extension (requests) ----------------------------------
 // Every request carries a mandatory caller-chosen correlation id `id` (number
@@ -231,14 +231,23 @@ const sessions = new Map();
 // whole — "open" (its replace:true shape is the tear-everything-down
 // reaper), "attach" (tears down every other tab on success), "tabs", any op
 // without a tabId (implicit-target resolution reads the whole table), and
-// the port-replacement teardown. A global op first drains every chain
-// (in-flight per-tab ops included), and every later op — per-tab or global —
-// queues behind it; per-tab ops on different tabs otherwise interleave
-// freely while ops on one tab stay FIFO. Two overlapping `open` calls can
-// therefore never both see no tab, create one each, and race to overwrite
-// the shared session state. Module-scoped (not per-port): queued ops from a
-// replaced port bail at onPythonMessage's staleness gate, and the new
-// port's ops queue behind them harmlessly.
+// unknown ops. A global op first drains every chain (in-flight per-tab ops
+// included), and every later op — per-tab or global — queues behind it;
+// per-tab ops on different tabs otherwise interleave freely while ops on
+// one tab stay FIFO. Two overlapping `open` calls can therefore never both
+// see no tab, create one each, and race to overwrite the shared session
+// state.
+//
+// Lifetime: the chains order ONE port's requests. dial() resets them when it
+// installs a new port, because an entry can legitimately never settle — a
+// sendCommand awaiting a promise the page never resolves (Runtime.evaluate
+// with awaitPromise) outlives the client's own timeout — and a new session's
+// ops must not queue behind a dead session's wedge. In particular the
+// replace:true reaper "open", the designated recovery op, is what CLEARS
+// such a wedge (its teardown's debugger.detach settles the hung command);
+// parked behind it, recovery would be impossible. Already-queued old-port
+// ops still run in their original order and bail at onPythonMessage's
+// port-staleness gate; mid-flight ones are covered by their rollback paths.
 let globalChain = Promise.resolve();
 const tabChains = new Map();
 
@@ -329,6 +338,11 @@ async function dial() {
   // Remember which host this port dialed so the profile-rename path can tell
   // whether an in-flight dial already landed on the wanted identity.
   p.bridgeHostName = hostName;
+  // Fresh port, fresh ordering state (see the chains' Lifetime note): the
+  // new session's requests must never queue behind a dead session's
+  // never-settling entry.
+  globalChain = Promise.resolve();
+  tabChains.clear();
   // Route each request onto the ordering chains (see their comment block):
   // an explicit tabId on a tab-targeted op pins it to that tab's chain
   // (same-tab FIFO, cross-tab interleave); everything else — "open",
@@ -759,16 +773,18 @@ connect();
 // If the user (re)configures the profile name from the options page while
 // this worker is alive, reconnect under the new identity immediately rather
 // than waiting for the next spin-up trigger.
-function reconnectWithNewIdentity() {
-  // The port-replacement teardown swaps the global port and reaps session
-  // entries — a session-table mutation, so it runs on the global chain,
-  // serialized against every in-flight request (which either finishes first
-  // or bails on its port-staleness gate) with every later request queued
-  // behind it.
-  return enqueueGlobal(reconnectWithNewIdentityNow);
-}
-
-async function reconnectWithNewIdentityNow() {
+//
+// Deliberately NOT queued on the global chain, even though it mutates the
+// session table: this teardown is the recovery valve for a WEDGED session —
+// its closeAllTabs() detaches every debuggee, which is what settles a hung
+// sendCommand — so parking it behind the wedge would make a rename
+// permanently un-runnable (and, chained, a single never-settling op would
+// survive even the port swap). Its safety against in-flight requests is
+// what it has always been: single-threaded JS, the per-op port-staleness
+// gates (ops re-check `port !== fromPort` after every await), and the
+// mid-op rollback paths. The chains reset when the new identity's port is
+// dialed (see dial()).
+async function reconnectWithNewIdentity() {
   // Let any in-flight dial settle first: it may have read the OLD profile name
   // before the storage write landed, so whatever it produced must be torn down
   // and re-dialed under the now-current name. (dial() never rejects, and the

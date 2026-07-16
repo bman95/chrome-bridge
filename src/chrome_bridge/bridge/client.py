@@ -63,8 +63,10 @@ Concurrency / failure model:
   because they mutate the session table / the tab registry. Thread-safety:
   ONE THREAD PER TAB is the supported pattern; the connection internals
   (reader thread, pending map, event buses, the lock split above) are safe
-  under it. Two threads sharing one tab do not corrupt anything — their ops
-  simply serialize on that tab's lock, in no guaranteed order.
+  under it. Two threads sharing one tab serialize on that tab's lock in no
+  guaranteed order — and their RECOVERY is not coordinated: both may re-open
+  the same detached tab, leaking a duplicate server-side tab until the next
+  ``replace:true`` open reclaims it. Stick to one thread per tab.
 * ``open``/``navigate`` await the full ``load`` event but treat a miss as
   non-fatal: ``wait_selector`` is the real readiness gate, and a page can finish
   loading before ``Page.enable`` subscribes.
@@ -320,7 +322,8 @@ class ChromeBridge:
     :meth:`reconnect`, :meth:`close`, :meth:`detach`, and every
     ``open``/``attach`` round-trip — take the exclusive side of ``_conn_lock``
     and serialize against everything. The supported pattern is ONE THREAD PER
-    TAB; two threads sharing a tab merely serialize on its lock.
+    TAB; two threads sharing a tab serialize on its lock but do not
+    coordinate recovery (see the module docstring).
     """
 
     def __init__(
@@ -636,6 +639,26 @@ class ChromeBridge:
         # never interleave with in-flight per-tab ops (the heals' own _open /
         # Page.enable legs nest reentrantly).
         with self._conn_lock.exclusive():
+            self._reconnect_locked()
+
+    def _reconnect_if_dead(self) -> None:
+        """:meth:`reconnect`, unless another thread already rebuilt the
+        connection.
+
+        The transparent-heal paths (:meth:`Tab.navigate`'s dead-socket branch,
+        ``_ensure_attached``) call this instead of :meth:`reconnect`: with one
+        thread per tab, N threads observe the same dead socket and would each
+        run a full teardown + rebuild in turn — every loser destroying the
+        fresh socket (and the freshly healed Chrome tabs, via its reaper
+        re-open) the winner just built. Checking liveness under the exclusive
+        grip makes the decision race-free: by the time a loser gets the grip,
+        the winner's heal is complete, so a live connection means the rebuild
+        this caller wanted has already happened. The public :meth:`reconnect`
+        keeps its unconditional force-rebuild semantics for direct callers.
+        """
+        with self._conn_lock.exclusive():
+            if self.is_alive():
+                return
             self._reconnect_locked()
 
     def _reconnect_locked(self) -> None:
@@ -1145,6 +1168,14 @@ class ChromeBridge:
                 frame["tabId"] = tab_id
             fut: Future[dict[str, Any]] = Future()
             with self._lock:
+                # Re-check under the lock: a lifecycle op (close/detach/
+                # reconnect) can tear the socket down between the entry check
+                # above and this point — writer preference deliberately queues
+                # this thread behind it at the shared grip — leaving _wfile
+                # None. Surface the documented BridgeError, not an
+                # AttributeError from write_frame(None, ...).
+                if self._wfile is None or self._closed.is_set():
+                    raise BridgeError("bridge is not connected")
                 self._pending[msg_id] = fut
                 self._pending_tab[msg_id] = tab_id
                 try:
@@ -1844,17 +1875,24 @@ class Tab:
             # No live socket to navigate over: rebuild the whole connection and
             # land on `url`. Set current_url first so the reconnect's eager
             # re-open of this tab targets the requested page, not a stale
-            # prior one.
+            # prior one. _reconnect_if_dead coalesces with a concurrent
+            # thread's reconnect rather than tearing down what it just built.
             self.current_url = url
-            bridge.reconnect()
-            if self.tab_id is not None:
-                return  # reconnect() re-opened this tab on `url`
-            # reconnect() heals best-effort per tab; if this tab's eager
-            # re-open failed, retry it here so the error (if any) surfaces on
-            # this call.
-            self._open(url, timeout=timeout)
-            return
-        if self.tab_id is None or self._detached.is_set():
+            bridge._reconnect_if_dead()
+            if self.tab_id is None:
+                # The heal is best-effort per tab; if this tab's eager
+                # re-open failed (or a coalesced reconnect ran before our
+                # current_url write and skipped it), retry here so the error
+                # (if any) surfaces on this call.
+                self._open(url, timeout=timeout)
+                return
+            if self.current_url == url:
+                return  # the heal re-opened this tab on `url`
+            # A concurrent thread's reconnect healed this tab onto its PRIOR
+            # url (its heal loop read current_url before our write landed,
+            # and _open wrote the healed url back). The tab is attached and
+            # live — fall through to an ordinary in-place navigate.
+        elif self.tab_id is None or self._detached.is_set():
             self._open(url, timeout=timeout)
             return
         loaded = threading.Event()
@@ -2382,9 +2420,12 @@ class Tab:
                     "bridge connection lost and no URL to re-attach to "
                     "(call open/navigate/attach first)"
                 )
-            bridge.reconnect()
+            # Coalesce with a concurrent thread's reconnect (one thread per
+            # tab means N threads can observe the same dead socket): only
+            # one rebuild runs; losers find the fresh connection healed.
+            bridge._reconnect_if_dead()
             if self.tab_id is not None:
-                return  # reconnect() re-opened this tab
+                return  # the reconnect re-opened this tab
         if self.tab_id is not None and not self._detached.is_set():
             return
         if self.current_url is None:
