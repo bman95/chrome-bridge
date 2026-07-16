@@ -14,13 +14,15 @@ Topology::
 
 Chrome owns the host's lifetime, so a script cannot be its parent. The host
 therefore listens on a loopback TCP socket (``127.0.0.1``) that the client
-dials into. Exactly one client connection is served at a time: the wire
-protocol serializes ops per connection — one request in flight, awaited
-before the next; the extension's session table relies on it (see the sw.js
-WIRE PROTOCOL note) — and a second concurrent client would interleave its
-frames into that single serialized stream. The rule is about the relay
-being one stream, not about tab count: the one client may hold several
-attached tabs at once (see ``docs/multi-tab.md``).
+dials into. Exactly one client connection is served at a time: request ids
+are client-chosen and the generation fence assumes one live client session,
+so a second concurrent client would interleave its frames into the one relay
+stream and corrupt the id space and the session-table ownership (see the
+sw.js WIRE PROTOCOL note). The rule is about there being ONE CLIENT SESSION,
+not about request count: within it the client may hold several attached tabs
+and keep one request in flight per tab (ops on one tab are FIFO; ops across
+tabs interleave — see ``docs/multi-tab.md``); the relay itself is a
+transparent frame pump either way.
 
 Client authentication (client -> host only; the sw.js wire contract is
 unchanged)

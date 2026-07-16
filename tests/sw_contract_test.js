@@ -396,13 +396,14 @@ const tests = String.raw`
   assert.equal(replies.at(-1).ok, true);
   assert.equal(sessions.size, 0);
 
-  // Exercise dial()'s real listener-level requestChain. A postMessage failure
-  // makes the first handler reject; the chain must recover and process the
-  // following request instead of remaining permanently rejected.
-  // KEEP THIS THE FINAL CASE: it permanently swaps the global port,
-  // storage.local.get, and connectNative — tab-op cases appended below it
-  // would misroute their replies into chainedReplies instead of replies.
-  // (No backticks in this template literal.)
+  // Exercise dial()'s real listener-level request chains. A postMessage
+  // failure makes the first handler reject; the chain must recover and
+  // process the following request instead of remaining permanently rejected.
+  // NOTE: this case and everything after it run against a dial()-installed
+  // port — it permanently swaps the global port, storage.local.get, and
+  // connectNative, so cases appended below must bring their own port +
+  // reply sink (as the per-tab pipelining section does) rather than reuse
+  // the plain "replies" array. (No backticks in this template literal.)
   let receive;
   // Throw on the first TWO postMessage calls: the first kills the try-path
   // reply, the second kills onPythonMessage's own catch-path reply, so the
@@ -430,6 +431,348 @@ const tests = String.raw`
   receive({ id: id(4, 2), op: "unknown-second" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(chainedReplies.at(-1).id[2], 2);
+
+  // --- Per-tab pipelining (issue #19): ops with an explicit tabId run on
+  // per-tab chains — same-tab FIFO, cross-tab interleave — while
+  // session-table ops ("open", tabless ops, ...) are barriers that drain
+  // every chain first and hold later ops back. Re-dial with a fresh port +
+  // reply sink (see the note on the previous case).
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const replies2 = [];
+  let receive2;
+  const nativePort2 = {
+    onMessage: { addListener: (fn) => { receive2 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    postMessage: (msg) => replies2.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort2;
+  port = null;
+  await dial();
+  const findReply = (original) =>
+    replies2.find((m) => Array.isArray(m.id) && m.id[2] === original);
+
+  // Deferred sendCommand: "Park.me" cdp ops hold their tab's chain until the
+  // test releases them, so overlap (or its absence) is observable.
+  const parkedSends = new Map(); // tabId -> release()
+  chrome.debugger.sendCommand = ({ tabId }, method) => {
+    sent.push(tabId);
+    if (method === "Park.me") {
+      return new Promise((resolve) => {
+        parkedSends.set(tabId, () => resolve({}));
+      });
+    }
+    return Promise.resolve({});
+  };
+
+  receive2({ id: id(30, 1), op: "open", url: "https://pipe-a.example" });
+  await flush();
+  const pipeA = replies2.at(-1).tabId;
+  receive2({ id: id(30, 2), op: "open", url: "https://pipe-b.example", replace: false });
+  await flush();
+  const pipeB = replies2.at(-1).tabId;
+  assert.equal(sessions.size, 2);
+
+  // Cross-tab interleave: park an op on tab A, then run one on tab B — B's
+  // reply must land while A's op is still in flight.
+  receive2({ id: id(30, 3), op: "cdp", method: "Park.me", tabId: pipeA });
+  receive2({ id: id(30, 4), op: "cdp", method: "Fast.op", tabId: pipeB });
+  await flush();
+  assert.ok(parkedSends.has(pipeA)); // A's op started and is parked...
+  assert.equal(findReply(3), undefined); // ...unreplied...
+  assert.equal(findReply(4).ok, true); // ...while B's op completed.
+
+  // Same-tab FIFO: a second op on tab A must not even START (no sendCommand)
+  // while the first is parked; once released, both reply in issue order.
+  const sentBefore = sent.length;
+  receive2({ id: id(30, 5), op: "cdp", method: "Fast.op", tabId: pipeA });
+  await flush();
+  assert.equal(sent.length, sentBefore); // queued behind the parked op
+  assert.equal(findReply(5), undefined);
+  parkedSends.get(pipeA)();
+  parkedSends.delete(pipeA);
+  await flush();
+  assert.equal(findReply(3).ok, true);
+  assert.equal(findReply(5).ok, true);
+  const aReplies = replies2
+    .filter((m) => Array.isArray(m.id) && [3, 5].includes(m.id[2]))
+    .map((m) => m.id[2]);
+  assert.deepEqual(aReplies, [3, 5]); // FIFO on tab A
+
+  // Global barrier: with an op parked on tab A, an "open" (session-table op)
+  // must not run until A's chain drains, and an op queued after the open —
+  // even one targeting tab B, whose own chain is idle — waits behind it.
+  receive2({ id: id(30, 6), op: "cdp", method: "Park.me", tabId: pipeA });
+  await flush();
+  assert.ok(parkedSends.has(pipeA));
+  const removedBeforeBarrier = removed.length;
+  receive2({ id: id(31, 1), op: "open", url: "https://barrier.example" }); // replace:true
+  receive2({ id: id(31, 2), op: "cdp", method: "Fast.op", tabId: pipeB });
+  await flush();
+  assert.equal(findReply(6), undefined); // A still parked
+  assert.equal(replies2.some((m) => Array.isArray(m.id) && m.id[1] === 31), false);
+  assert.equal(removed.length, removedBeforeBarrier); // teardown has not run
+  assert.equal(sessions.size, 2); // table untouched while ops are in flight
+  parkedSends.get(pipeA)();
+  parkedSends.delete(pipeA);
+  await flush();
+  assert.equal(findReply(6).ok, true); // parked op finished first
+  const barrierReply = replies2.find(
+    (m) => Array.isArray(m.id) && m.id[1] === 31 && m.id[2] === 1
+  );
+  assert.equal(barrierReply.ok, true); // then the reaper open ran...
+  assert.ok(removed.includes(pipeA));
+  assert.ok(removed.includes(pipeB)); // ...tearing down both tabs...
+  const afterBarrier = replies2.find(
+    (m) => Array.isArray(m.id) && m.id[1] === 31 && m.id[2] === 2
+  );
+  assert.equal(afterBarrier.ok, false); // ...and B's queued op ran AFTER it
+  assert.match(afterBarrier.error, /no attached tab with tabId/);
+  assert.deepEqual([...sessions.keys()], [barrierReply.tabId]);
+
+  // cleanup
+  receive2({ id: id(31, 3), op: "close", tabId: barrierReply.tabId });
+  await flush();
+  assert.equal(sessions.size, 0);
+
+  // --- Wedge recovery: a never-settling op (a sendCommand awaiting a
+  // promise the page never resolves) must not brick later sessions. dial()
+  // resets the ordering chains per port, so after a port swap the NEW
+  // session's reaper open — the op that clears the wedge — runs immediately
+  // instead of queueing behind it forever.
+  receive2({ id: id(32, 1), op: "open", url: "https://wedge.example" });
+  await flush();
+  const wedgeTab = replies2.at(-1).tabId;
+  receive2({ id: id(32, 2), op: "cdp", method: "Park.me", tabId: wedgeTab });
+  await flush();
+  assert.ok(parkedSends.has(wedgeTab)); // hung op holds the old chain forever
+  const replies3 = [];
+  let receive3;
+  const nativePort3 = {
+    onMessage: { addListener: (fn) => { receive3 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies3.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort3;
+  port = null; // the old port dropped with the op still hung
+  await dial();
+  receive3({ id: id(33, 1), op: "open", url: "https://recovered.example" });
+  await flush();
+  const recoveredReply = replies3.find(
+    (m) => Array.isArray(m.id) && m.id[1] === 33 && m.id[2] === 1
+  );
+  assert.ok(recoveredReply && recoveredReply.ok); // the reaper open RAN
+  assert.ok(removed.includes(wedgeTab)); // and reclaimed the wedged tab
+  const recoveredTab = recoveredReply.tabId;
+  receive3({ id: id(33, 2), op: "cdp", method: "Fast.op", tabId: recoveredTab });
+  await flush();
+  assert.equal(replies3.at(-1).ok, true); // per-tab ops flow too
+
+  // The rename teardown is the other recovery valve: deliberately UNCHAINED,
+  // it must complete while an op is wedged (its closeAllTabs detach is what
+  // settles a hung sendCommand in real Chrome) — a chained teardown would
+  // park behind the wedge forever and never swap the identity.
+  receive3({ id: id(33, 3), op: "cdp", method: "Park.me", tabId: recoveredTab });
+  await flush();
+  assert.ok(parkedSends.has(recoveredTab));
+  const nativePort4 = {
+    onMessage: { addListener: () => {} },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: () => {},
+  };
+  chrome.storage.local.get = async () => ({ bridgeProfileName: "renamed" });
+  chrome.runtime.connectNative = () => nativePort4;
+  let renameDone = false;
+  reconnectWithNewIdentity().then(() => { renameDone = true; });
+  await flush();
+  await flush();
+  assert.equal(renameDone, true); // completed despite the wedged op
+  assert.ok(detached.includes(recoveredTab)); // teardown released the tab
+  assert.equal(sessions.size, 0);
+
+  // --- Stale teardown loops must not cross a port swap: a replace:true
+  // open's teardown suspended in an await (tabs.remove held up by e.g. a
+  // beforeunload dialog) resumes AFTER the chains reset let a successor
+  // session run — its remaining iterations must not destroy an entry the
+  // successor just adopted (the per-iteration port gates).
+  const replies5 = [];
+  let receive5;
+  const nativePort5 = {
+    onMessage: { addListener: (fn) => { receive5 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies5.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort5;
+  port = null;
+  await dial();
+  receive5({ id: id(40, 1), op: "open", url: "https://stale-a.example" });
+  await flush();
+  const staleA = replies5.at(-1).tabId;
+  receive5({ id: id(40, 2), op: "open", url: "https://stale-b.example", replace: false });
+  await flush();
+  const staleB = replies5.at(-1).tabId;
+  assert.equal(sessions.size, 2);
+  // Park the removal of staleA so the replace:true teardown loop (snapshot
+  // [staleA, staleB]) suspends after its first iteration.
+  const parkedRemoves = new Map();
+  const realRemove = chrome.tabs.remove;
+  chrome.tabs.remove = (tabId) => {
+    if (tabId === staleA) {
+      return new Promise((resolve) => {
+        parkedRemoves.set(tabId, () => { removed.push(tabId); resolve(); });
+      });
+    }
+    return realRemove(tabId);
+  };
+  receive5({ id: id(40, 3), op: "open", url: "https://stale-reaper.example" });
+  await flush();
+  assert.ok(parkedRemoves.has(staleA)); // loop suspended mid-teardown
+  assert.ok(sessions.has(staleB)); // second iteration has not run yet
+  // Port swap while the loop is suspended; the successor session adopts
+  // staleB via the attach handover.
+  const replies6 = [];
+  let receive6;
+  const nativePort6 = {
+    onMessage: { addListener: (fn) => { receive6 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies6.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort6;
+  port = null;
+  await dial();
+  activeTab = { id: staleB };
+  receive6({ id: id(41, 1), op: "attach" }, );
+  await flush();
+  assert.equal(replies6.at(-1).ok, true);
+  assert.equal(sessions.get(staleB).sessionGeneration, 41); // handover done
+  // Resume the stale loop: its next iteration must hit the port gate and
+  // walk away — NOT closeTab(staleB), which would silently destroy the
+  // successor's adopted entry with no detached event.
+  parkedRemoves.get(staleA)();
+  parkedRemoves.delete(staleA);
+  chrome.tabs.remove = realRemove;
+  await flush();
+  assert.ok(sessions.has(staleB)); // successor entry intact
+  assert.equal(sessions.get(staleB).sessionGeneration, 41);
+  assert.ok(!removed.includes(staleB));
+  // The stale open never replied into the successor's stream.
+  assert.equal(replies6.some((m) => Array.isArray(m.id) && m.id[1] === 40), false);
+  // cleanup
+  receive6({ id: id(41, 2), op: "close", tabId: staleB });
+  await flush();
+  assert.equal(sessions.size, 0);
+  activeTab = null;
+
+  // --- Stale ATTACH rollback must key on entry IDENTITY, not generation:
+  // generations are per-host counters, so a successor client on a fresh
+  // host can carry the SAME number (both first sessions are generation 1).
+  // A stale attach suspended in its teardown, resumed after the port swap,
+  // must not roll back (delete + silently detach) the successor's adopted
+  // entry just because the numbers collide.
+  receive6({ id: id(50, 1), op: "open", url: "https://ident-p.example" });
+  await flush();
+  const identP = replies6.at(-1).tabId;
+  activeTab = { id: 900 };
+  const parkedRemoves2 = new Map();
+  const realRemove2 = chrome.tabs.remove;
+  chrome.tabs.remove = (tabId) => {
+    if (tabId === identP) {
+      return new Promise((resolve) => {
+        parkedRemoves2.set(tabId, () => { removed.push(tabId); resolve(); });
+      });
+    }
+    return realRemove2(tabId);
+  };
+  receive6({ id: id(50, 2), op: "attach" }); // stale attach, generation 50
+  await flush();
+  assert.ok(parkedRemoves2.has(identP)); // teardown loop suspended
+  assert.equal(sessions.get(900).sessionGeneration, 50);
+  const replies7 = [];
+  let receive7;
+  const nativePort7 = {
+    onMessage: { addListener: (fn) => { receive7 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies7.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort7;
+  port = null;
+  await dial();
+  // Successor attaches to the SAME tab with the SAME (colliding) generation.
+  receive7({ id: id(50, 3), op: "attach" });
+  await flush();
+  assert.equal(replies7.at(-1).ok, true);
+  assert.equal(replies7.at(-1).tabId, 900); // handover to the successor
+  parkedRemoves2.get(identP)();
+  parkedRemoves2.delete(identP);
+  chrome.tabs.remove = realRemove2;
+  await flush();
+  // The stale rollback must have skipped the successor's entry: identity
+  // differs even though the generation number matches.
+  assert.ok(sessions.has(900));
+  assert.equal(sessions.get(900).sessionGeneration, 50);
+  receive7({ id: id(50, 4), op: "close", tabId: 900 });
+  await flush();
+  assert.equal(sessions.size, 0);
+
+  // --- The attach teardown loop's per-iteration port gate: a stale attach
+  // suspended mid-teardown resumes after the port swap; its REMAINING
+  // iterations must not closeTab an entry the successor session adopted.
+  receive7({ id: id(51, 1), op: "open", url: "https://gate-p.example" });
+  await flush();
+  const gateP = replies7.at(-1).tabId;
+  receive7({ id: id(51, 2), op: "open", url: "https://gate-q.example", replace: false });
+  await flush();
+  const gateQ = replies7.at(-1).tabId;
+  activeTab = { id: 901 };
+  const parkedRemoves3 = new Map();
+  const realRemove3 = chrome.tabs.remove;
+  chrome.tabs.remove = (tabId) => {
+    if (tabId === gateP) {
+      return new Promise((resolve) => {
+        parkedRemoves3.set(tabId, () => { removed.push(tabId); resolve(); });
+      });
+    }
+    return realRemove3(tabId);
+  };
+  receive7({ id: id(51, 3), op: "attach" }); // teardown snapshot [gateP, gateQ, 901]
+  await flush();
+  assert.ok(parkedRemoves3.has(gateP)); // suspended on gateP's removal
+  const replies8 = [];
+  let receive8;
+  const nativePort8 = {
+    onMessage: { addListener: (fn) => { receive8 = fn; } },
+    onDisconnect: { addListener: () => {} },
+    disconnect: () => {},
+    postMessage: (msg) => replies8.push(msg),
+  };
+  chrome.runtime.connectNative = () => nativePort8;
+  port = null;
+  await dial();
+  // Successor adopts gateQ (attach handover) — a snapshot member the stale
+  // loop has not reached yet.
+  activeTab = { id: gateQ };
+  receive8({ id: id(52, 1), op: "attach" });
+  await flush();
+  assert.equal(replies8.at(-1).ok, true);
+  assert.equal(replies8.at(-1).tabId, gateQ);
+  assert.equal(sessions.get(gateQ).sessionGeneration, 52);
+  parkedRemoves3.get(gateP)();
+  parkedRemoves3.delete(gateP);
+  chrome.tabs.remove = realRemove3;
+  await flush();
+  // The resumed stale loop must have broken at the port gate before its
+  // gateQ iteration: the successor's adopted entry survives, untouched.
+  assert.ok(sessions.has(gateQ));
+  assert.equal(sessions.get(gateQ).sessionGeneration, 52);
+  assert.ok(!removed.includes(gateQ));
+  receive8({ id: id(52, 2), op: "close", tabId: gateQ });
+  await flush();
+  assert.equal(sessions.size, 0);
+  activeTab = null;
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

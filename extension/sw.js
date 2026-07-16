@@ -11,12 +11,17 @@
 // length-prefixed with a 4-byte little-endian uint32 (handled by Chrome /
 // nmh.py, never by this file). Two directions:
 //
-// Requests are processed one at a time (no pipelining): Python sends a
-// request and awaits its reply before sending the next. The session table
-// below relies on this — do not interleave ops from the Python side.
-// (Several tabs may be ATTACHED at once — see "open" replace:false — but
-// requests are still serialized; per-tab pipelining is not part of this
-// contract today — it is tracked separately as future work.)
+// Request ordering (per-tab pipelining): requests that target ONE attached
+// tab — "cdp"/"close"/"detach" carrying an explicit `tabId` — are processed
+// FIFO per tab, in arrival order, and MAY be processed concurrently across
+// different tabs; Python may therefore keep one request in flight per tab
+// at a time (it still awaits a tab's reply before sending that tab's next
+// request). Requests that mutate or read the session table as a whole —
+// "open" (any `replace` shape), "attach", "tabs", any op WITHOUT a `tabId`,
+// and any unrecognized op — are barriers: they run only after every
+// in-flight request has settled, and every later request waits for them.
+// This is what lets two concurrent "open"s never race the table while
+// independent tabs still make progress in parallel.
 //
 // ---- Python -> extension (requests) ----------------------------------
 // Every request carries a mandatory caller-chosen correlation id `id` (number
@@ -198,7 +203,9 @@ let port = null;
 let connectPromise = null;
 // Session table: one entry per attached tab (chrome.debugger natively keys
 // every attach/sendCommand/onEvent/onDetach by tabId, so holding several
-// concurrent debuggees is safe; requests stay serialized regardless).
+// concurrent debuggees is safe; requests are ordered per tab, with
+// table-level ops serialized against everything — see the request chains
+// below).
 // Map<tabId, { sessionGeneration, owner, bridgeCreated }>:
 //   sessionGeneration — generation injected into request ids by nmh.py.
 //       Events have no correlation id, so each entry carries the generation
@@ -216,6 +223,72 @@ let connectPromise = null;
 //       it merely attached to the user's active tab ("attach"). Teardown
 //       removes the tab only when true — see the WIRE PROTOCOL contract notes.
 const sessions = new Map();
+
+// Request ordering (the WIRE PROTOCOL "per-tab pipelining" contract).
+// Native Messaging listeners do not await async callbacks, so ordering is
+// imposed here with promise chains: one chain per targeted tab, plus one
+// GLOBAL chain for everything that mutates or reads the session table as a
+// whole — "open" (its replace:true shape is the tear-everything-down
+// reaper), "attach" (tears down every other tab on success), "tabs", any op
+// without a tabId (implicit-target resolution reads the whole table), and
+// unknown ops. A global op first drains every chain (in-flight per-tab ops
+// included), and every later op — per-tab or global — queues behind it;
+// per-tab ops on different tabs otherwise interleave freely while ops on
+// one tab stay FIFO. Two overlapping `open` calls can therefore never both
+// see no tab, create one each, and race to overwrite the shared session
+// state.
+//
+// Lifetime: the chains order ONE port's requests. dial() resets them when it
+// installs a new port, because an entry can legitimately never settle — a
+// sendCommand awaiting a promise the page never resolves (Runtime.evaluate
+// with awaitPromise) outlives the client's own timeout — and a session that
+// FOLLOWS A PORT SWAP must not queue behind the dead port's wedge. In
+// particular the replace:true reaper "open", the designated recovery op, is
+// what CLEARS such a wedge (its teardown's debugger.detach settles the hung
+// command); parked behind it, recovery would be impossible. (A successor
+// loopback client on the SAME still-live port shares that port's chains, as
+// it always shared the single pre-split chain; a wedge there ends with the
+// worker's eviction dropping the port.) Already-queued old-port ops still
+// run in their original order and bail at onPythonMessage's entry
+// port-staleness gate; mid-flight ones re-check port currency at — and,
+// for the multi-tab teardown loops, between — their await boundaries, so a
+// resumed stale op can neither reply nor touch entries the successor
+// session created or adopted.
+let globalChain = Promise.resolve();
+const tabChains = new Map();
+
+// Chain `fn` after every queued op, global and per-tab, and make every later
+// op wait for it. Stored tails never reject: `fn` is wrapped with a catch so
+// one failed request cannot suppress every later one (a disconnect can make
+// postMessage throw even inside the handler's error path).
+function enqueueGlobal(fn) {
+  const barrier = Promise.all([globalChain, ...tabChains.values()]);
+  const run = barrier.then(fn).catch((error) => {
+    console.warn("chrome-bridge: request failed:", error);
+  });
+  globalChain = run;
+  // The old per-tab tails are absorbed into the barrier; later per-tab ops
+  // must chain on the new global tail, not slip past it via a stale entry.
+  tabChains.clear();
+  return run;
+}
+
+// Chain `fn` after the target tab's last queued op (or the last global op,
+// whichever is later — enqueueGlobal cleared the map, so a surviving entry
+// already queues after the last global op). Same never-rejects wrapping as
+// enqueueGlobal. The entry self-cleans once its chain drains, so closed
+// tabs do not accumulate map entries.
+function enqueueTab(tabId, fn) {
+  const prev = tabChains.get(tabId) || globalChain;
+  const run = prev.then(fn).catch((error) => {
+    console.warn("chrome-bridge: request failed:", error);
+  });
+  tabChains.set(tabId, run);
+  run.then(() => {
+    if (tabChains.get(tabId) === run) tabChains.delete(tabId);
+  });
+  return run;
+}
 
 async function nativeHostName() {
   const { bridgeProfileName } = await chrome.storage.local.get("bridgeProfileName");
@@ -271,20 +344,26 @@ async function dial() {
   // Remember which host this port dialed so the profile-rename path can tell
   // whether an in-flight dial already landed on the wanted identity.
   p.bridgeHostName = hostName;
-  // Native Messaging listeners do not await async callbacks themselves.
-  // Serialize operations explicitly: two loopback client sessions share this
-  // same native port, and overlapping `open` calls could otherwise both see
-  // no tab, create one, then race to overwrite the global attachment state.
-  let requestChain = Promise.resolve();
+  // Fresh port, fresh ordering state (see the chains' Lifetime note): the
+  // new session's requests must never queue behind a dead session's
+  // never-settling entry.
+  globalChain = Promise.resolve();
+  tabChains.clear();
+  // Route each request onto the ordering chains (see their comment block):
+  // an explicit tabId on a tab-targeted op pins it to that tab's chain
+  // (same-tab FIFO, cross-tab interleave); everything else — "open",
+  // "attach", "tabs", implicit-target ops, unknown ops — is a session-table
+  // op and takes the global barrier chain.
   p.onMessage.addListener((msg) => {
-    requestChain = requestChain
-      .then(() => onPythonMessage(msg, p))
-      .catch((error) => {
-        // A disconnect can make postMessage throw even inside the handler's
-        // error path. Recover the chain so one failed request cannot suppress
-        // every later request delivered on a still-live port.
-        console.warn("chrome-bridge: request failed:", error);
-      });
+    const run = () => onPythonMessage(msg, p);
+    if (
+      msg.tabId !== undefined &&
+      (msg.op === "cdp" || msg.op === "close" || msg.op === "detach")
+    ) {
+      enqueueTab(msg.tabId, run);
+    } else {
+      enqueueGlobal(run);
+    }
   });
   p.onDisconnect.addListener(() => {
     // chrome.runtime.lastError is set here when the host died/was missing
@@ -345,8 +424,19 @@ async function onPythonMessage(msg, fromPort) {
       // Single-tab mode is the DEFAULT: unless the caller opts out with
       // "replace": false, tear down every attached tab so a re-open (e.g.
       // after a dropped detach) cannot orphan them. replace:false adds an
-      // ADDITIONAL tab, leaving existing attachments untouched.
-      if (msg.replace !== false) await closeAllTabs();
+      // ADDITIONAL tab, leaving existing attachments untouched. Torn down
+      // one tab at a time with a port-currency gate BETWEEN iterations: the
+      // ordering chains reset when a new port is dialed, so a successor
+      // session's ops can run while this loop is suspended in an await
+      // (e.g. tabs.remove held up by a beforeunload dialog) — and closeTab
+      // re-reads the table, so a stale iteration could otherwise destroy an
+      // entry the successor just created or adopted.
+      if (msg.replace !== false) {
+        for (const priorTabId of [...sessions.keys()]) {
+          if (port !== fromPort) return; // replaced mid-teardown: walk away
+          await closeTab(priorTabId);
+        }
+      }
       if (port !== fromPort) return; // replaced while closing prior tabs
       // active:false opens the tab in the current window without focusing it,
       // sharing the real profile's cookies/login state. We deliberately use
@@ -430,23 +520,35 @@ async function onPythonMessage(msg, fromPort) {
       // active tab was ALREADY attached (e.g. the user focused a
       // bridge-created one) this commit is the ownership handover: it is the
       // user's tab now (bridgeCreated: false), so teardown must never
-      // remove it.
-      sessions.set(tab.id, {
+      // remove it. Keep a reference to OUR entry object: the post-teardown
+      // checks below compare by identity, not by generation — generations
+      // are per-host-process counters, so a successor client on a fresh
+      // host after a port swap can carry the SAME number (both first
+      // sessions are generation 1), and a value compare would let the
+      // stale rollback destroy the successor's just-secured attachment.
+      const ourEntry = {
         sessionGeneration: requestGeneration,
         owner: fromPort.bridgeHostName,
         bridgeCreated: false,
-      });
+      };
+      sessions.set(tab.id, ourEntry);
       // Single-tab invariant, same as a replace:true "open": tear down every
-      // OTHER attached tab (each removed only if bridge-created).
+      // OTHER attached tab (each removed only if bridge-created). Same
+      // per-iteration port gate as the "open" teardown loop — a stale
+      // iteration after a port swap must not destroy entries the successor
+      // session created or adopted; breaking falls into the rollback below,
+      // which already handles the replaced-port case.
       for (const priorTabId of [...sessions.keys()]) {
+        if (port !== fromPort) break;
         if (priorTabId !== tab.id) await closeTab(priorTabId);
       }
       if (port !== fromPort) {
-        // This session died mid-teardown. Roll back only what is still OURS:
-        // a successor may already have taken the entry over (e.g. its own
-        // "attach" to this same active tab re-generations the session).
-        const entry = sessions.get(tab.id);
-        if (entry !== undefined && entry.sessionGeneration === requestGeneration) {
+        // This session died mid-teardown. Roll back only what is still OURS
+        // — by OBJECT IDENTITY (see the ourEntry note above): a successor
+        // may already have taken the entry over (its own "attach" to this
+        // same active tab replaces the entry object), and its generation
+        // number can collide with ours across a host swap.
+        if (sessions.get(tab.id) === ourEntry) {
           sessions.delete(tab.id);
           try {
             await chrome.debugger.detach({ tabId: tab.id });
@@ -456,11 +558,11 @@ async function onPythonMessage(msg, fromPort) {
         }
         return;
       }
-      const entry = sessions.get(tab.id);
-      if (entry === undefined || entry.sessionGeneration !== requestGeneration) {
+      if (sessions.get(tab.id) !== ourEntry) {
         // A mid-teardown onDetach for the just-attached tab already ended
         // this session (the detached event was relayed above) — replying
-        // ok:true would claim a tab whose debugger is gone.
+        // ok:true would claim a tab whose debugger is gone. Identity, not
+        // generation, for the same collision-proofing as the rollback.
         reply(msg.id, { ok: false, error: "debugger detached during attach" });
         return;
       }
@@ -700,6 +802,17 @@ connect();
 // If the user (re)configures the profile name from the options page while
 // this worker is alive, reconnect under the new identity immediately rather
 // than waiting for the next spin-up trigger.
+//
+// Deliberately NOT queued on the global chain, even though it mutates the
+// session table: this teardown is the recovery valve for a WEDGED session —
+// its closeAllTabs() detaches every debuggee, which is what settles a hung
+// sendCommand — so parking it behind the wedge would make a rename
+// permanently un-runnable (and, chained, a single never-settling op would
+// survive even the port swap). Its safety against in-flight requests is
+// what it has always been: single-threaded JS, the per-op port-staleness
+// gates (ops re-check `port !== fromPort` after every await), and the
+// mid-op rollback paths. The chains reset when the new identity's port is
+// dialed (see dial()).
 async function reconnectWithNewIdentity() {
   // Let any in-flight dial settle first: it may have read the OLD profile name
   // before the storage write landed, so whatever it produced must be torn down

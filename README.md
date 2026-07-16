@@ -70,7 +70,8 @@ with ChromeBridge(profile="personal") as bridge:
 
 The legacy single-tab usage above is unchanged — the facade methods
 (`cdp.navigate(...)` etc.) keep driving one tab at a time. Operations are
-serialized per connection (tabs interleave, they don't run in parallel).
+ordered per tab: ops on one tab are FIFO, while independent tabs can be
+driven in parallel (one thread per tab).
 See [`docs/multi-tab.md`](docs/multi-tab.md).
 
 ## CLI commands
