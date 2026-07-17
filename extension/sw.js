@@ -182,7 +182,6 @@
 
 const NATIVE_HOST_PREFIX = "com.chromebridge.bridge";
 const CDP_PROTOCOL_VERSION = "1.3";
-const KEEPALIVE_ALARM = "ka";
 // One-shot alarm to re-dial soon after the port drops while idle. Alarms are
 // the ONLY timer that survives a service-worker eviction (a setTimeout dies
 // with the worker), and chrome.alarms clamps packed extensions to a 1-minute
@@ -773,19 +772,11 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // connected, message traffic on it resets the idle timer, so an active job
 // (Python <-> extension chatter) keeps the worker alive on its own.
 //
-// The alarm is only a coarse RECONNECT poke for when the port has dropped while
-// idle. NOTE: chrome.alarms enforces a 1-minute minimum period for packed
-// extensions (values < 1 are clamped up; unpacked/dev builds allow shorter but
-// warn), so this fires at most ~once a minute — it cannot by itself beat the
-// ~30 s idle eviction. That is fine: the port (not the alarm) is what holds the
-// worker during work; the alarm just re-establishes the port after an idle gap.
-chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  // Both the periodic keepalive and the one-shot post-drop reconnect just
-  // re-dial if the port is down (connect() no-ops when it is already up). The
-  // alarm handler firing is also what re-spins an evicted worker, so this is
-  // the path that brings the bridge back unattended after eviction.
-  if (alarm.name === KEEPALIVE_ALARM || alarm.name === RECONNECT_ALARM) {
+  // The one-shot alarm is created only after a real dial failure or disconnect.
+  // It survives worker eviction and brings the bridge back unattended without
+  // waking an extension that has never been configured.
+  if (alarm.name === RECONNECT_ALARM) {
     connect();
   }
 });

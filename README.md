@@ -103,12 +103,15 @@ likewise leaves it open on exit.
 
 1. Allocate a loopback port for this profile.
 2. Ask which Chrome profile directory this maps to (for display purposes).
-3. Generate a native-messaging manifest + launcher batch file for this
-   profile, with the port baked in.
+3. Copy the bundled extension and generate a native-messaging manifest +
+   launcher batch file under your per-user chrome-bridge data directory, with
+   the port baked in. The launcher uses the Python installation that provides
+   `chrome-bridge`; a source checkout and `uv` are not required.
 4. Register the launcher in the Windows registry
    (`HKCU\Software\Google\Chrome\NativeMessagingHosts\com.chromebridge.bridge.<name>`).
 5. Walk you through: opening `chrome://extensions` **in that profile's Chrome
-   window**, enabling Developer mode, loading `extension/` unpacked, and
+   window**, enabling Developer mode, loading the copied extension directory
+   printed by `init` unpacked, and
    setting the profile name on the extension's options page.
 6. Save the extension ID it prints back into the profile registry.
 

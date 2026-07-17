@@ -24,6 +24,7 @@ from chrome_bridge.bridge.client import BridgeError
 from test_client import FakeBridge
 
 runner = CliRunner()
+EXTENSION_ID = "abcdefghijklmnopabcdefghijklmnop"
 
 
 @pytest.fixture
@@ -597,14 +598,14 @@ def test_init_full_flow_registers_and_saves_profile(registry_path, mocked_instal
     result = runner.invoke(
         cli_mod.app,
         ["init", "--profile", "personal"],
-        input="Default\nabc123extensionid\n",
+        input=f"Default\n{EXTENSION_ID}\n",
     )
     assert result.exit_code == 0, result.output
     assert "personal" in mocked_install
     cfg = profiles_mod.get_profile("personal", path=registry_path)
     assert cfg.port == profiles_mod.DEFAULT_BASE_PORT
     assert cfg.chrome_profile_directory == "Default"
-    assert cfg.extension_id == "abc123extensionid"
+    assert cfg.extension_id == EXTENSION_ID
     assert (tmp_path / "run_nmh_personal.bat").exists()
     assert (tmp_path / "nmh-manifest.personal.local.json").exists()
 
@@ -613,6 +614,23 @@ def test_init_full_flow_registers_and_saves_profile(registry_path, mocked_instal
 def test_init_rejects_invalid_profile_name(registry_path, mocked_install):
     result = runner.invoke(cli_mod.app, ["init", "--profile", "Not Valid"])
     assert result.exit_code == 1
+
+
+def test_init_rejects_invalid_extension_id_before_profile_artifacts(
+    registry_path, mocked_install, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(sys, "platform", "win32")
+    result = runner.invoke(
+        cli_mod.app,
+        ["init", "--profile", "personal"],
+        input="Default\nnot-an-extension-id\n",
+    )
+    assert result.exit_code == 1
+    assert "invalid Chrome extension ID" in result.output
+    assert not registry_path.exists()
+    assert not list(tmp_path.glob("*.bat"))
+    assert not list(tmp_path.glob("nmh-manifest.*"))
+    assert not mocked_install
 
 
 @pytest.mark.parametrize("port", ["0", "65536"])
@@ -697,13 +715,13 @@ def test_init_rerun_overwrite_keeps_stored_port(registry_path, mocked_install, m
     result = runner.invoke(
         cli_mod.app,
         ["init", "--profile", "personal"],
-        input="y\nDefault\nabc123extensionid\n",
+        input=f"y\nDefault\n{EXTENSION_ID}\n",
     )
     assert result.exit_code == 0, result.output
     assert "Using port 8770" in result.output
     cfg = profiles_mod.get_profile("personal", path=registry_path)
     assert cfg.port == 8770
-    assert cfg.extension_id == "abc123extensionid"
+    assert cfg.extension_id == EXTENSION_ID
     assert "personal" in mocked_install
     assert (tmp_path / "run_nmh_personal.bat").exists()
 

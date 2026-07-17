@@ -3,10 +3,10 @@
 // "MULTI-PROFILE IDENTITY" block in sw.js and docs/multi-profile.md.
 
 // Matches the profile-name validation chrome_bridge.profiles enforces
-// (lowercase alnum + hyphen/underscore) — it becomes part of a native
+// (lowercase alnum + underscore) — it becomes part of a native
 // messaging host name and of generated filenames, both of which are picky
 // about characters.
-const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
+const NAME_RE = /^[a-z0-9][a-z0-9_]*$/;
 
 const input = document.getElementById("profile-name");
 const status = document.getElementById("status");
@@ -23,7 +23,7 @@ async function save() {
   const name = input.value.trim();
   if (!NAME_RE.test(name)) {
     status.textContent =
-      "Invalid name — use lowercase letters, digits, hyphens, or underscores, starting with a letter or digit.";
+      "Invalid name — use lowercase letters, digits, or underscores, starting with a letter or digit.";
     return;
   }
   await chrome.storage.local.set({ bridgeProfileName: name });

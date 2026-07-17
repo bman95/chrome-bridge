@@ -106,9 +106,29 @@ def read_frame(stream: BinaryIO) -> dict[str, Any] | None:
     if body is None:
         raise FrameError("truncated frame body")
     try:
-        return json.loads(body.decode("utf-8"))
+        decoded = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FrameError(f"invalid frame JSON: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise FrameError("invalid frame JSON: expected a JSON object")
+    return decoded
+
+
+def _encode_body(obj: Any, max_bytes: int | None) -> bytes:
+    """Encode and validate a frame body without allocating its wire prefix."""
+    try:
+        text = json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise FrameError(f"frame not JSON-serialisable: {exc}") from exc
+    try:
+        body = text.encode("utf-8")
+    except UnicodeEncodeError:
+        body = _SURROGATES.sub("\ufffd", text).encode("utf-8")
+    if max_bytes is not None and len(body) > max_bytes:
+        raise FrameError(
+            f"frame body {len(body)} bytes exceeds {max_bytes}-byte cap"
+        )
+    return body
 
 
 def encode_frame(obj: Any, *, max_bytes: int | None = MAX_MESSAGE_BYTES) -> bytes:
@@ -131,18 +151,7 @@ def encode_frame(obj: Any, *, max_bytes: int | None = MAX_MESSAGE_BYTES) -> byte
     unpaired surrogates — legitimate in scraped page text — are replaced with
     U+FFFD (as Chromium itself does) rather than failing the whole frame.
     """
-    try:
-        text = json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    except ValueError as exc:
-        raise FrameError(f"frame not JSON-serialisable: {exc}") from exc
-    try:
-        body = text.encode("utf-8")
-    except UnicodeEncodeError:
-        body = _SURROGATES.sub("\ufffd", text).encode("utf-8")
-    if max_bytes is not None and len(body) > max_bytes:
-        raise FrameError(
-            f"frame body {len(body)} bytes exceeds {max_bytes}-byte cap"
-        )
+    body = _encode_body(obj, max_bytes)
     return _LEN.pack(len(body)) + body
 
 
@@ -154,5 +163,7 @@ def write_frame(
     ``max_bytes`` is forwarded to :func:`encode_frame`; pass ``None`` to lift
     the 1 MB cap when the destination is not the extension.
     """
-    stream.write(encode_frame(obj, max_bytes=max_bytes))
+    body = _encode_body(obj, max_bytes)
+    stream.write(_LEN.pack(len(body)))
+    stream.write(body)
     stream.flush()

@@ -25,12 +25,13 @@ decoupled entirely from whatever identity launched the script.
 **Resolution: one native host name per profile**
 (`com.chromebridge.bridge.<profile>`), each with its own:
 - Registry key: `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.chromebridge.bridge.<profile>`
-- Manifest file: `nmh-manifest.<profile>.local.json` (gitignored)
+- Manifest file: `nmh-manifest.<profile>.local.json` in the per-user
+  chrome-bridge installation directory
 - Launcher: `run_nmh_<profile>.bat`, with that profile's port baked in via
   `set CBR_BRIDGE_PORT=<port>`
 
 The extension side needs a small per-profile identity too, since the same
-unpacked `extension/` code is loaded into every profile: `extension/options.html`
+unpacked extension code is loaded into every profile: `options.html`
 lets you type the profile's name once per profile-load, stored in
 `chrome.storage.local`. `sw.js`'s `connect()` reads it and dials
 `com.chromebridge.bridge.<profileName>`.

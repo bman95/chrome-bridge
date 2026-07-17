@@ -67,6 +67,7 @@ import struct
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
@@ -361,8 +362,11 @@ class _ExtensionRelay:
     discarded, so a late reply/event can never leak into the next client.
     """
 
-    def __init__(self, ext_in: BinaryIO) -> None:
+    def __init__(
+        self, ext_in: BinaryIO, *, on_close: Callable[[], object] | None = None
+    ) -> None:
         self._ext_in = ext_in
+        self._on_close = on_close
         self._lock = threading.Lock()
         self._client_out: BinaryIO | None = None
         self._session_closed: threading.Event | None = None
@@ -440,6 +444,11 @@ class _ExtensionRelay:
             logger.debug("ext->client: read failed: %s", exc)
         finally:
             self.closed.set()
+            if self._on_close is not None:
+                try:
+                    self._on_close()
+                except OSError:
+                    pass
             with self._lock:
                 session_closed = self._session_closed
             if session_closed is not None:
@@ -522,9 +531,17 @@ def _bind_listener(host: str, port: int) -> socket.socket:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind((host, port))
     listener.listen(1)
-    listener.settimeout(0.2)
     logger.info("bridge listening for clients on %s:%d", host, port)
     return listener
+
+
+def _wake_listener(listener: socket.socket) -> None:
+    """Wake a blocking ``accept`` after the extension input pipe closes."""
+    try:
+        wake = socket.create_connection(listener.getsockname(), timeout=1.0)
+    except OSError:
+        return
+    wake.close()
 
 
 def _accept_client(listener: socket.socket) -> tuple[socket.socket, BinaryIO, BinaryIO]:
@@ -593,14 +610,16 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("could not write bridge auth token: %s", exc)
         listener.close()
         return 1
-    ext_relay = _ExtensionRelay(ext_in)
+    # A short-lived loopback connection is the explicit wakeup for the blocking
+    # accept when Chrome closes the Native Messaging input pipe. Closing a
+    # listening socket from another thread does not reliably wake accept on all
+    # supported OSes; this avoids periodic idle polling and remains portable.
+    ext_relay = _ExtensionRelay(ext_in, on_close=lambda: _wake_listener(listener))
     ext_relay.start()
     try:
         while not ext_relay.closed.is_set():
             try:
                 client, client_in, client_out = _accept_client(listener)
-            except socket.timeout:
-                continue
             except OSError as exc:
                 if ext_relay.closed.is_set():
                     break

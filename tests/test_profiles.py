@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 
 import pytest
 
 from chrome_bridge import profiles
+
+
+def _add_profiles_concurrently(path, worker, start):
+    start.wait()
+    for index in range(12):
+        profiles.add_profile(
+            f"worker_{worker}_{index}",
+            10000 + worker * 100 + index,
+            path=path,
+        )
 
 
 @pytest.fixture
@@ -64,6 +75,15 @@ def test_load_registry_ignores_unknown_keys(registry_path):
     assert cfg.port == 8765
     assert cfg.chrome_profile_directory == "Default"
     assert not hasattr(cfg, "chrome_user_data_dir")
+
+
+def test_load_registry_rejects_legacy_name_chrome_cannot_register(registry_path):
+    registry_path.write_text(
+        json.dumps({"profiles": {"work-2": {"port": 8765}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(profiles.ProfileError, match="work-2"):
+        profiles.load_registry(registry_path)
 
 
 def test_resolve_port_returns_registered_port(registry_path):
@@ -151,14 +171,14 @@ def test_remove_profile_returns_false_when_absent(registry_path):
 
 @pytest.mark.parametrize(
     "name",
-    ["Personal", "my profile", "-personal", "personal!", ""],
+    ["Personal", "my profile", "-personal", "personal!", "work-2", "personal\n", ""],
 )
 def test_validate_profile_name_rejects_invalid(name):
     with pytest.raises(profiles.ProfileError):
         profiles.validate_profile_name(name)
 
 
-@pytest.mark.parametrize("name", ["personal", "work-2", "work_2", "p2"])
+@pytest.mark.parametrize("name", ["personal", "work_2", "p2"])
 def test_validate_profile_name_accepts_valid(name):
     profiles.validate_profile_name(name)  # must not raise
 
@@ -211,6 +231,26 @@ def test_registry_file_is_well_formed_json(registry_path):
     assert '"port": 8765' in text
 
 
+def test_concurrent_process_updates_preserve_every_profile(registry_path):
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    workers = [
+        context.Process(
+            target=_add_profiles_concurrently,
+            args=(registry_path, worker, start),
+        )
+        for worker in range(6)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    for worker in workers:
+        worker.join(timeout=15)
+        assert worker.exitcode == 0
+
+    assert len(profiles.list_profiles(registry_path)) == 72
+
+
 # --------------------------------------------------------------------------- #
 # Auth-token paths + profile-by-port lookup (issue #7)
 # --------------------------------------------------------------------------- #
@@ -227,11 +267,11 @@ def test_port_token_path_beside_registry(registry_path, monkeypatch):
 
 
 def test_token_path_and_port_token_path_never_collide(registry_path, monkeypatch):
-    # A profile literally named "port-8765" is valid; its token file must still
+    # A profile literally named "port_8765" is valid; its token file must still
     # not collide with the port-8765 fallback (the '.' infix guarantees this).
     monkeypatch.setattr(profiles, "default_registry_path", lambda: registry_path)
-    profiles.validate_profile_name("port-8765")  # confirms it is a valid name
-    assert profiles.token_path("port-8765") != profiles.port_token_path(8765)
+    profiles.validate_profile_name("port_8765")  # confirms it is a valid name
+    assert profiles.token_path("port_8765") != profiles.port_token_path(8765)
 
 
 def test_find_profile_by_port_returns_match(registry_path):

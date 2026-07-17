@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uvx ruff check src tests
+      - run: uv run --with mypy mypy src
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv run pytest
+
+  javascript-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --check extension/sw.js
+      - run: node --check extension/options.js
+      - run: node tests/sw_contract_test.js
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv build
+      - name: Install wheel into a clean environment
+        run: |
+          uv venv --seed .clean-venv
+          uv pip install --python .clean-venv/bin/python dist/*.whl
+          .clean-venv/bin/chrome-bridge --help
+          .clean-venv/bin/python -c "from pathlib import Path; from chrome_bridge.install import install_extension; p = install_extension(Path('.clean-extension')); assert (p / 'manifest.json').is_file()"
+      - name: Verify typed-package marker is shipped
+        run: uv run python -m zipfile -l dist/*.whl | grep 'chrome_bridge/py.typed'

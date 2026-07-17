@@ -430,6 +430,7 @@ def test_accept_client_binds_loopback_and_accepts():
     result: dict[str, object] = {}
 
     listener = nmh._bind_listener(host, port)
+    assert listener.gettimeout() is None
 
     def server_thread():
         client, rfile, wfile = nmh._accept_client(listener)

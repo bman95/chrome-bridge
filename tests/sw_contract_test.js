@@ -6,6 +6,7 @@ const debuggerEvents = [];
 const debuggerDetaches = [];
 const storageChanges = [];
 const alarmEvents = [];
+const createdAlarms = [];
 const removed = [];
 const detached = [];
 const sent = [];
@@ -26,7 +27,7 @@ global.chrome = {
     onInstalled: { addListener: () => {} },
   },
   alarms: {
-    create: () => {},
+    create: (name, options) => { createdAlarms.push({ name, options }); },
     onAlarm: { addListener: (fn) => alarmEvents.push(fn) },
   },
   tabs: {
@@ -55,6 +56,10 @@ const source = fs.readFileSync(
 );
 const tests = String.raw`
 (async () => {
+  // An unconfigured worker must not install a periodic alarm that wakes it
+  // forever. A one-shot reconnect alarm is still installed after a real
+  // native-host disconnect/failure later in this contract.
+  assert.equal(createdAlarms.some(({ options }) => options.periodInMinutes), false);
   const replies = [];
   const fakePort = {
     bridgeHostName: "com.chromebridge.bridge.personal",

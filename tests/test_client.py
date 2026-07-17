@@ -201,6 +201,11 @@ def test_connect_failure_raises_bridge_error():
         cdp.connect()
 
 
+def test_constructor_rejects_profile_with_explicit_endpoint():
+    with pytest.raises(ValueError, match="profile.*host.*port"):
+        ChromeBridge(profile="personal", host="127.0.0.1", port=8765)
+
+
 def test_context_manager_connects_and_closes(bridge):
     bridge.on("open", _ok_open())
     bridge.set_default(_cdp_result({}))
@@ -616,6 +621,75 @@ def test_detach_event_routes_to_listener(bridge):
         assert cdp._detached.is_set()
         assert cdp._tab_id is None
     finally:
+        cdp.close()
+
+
+def test_event_listener_can_issue_cdp_request_without_blocking_reader(bridge):
+    bridge.on("open", _ok_open())
+    bridge.set_default(_evaluate_value(4))
+    cdp = _client(bridge, op_timeout=0.5)
+    done = threading.Event()
+    results = []
+
+    def on_event(_params):
+        results.append(cdp.evaluate("2 + 2"))
+        done.set()
+
+    cdp.on_event("Custom.evt", on_event)
+    try:
+        cdp.open("https://x", timeout=0.1)
+        bridge.send_event(
+            {
+                "event": True,
+                "type": "cdp",
+                "tabId": cdp._tab_id,
+                "method": "Custom.evt",
+                "params": {},
+            }
+        )
+        assert done.wait(2.0)
+        assert results == [4]
+    finally:
+        cdp.close()
+
+
+def test_slow_event_listener_does_not_delay_replies_and_events_stay_ordered(bridge):
+    bridge.on("open", _ok_open())
+    bridge.set_default(_evaluate_value(True))
+    cdp = _client(bridge, op_timeout=0.5)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    both_done = threading.Event()
+    seen = []
+
+    def on_event(params):
+        if params["sequence"] == 1:
+            first_started.set()
+            release_first.wait(2.0)
+        seen.append(params["sequence"])
+        if len(seen) == 2:
+            both_done.set()
+
+    cdp.on_event("Custom.ordered", on_event)
+    try:
+        cdp.open("https://x", timeout=0.1)
+        for sequence in (1, 2):
+            bridge.send_event(
+                {
+                    "event": True,
+                    "type": "cdp",
+                    "tabId": cdp._tab_id,
+                    "method": "Custom.ordered",
+                    "params": {"sequence": sequence},
+                }
+            )
+        assert first_started.wait(1.0)
+        assert cdp.banner_present("body") is True
+        release_first.set()
+        assert both_done.wait(1.0)
+        assert seen == [1, 2]
+    finally:
+        release_first.set()
         cdp.close()
 
 
@@ -2334,6 +2408,9 @@ def test_detach_racing_attach_reply_is_not_lost(bridge):
             cdp.attach()
         assert cdp._detached.is_set()
         assert cdp._tab_id is None
+        deadline = time.monotonic() + 1.0
+        while not seen and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert seen == [{"reason": "early_gone", "tabId": 55}]
     finally:
         cdp.close()
