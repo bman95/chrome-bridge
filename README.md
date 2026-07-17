@@ -117,6 +117,13 @@ likewise leaves it open on exit.
 
 Re-run it any time — every step is idempotent.
 
+> **Note:** the generated launcher bakes in the absolute path of the Python
+> interpreter that ran `init`. Install chrome-bridge into a persistent
+> environment (a project venv, `pipx`, `uv tool install`) before running
+> `init` — an ephemeral environment (e.g. `uvx chrome-bridge init`) lives in
+> a cache that may be pruned, silently breaking the launcher later. If the
+> environment moves, just re-run `init`.
+
 To script a second profile (e.g. "work"), just run `init` again with a
 different `--profile` name; each profile gets its own port and native host, so
 they never interfere with each other.

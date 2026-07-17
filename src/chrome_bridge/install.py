@@ -78,10 +78,17 @@ def _bundled_extension_dir() -> Path:
 
 
 def install_extension(destination: Path | None = None) -> Path:
-    """Copy the bundled unpacked extension to a stable, user-owned directory."""
+    """Copy the bundled unpacked extension to a stable, user-owned directory.
+
+    An existing destination is REPLACED, not merged over: leftover files from
+    an older bundle would otherwise linger and get loaded by Chrome alongside
+    the fresh copy.
+    """
     target = destination or default_extension_dir()
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(_bundled_extension_dir(), target, dirs_exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(_bundled_extension_dir(), target)
     return target
 
 
@@ -106,6 +113,15 @@ def install_profile(
     profiles_mod.validate_profile_name(profile)
     profiles_mod.validate_port(port)
     normalized_id = normalize_extension_id(extension_id)
+    # Pre-flight the port-conflict check so the common conflict fails BEFORE
+    # any artifact is written or registered. add_profile repeats it atomically
+    # under the registry lock as the race-safe final word.
+    registry = profiles_mod.load_registry(registry_path)
+    conflict = profiles_mod.find_port_conflict(profile, port, registry.profiles)
+    if conflict is not None:
+        raise profiles_mod.ProfileError(
+            f"port {port} is already used by profile {conflict!r}"
+        )
 
     root = artifacts_root or default_install_dir()
     launcher = write_launcher(

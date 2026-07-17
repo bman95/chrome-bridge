@@ -71,17 +71,21 @@ class EventDispatcher:
             started = self._started
         if not started:
             return
-        try:
-            self._queue.put_nowait(_STOP)
-        except queue.Full:
-            # Make room for the stop marker. Shutdown is more important than a
-            # queued delivery and the currently running callback is unaffected.
+        # Loop until the stop marker lands: a submitter that passed its closed
+        # check before close() set the flag can still be mid-put, so a single
+        # drop-one-then-put attempt can lose the race and raise queue.Full out
+        # of a teardown path. Shutdown outranks queued deliveries, and the
+        # producer population is finite once _closed is set, so this converges.
+        while True:
             try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except queue.Empty:
-                pass
-            self._queue.put_nowait(_STOP)
+                self._queue.put_nowait(_STOP)
+                return
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                except queue.Empty:
+                    pass
 
     def join(self, timeout: float | None = None) -> None:
         if self._started and threading.current_thread() is not self._thread:

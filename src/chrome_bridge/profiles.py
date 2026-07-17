@@ -14,12 +14,15 @@ records where to find an already-running profile's bridge.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 DEFAULT_BASE_PORT = 8765
 MAX_PORT = 65535
@@ -139,6 +142,13 @@ def load_registry(path: Path | None = None) -> _Registry:
     raises :class:`ProfileError`, never a raw ``json``/``TypeError``/
     ``AttributeError``: callers that must degrade gracefully (the token-path
     resolution in the host and client) catch one well-known error type.
+
+    Entries whose NAME fails today's validation (e.g. hyphenated names written
+    by an older version — Chrome rejects hyphens in native-messaging host
+    names, so they never worked) are SKIPPED with a warning rather than
+    raised: raising would brick every profiles command, including the
+    ``remove`` a user needs to clean the entry up. A skipped entry is dropped
+    from the file by the next successful save.
     """
     p = path or default_registry_path()
     if not p.exists():
@@ -151,7 +161,16 @@ def load_registry(path: Path | None = None) -> _Registry:
         known = {f.name for f in fields(ProfileConfig)} - {"name"}
         profiles = {}
         for name, cfg in data.get("profiles", {}).items():
-            validate_profile_name(name)
+            if not _NAME_RE.fullmatch(name):
+                log.warning(
+                    "chrome-bridge: skipping registry profile %r: the name is "
+                    "not registrable with Chrome (use lowercase letters, "
+                    "digits, or underscores); re-run `chrome-bridge init` "
+                    "with a valid name — the entry is dropped on the next "
+                    "registry write",
+                    name,
+                )
+                continue
             profiles[name] = ProfileConfig(
                 name=name,
                 **{k: v for k, v in cfg.items() if k in known},
@@ -167,6 +186,7 @@ def _registry_lock(path: Path):
     lock_path = path.with_name(f"{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a+b")
+    acquired = False
     try:
         if os.name == "nt":
             import msvcrt
@@ -175,27 +195,46 @@ def _registry_lock(path: Path):
                 lock_file.write(b"\0")
                 lock_file.flush()
             lock_file.seek(0)
-            msvcrt.locking(  # type: ignore[attr-defined]
-                lock_file.fileno(), msvcrt.LK_LOCK, 1  # type: ignore[attr-defined]
-            )
+            # LK_LOCK gives up after ~10 s of internal retries and raises;
+            # loop so contention BLOCKS like POSIX flock instead of failing a
+            # registry write. A dead holder cannot wedge this: the OS releases
+            # its region lock when the process's handle goes away.
+            while True:
+                try:
+                    msvcrt.locking(  # type: ignore[attr-defined]
+                        lock_file.fileno(),
+                        msvcrt.LK_LOCK,  # type: ignore[attr-defined]
+                        1,
+                    )
+                    break
+                except OSError:
+                    continue
         else:
             import fcntl
 
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        acquired = True
         yield
     finally:
-        if os.name == "nt":
-            import msvcrt
+        try:
+            # Unlock only what was locked: unlocking after a failed acquire
+            # raises on Windows and would mask the original error.
+            if acquired:
+                if os.name == "nt":
+                    import msvcrt
 
-            lock_file.seek(0)
-            msvcrt.locking(  # type: ignore[attr-defined]
-                lock_file.fileno(), msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
-            )
-        else:
-            import fcntl
+                    lock_file.seek(0)
+                    msvcrt.locking(  # type: ignore[attr-defined]
+                        lock_file.fileno(),
+                        msvcrt.LK_UNLCK,  # type: ignore[attr-defined]
+                        1,
+                    )
+                else:
+                    import fcntl
 
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_file.close()
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def _save_registry_unlocked(registry: _Registry, path: Path) -> None:

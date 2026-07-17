@@ -1168,6 +1168,12 @@ class ChromeBridge:
         notes on stale events). Use ``"__detached__"`` to observe debugger
         detach (``params`` has ``reason``, plus ``tabId`` when the event was
         tagged with one).
+
+        Delivery is ASYNCHRONOUS: callbacks run on a dedicated dispatcher
+        thread, in wire order, decoupled from the reader — so a callback may
+        safely issue bridge ops, but it is NOT guaranteed to have run by the
+        time the op that triggered the event returns. Synchronize on state
+        the callback sets (an ``Event``, a queue), never on op completion.
         """
         with self._lock:
             self._event_listeners.setdefault(method, []).append(callback)
@@ -1657,6 +1663,10 @@ class Tab:
         for compatibility with single-tab-era peers, untagged events, which
         are broadcast to every handle). Use ``"__detached__"`` to observe this
         tab's debugger detach (``params`` has ``reason``).
+
+        Delivery is ASYNCHRONOUS — see :meth:`ChromeBridge.on_event`:
+        callbacks run on the dispatcher thread in wire order, may issue
+        bridge ops, and may lag the op that triggered the event.
         """
         with self._bridge._lock:
             self._event_listeners.setdefault(method, []).append(callback)

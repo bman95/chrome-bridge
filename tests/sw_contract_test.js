@@ -437,6 +437,22 @@ const tests = String.raw`
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(chainedReplies.at(-1).id[2], 2);
 
+  // A successful dial arms the one-shot eviction net: an eviction while the
+  // port is healthy fires no onDisconnect, so a pending alarm must already
+  // exist or nothing ever re-spins the worker. Firing the alarm with the
+  // port up must RE-arm it (the net stands while configured) and must never
+  // create a periodic alarm.
+  assert.ok(
+    createdAlarms.some(
+      ({ name, options }) => name === "reconnect" && options.delayInMinutes
+    )
+  );
+  const armedBefore = createdAlarms.length;
+  alarmEvents[0]({ name: "reconnect" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(createdAlarms.length > armedBefore);
+  assert.equal(createdAlarms.some(({ options }) => options.periodInMinutes), false);
+
   // --- Per-tab pipelining (issue #19): ops with an explicit tabId run on
   // per-tab chains — same-tab FIFO, cross-tab interleave — while
   // session-table ops ("open", tabless ops, ...) are barriers that drain

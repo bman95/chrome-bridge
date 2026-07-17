@@ -536,10 +536,22 @@ def _bind_listener(host: str, port: int) -> socket.socket:
 
 
 def _wake_listener(listener: socket.socket) -> None:
-    """Wake a blocking ``accept`` after the extension input pipe closes."""
+    """Wake a blocking ``accept`` after the extension input pipe closes.
+
+    Falls back to closing the listener when the wake connection cannot be
+    made (e.g. the listener is bound to an address the OS refuses to connect
+    to, such as 0.0.0.0 on Windows): a closed listener makes the blocked
+    ``accept`` raise ``OSError``, which the main loop treats as shutdown once
+    the relay is closed — without SOME wake path the host would linger in
+    ``accept`` forever after Chrome closed the pipe.
+    """
     try:
         wake = socket.create_connection(listener.getsockname(), timeout=1.0)
     except OSError:
+        try:
+            listener.close()
+        except OSError:
+            pass
         return
     wake.close()
 

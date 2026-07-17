@@ -77,13 +77,31 @@ def test_load_registry_ignores_unknown_keys(registry_path):
     assert not hasattr(cfg, "chrome_user_data_dir")
 
 
-def test_load_registry_rejects_legacy_name_chrome_cannot_register(registry_path):
+def test_load_registry_skips_legacy_name_chrome_cannot_register(
+    registry_path, caplog
+):
+    # A hyphenated name written by an older version never worked with Chrome
+    # (native-messaging host names reject hyphens). It must be skipped with a
+    # warning — raising would brick every profiles command, including the
+    # cleanup path — while valid siblings keep loading.
+    registry_path.write_text(
+        json.dumps({"profiles": {"work-2": {"port": 8765}, "ok": {"port": 8766}}}),
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING", logger="chrome_bridge.profiles"):
+        registry = profiles.load_registry(registry_path)
+    assert set(registry.profiles) == {"ok"}
+    assert any("work-2" in message for message in caplog.messages)
+
+
+def test_registry_write_drops_previously_skipped_legacy_entry(registry_path):
     registry_path.write_text(
         json.dumps({"profiles": {"work-2": {"port": 8765}}}),
         encoding="utf-8",
     )
-    with pytest.raises(profiles.ProfileError, match="work-2"):
-        profiles.load_registry(registry_path)
+    profiles.add_profile("fresh", 8767, path=registry_path)
+    data = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert set(data["profiles"]) == {"fresh"}
 
 
 def test_resolve_port_returns_registered_port(registry_path):

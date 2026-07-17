@@ -55,6 +55,46 @@ def test_install_profile_validates_then_writes_all_profile_artifacts(
     ]
 
 
+def test_install_extension_replaces_stale_files_from_older_bundle(tmp_path):
+    destination = tmp_path / "installed-extension"
+    install.install_extension(destination)
+    stale = destination / "old-module.js"
+    stale.write_text("// leftover from an older bundle\n", encoding="utf-8")
+
+    install.install_extension(destination)
+
+    assert not stale.exists()
+    assert (destination / "manifest.json").is_file()
+
+
+def test_install_profile_port_conflict_fails_before_writing_artifacts(
+    tmp_path, monkeypatch
+):
+    from chrome_bridge import profiles as profiles_mod
+
+    registered = []
+    monkeypatch.setattr(
+        install,
+        "register_native_host",
+        lambda *args: registered.append(args),
+    )
+    registry_path = tmp_path / "profiles.json"
+    profiles_mod.add_profile("existing", 8765, path=registry_path)
+
+    with pytest.raises(profiles_mod.ProfileError, match="already used"):
+        install.install_profile(
+            "personal",
+            8765,
+            chrome_profile_directory="Default",
+            extension_id=EXTENSION_ID_A,
+            artifacts_root=tmp_path / "artifacts",
+            registry_path=registry_path,
+        )
+    assert not (tmp_path / "artifacts").exists()
+    assert not registered
+    assert set(profiles_mod.list_profiles(registry_path)) == {"existing"}
+
+
 def test_install_profile_rejects_invalid_input_before_writing(tmp_path, monkeypatch):
     registered = []
     monkeypatch.setattr(
