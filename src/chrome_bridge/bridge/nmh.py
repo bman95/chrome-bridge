@@ -493,10 +493,21 @@ def _serve_session(
         except OSError:
             pass  # already closed / never connected
     # A per-session client reader must be gone before another client can be
-    # accepted; otherwise an old operation could reach the extension during
-    # the next session. Peer close/shutdown wakes this read on supported
-    # platforms. If it does not, fail closed instead of overlapping sessions.
-    t_up.join(timeout=1.0)
+    # accepted; otherwise an old operation could interleave bytes into the
+    # extension stream during the next session. shutdown() wakes the blocked
+    # read on POSIX but NOT on Windows, where a recv already blocked in
+    # another thread keeps blocking — there, closing the OS handle is what
+    # aborts it. detach() first so the socket object (and the makefile
+    # wrappers' later close) can never double-close a reused handle. If even
+    # that fails to stop the reader, fail closed instead of overlapping
+    # sessions.
+    t_up.join(timeout=0.5)
+    if t_up.is_alive() and client_sock is not None:
+        try:
+            socket.close(client_sock.detach())
+        except OSError:
+            pass
+        t_up.join(timeout=1.0)
     if t_up.is_alive():
         raise RuntimeError("client reader did not stop; refusing a new session")
 
