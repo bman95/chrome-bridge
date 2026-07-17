@@ -1925,6 +1925,11 @@ def test_targeted_detach_marks_only_that_tab(bridge):
         while not tab_b._detached.is_set() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert tab_b.tab_id is None
+        # The __detached__ callback is delivered on the dispatcher thread and
+        # may lag the reader-side detach mark; wait for it, don't race it.
+        deadline = time.monotonic() + 2
+        while not seen_b and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert seen_b == [{"reason": "target_closed", "tabId": 101}]
         # The default tab is untouched and still usable without a re-open.
         assert cdp._tab_id == 100
