@@ -103,16 +103,26 @@ likewise leaves it open on exit.
 
 1. Allocate a loopback port for this profile.
 2. Ask which Chrome profile directory this maps to (for display purposes).
-3. Generate a native-messaging manifest + launcher batch file for this
-   profile, with the port baked in.
+3. Copy the bundled extension and generate a native-messaging manifest +
+   launcher batch file under your per-user chrome-bridge data directory, with
+   the port baked in. The launcher uses the Python installation that provides
+   `chrome-bridge`; a source checkout and `uv` are not required.
 4. Register the launcher in the Windows registry
    (`HKCU\Software\Google\Chrome\NativeMessagingHosts\com.chromebridge.bridge.<name>`).
 5. Walk you through: opening `chrome://extensions` **in that profile's Chrome
-   window**, enabling Developer mode, loading `extension/` unpacked, and
+   window**, enabling Developer mode, loading the copied extension directory
+   printed by `init` unpacked, and
    setting the profile name on the extension's options page.
 6. Save the extension ID it prints back into the profile registry.
 
 Re-run it any time — every step is idempotent.
+
+> **Note:** the generated launcher bakes in the absolute path of the Python
+> interpreter that ran `init`. Install chrome-bridge into a persistent
+> environment (a project venv, `pipx`, `uv tool install`) before running
+> `init` — an ephemeral environment (e.g. `uvx chrome-bridge init`) lives in
+> a cache that may be pruned, silently breaking the launcher later. If the
+> environment moves, just re-run `init`.
 
 To script a second profile (e.g. "work"), just run `init` again with a
 different `--profile` name; each profile gets its own port and native host, so

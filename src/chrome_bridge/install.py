@@ -14,12 +14,18 @@ that one piece stays a generated file, not a Python function call.
 
 from __future__ import annotations
 
+import re
+import shutil
 import sys
+from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
+from . import profiles as profiles_mod
 from .bridge import HOST_NAME_PREFIX
 
 REGISTRY_KEY_ROOT = r"Software\Google\Chrome\NativeMessagingHosts"
+_EXTENSION_ID_RE = re.compile(r"^[a-p]{32}$")
 
 _LAUNCHER_TEMPLATE = """@echo off
 REM Native Messaging host launcher for {host_name} (profile "{profile}").
@@ -28,23 +34,116 @@ REM Chrome spawns this with the manifest path (and, on Windows, the calling
 REM extension origin) as arguments; %* forwards them to the Python host, which
 REM ignores them. stdin/stdout MUST stay binary, so nothing here may print to
 REM stdout — diagnostics go to stderr (1>&2) so they never corrupt the NM pipe.
-REM
-REM cd to this script's own directory so `uv run` resolves the project's
-REM virtualenv regardless of Chrome's working directory.
-cd /d "%~dp0"
 set CBR_BRIDGE_PORT={port}
 set CBR_BRIDGE_PROFILE={profile}
-where uv >nul 2>nul
-if errorlevel 1 (
-  echo run_nmh_{profile}.bat: 'uv' not found on PATH; install uv or add it to PATH 1>&2
-  exit /b 1
-)
-uv run python -m chrome_bridge.bridge.nmh %*
+"{python_executable}" -m chrome_bridge.bridge.nmh %*
 """
 
 
 def host_name(profile: str) -> str:
     return f"{HOST_NAME_PREFIX}.{profile}"
+
+
+def normalize_extension_id(extension_id: str) -> str:
+    """Trim and validate a Chrome extension ID for an allowed origin."""
+    normalized = extension_id.strip()
+    if not _EXTENSION_ID_RE.fullmatch(normalized):
+        raise ValueError(
+            f"invalid Chrome extension ID {extension_id!r}: expected exactly "
+            "32 lowercase letters from a through p"
+        )
+    return normalized
+
+
+def default_install_dir() -> Path:
+    """Stable per-user directory for generated setup artifacts."""
+    return profiles_mod.default_registry_path().parent / "installation"
+
+
+def default_extension_dir() -> Path:
+    return default_install_dir() / "extension"
+
+
+def _bundled_extension_dir() -> Path:
+    bundled = resources.files("chrome_bridge").joinpath("_extension")
+    bundled_path = Path(str(bundled))
+    if bundled_path.is_dir():
+        return bundled_path
+
+    # Editable/source-tree installs do not apply Hatch's wheel force-include.
+    source_tree = Path(__file__).resolve().parents[2] / "extension"
+    if source_tree.is_dir():
+        return source_tree
+    raise RuntimeError("the chrome-bridge extension bundle is missing from this installation")
+
+
+def install_extension(destination: Path | None = None) -> Path:
+    """Copy the bundled unpacked extension to a stable, user-owned directory.
+
+    An existing destination is REPLACED, not merged over: leftover files from
+    an older bundle would otherwise linger and get loaded by Chrome alongside
+    the fresh copy.
+    """
+    target = destination or default_extension_dir()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(_bundled_extension_dir(), target)
+    return target
+
+
+@dataclass(frozen=True)
+class InstalledProfile:
+    launcher: Path
+    manifest: Path
+    extension_id: str
+
+
+def install_profile(
+    profile: str,
+    port: int,
+    *,
+    chrome_profile_directory: str,
+    extension_id: str,
+    artifacts_root: Path | None = None,
+    registry_path: Path | None = None,
+    python_executable: str | None = None,
+) -> InstalledProfile:
+    """Validate and install every native-host artifact for one profile."""
+    profiles_mod.validate_profile_name(profile)
+    profiles_mod.validate_port(port)
+    normalized_id = normalize_extension_id(extension_id)
+    # Pre-flight the port-conflict check so the common conflict fails BEFORE
+    # any artifact is written or registered. add_profile repeats it atomically
+    # under the registry lock as the race-safe final word.
+    registry = profiles_mod.load_registry(registry_path)
+    conflict = profiles_mod.find_port_conflict(profile, port, registry.profiles)
+    if conflict is not None:
+        raise profiles_mod.ProfileError(
+            f"port {port} is already used by profile {conflict!r}"
+        )
+
+    root = artifacts_root or default_install_dir()
+    launcher = write_launcher(
+        root,
+        profile,
+        port,
+        python_executable=python_executable,
+    )
+    manifest = write_manifest(root, profile, extension_ids=[normalized_id])
+    register_native_host(profile, manifest)
+    profiles_mod.add_profile(
+        profile,
+        port,
+        chrome_profile_directory=chrome_profile_directory,
+        extension_id=normalized_id,
+        path=registry_path,
+    )
+    return InstalledProfile(
+        launcher=launcher,
+        manifest=manifest,
+        extension_id=normalized_id,
+    )
 
 
 def launcher_path(project_root: Path, profile: str) -> Path:
@@ -55,15 +154,25 @@ def manifest_path(project_root: Path, profile: str) -> Path:
     return project_root / f"nmh-manifest.{profile}.local.json"
 
 
-def write_launcher(project_root: Path, profile: str, port: int) -> Path:
+def write_launcher(
+    project_root: Path,
+    profile: str,
+    port: int,
+    *,
+    python_executable: str | None = None,
+) -> Path:
     """Write the profile's launcher .bat with its port baked in.
 
     Written with CRLF line endings: cmd.exe can mis-parse a lone-LF batch file
     (a `setlocal`/label line can split mid-token) — see .gitattributes.
     """
     path = launcher_path(project_root, profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
     content = _LAUNCHER_TEMPLATE.format(
-        host_name=host_name(profile), profile=profile, port=port
+        host_name=host_name(profile),
+        profile=profile,
+        port=port,
+        python_executable=python_executable or sys.executable,
     )
     path.write_bytes(content.replace("\n", "\r\n").encode("utf-8"))
     return path
@@ -81,13 +190,14 @@ def write_manifest(
     """
     import json
 
+    normalized_ids = [normalize_extension_id(eid) for eid in extension_ids]
     path = manifest_path(project_root, profile)
     payload = {
         "name": host_name(profile),
         "description": f"Chrome Bridge Native Messaging host for profile {profile}",
         "path": str(launcher_path(project_root, profile)),
         "type": "stdio",
-        "allowed_origins": [f"chrome-extension://{eid}/" for eid in extension_ids],
+        "allowed_origins": [f"chrome-extension://{eid}/" for eid in normalized_ids],
     }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
@@ -130,6 +240,7 @@ def patch_allowed_origins(manifest_file: Path, extension_id: str) -> None:
     """Append ``extension_id`` to an existing manifest's allowed_origins, if absent."""
     import json
 
+    extension_id = normalize_extension_id(extension_id)
     data = json.loads(manifest_file.read_text(encoding="utf-8"))
     origin = f"chrome-extension://{extension_id}/"
     origins = data.setdefault("allowed_origins", [])

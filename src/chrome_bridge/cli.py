@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import socket
 import sys
-from pathlib import Path
 from typing import Optional
 
 import typer
@@ -20,7 +19,9 @@ app = typer.Typer(help="Drive your real, everyday Chrome from Python scripts.")
 profiles_app = typer.Typer(help="Manage registered Chrome profiles.")
 app.add_typer(profiles_app, name="profiles")
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# Kept as one overrideable root for tests; in production this is a stable,
+# user-owned data directory, never the source checkout or site-packages.
+_PROJECT_ROOT = install_mod.default_install_dir()
 
 
 @profiles_app.command("list")
@@ -151,34 +152,29 @@ def init(
         default=existing.chrome_profile_directory if existing else "Default",
     )
 
-    launcher = install_mod.write_launcher(_PROJECT_ROOT, profile, chosen_port)
-    typer.echo(f"Wrote launcher: {launcher}")
-
-    existing_ids = [existing.extension_id] if existing and existing.extension_id else []
-    manifest = install_mod.write_manifest(_PROJECT_ROOT, profile, extension_ids=existing_ids)
-    typer.echo(f"Wrote manifest: {manifest}")
-
-    install_mod.register_native_host(profile, manifest)
-    typer.echo(f"Registered native host {install_mod.host_name(profile)!r} in HKCU.")
+    extension_dir = install_mod.install_extension(_PROJECT_ROOT / "extension")
 
     typer.echo("")
     typer.echo("Now, in that Chrome profile's own window:")
     typer.echo("  1. Open chrome://extensions and enable Developer mode.")
-    typer.echo(f"  2. Click 'Load unpacked' and select: {_PROJECT_ROOT / 'extension'}")
+    typer.echo(f"  2. Click 'Load unpacked' and select: {extension_dir}")
     typer.echo("  3. Note the extension ID shown on its card.")
     typer.echo("  4. Open the extension's 'Details' -> 'Extension options' page")
     typer.echo(f"     and set the profile name to: {profile}")
-    extension_id = typer.prompt("Paste the extension ID here")
-
-    install_mod.patch_allowed_origins(manifest, extension_id)
-    typer.echo(f"Patched allowed_origins in {manifest}.")
+    pasted_extension_id = typer.prompt("Paste the extension ID here")
+    try:
+        extension_id = install_mod.normalize_extension_id(pasted_extension_id)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
 
     try:
-        profiles_mod.add_profile(
+        installed = install_mod.install_profile(
             profile,
             chosen_port,
             chrome_profile_directory=chrome_profile_dir,
             extension_id=extension_id,
+            artifacts_root=_PROJECT_ROOT,
         )
     except profiles_mod.ProfileError as exc:
         # Registry changed while init was waiting on the prompts above.
@@ -190,6 +186,9 @@ def init(
             err=True,
         )
         raise typer.Exit(code=1) from exc
+    typer.echo(f"Wrote launcher: {installed.launcher}")
+    typer.echo(f"Wrote manifest: {installed.manifest}")
+    typer.echo(f"Registered native host {install_mod.host_name(profile)!r} in HKCU.")
     typer.echo(f"Saved profile {profile!r} to the registry.")
     typer.echo("")
     typer.echo("Reload the extension in chrome://extensions, then verify with:")
@@ -378,4 +377,3 @@ def eval_(
 
 if __name__ == "__main__":
     app()
-

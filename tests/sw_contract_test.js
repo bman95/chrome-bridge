@@ -6,6 +6,7 @@ const debuggerEvents = [];
 const debuggerDetaches = [];
 const storageChanges = [];
 const alarmEvents = [];
+const createdAlarms = [];
 const removed = [];
 const detached = [];
 const sent = [];
@@ -26,7 +27,7 @@ global.chrome = {
     onInstalled: { addListener: () => {} },
   },
   alarms: {
-    create: () => {},
+    create: (name, options) => { createdAlarms.push({ name, options }); },
     onAlarm: { addListener: (fn) => alarmEvents.push(fn) },
   },
   tabs: {
@@ -55,6 +56,10 @@ const source = fs.readFileSync(
 );
 const tests = String.raw`
 (async () => {
+  // An unconfigured worker must not install a periodic alarm that wakes it
+  // forever. A one-shot reconnect alarm is still installed after a real
+  // native-host disconnect/failure later in this contract.
+  assert.equal(createdAlarms.some(({ options }) => options.periodInMinutes), false);
   const replies = [];
   const fakePort = {
     bridgeHostName: "com.chromebridge.bridge.personal",
@@ -431,6 +436,22 @@ const tests = String.raw`
   receive({ id: id(4, 2), op: "unknown-second" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(chainedReplies.at(-1).id[2], 2);
+
+  // A successful dial arms the one-shot eviction net: an eviction while the
+  // port is healthy fires no onDisconnect, so a pending alarm must already
+  // exist or nothing ever re-spins the worker. Firing the alarm with the
+  // port up must RE-arm it (the net stands while configured) and must never
+  // create a periodic alarm.
+  assert.ok(
+    createdAlarms.some(
+      ({ name, options }) => name === "reconnect" && options.delayInMinutes
+    )
+  );
+  const armedBefore = createdAlarms.length;
+  alarmEvents[0]({ name: "reconnect" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(createdAlarms.length > armedBefore);
+  assert.equal(createdAlarms.some(({ options }) => options.periodInMinutes), false);
 
   // --- Per-tab pipelining (issue #19): ops with an explicit tabId run on
   // per-tab chains — same-tab FIFO, cross-tab interleave — while

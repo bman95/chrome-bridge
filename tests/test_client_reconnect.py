@@ -292,6 +292,23 @@ def test_reconnect_redials_and_reattaches_on_last_url(rbridge):
         cdp.close()
 
 
+def test_connect_redials_after_peer_eof_without_explicit_reconnect(rbridge):
+    cdp = _client(rbridge)
+    try:
+        cdp.open("https://example.com/before-eof", timeout=0.3)
+        rbridge.drop()
+        _wait(lambda: not cdp.is_alive())
+
+        cdp.connect()
+
+        assert cdp.is_alive()
+        assert rbridge.connections() == 2
+        assert rbridge.opens == 2
+        assert cdp.banner_present("body") is True
+    finally:
+        cdp.close()
+
+
 def test_primitive_auto_reconnects_after_socket_death(rbridge):
     # The core acceptance path: after a worker eviction (socket death), the NEXT
     # primitive transparently rebuilds the connection and resumes — no human

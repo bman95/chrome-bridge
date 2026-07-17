@@ -430,6 +430,7 @@ def test_accept_client_binds_loopback_and_accepts():
     result: dict[str, object] = {}
 
     listener = nmh._bind_listener(host, port)
+    assert listener.gettimeout() is None
 
     def server_thread():
         client, rfile, wfile = nmh._accept_client(listener)
@@ -449,6 +450,39 @@ def test_accept_client_binds_loopback_and_accepts():
     client.close()
     result["client"].close()  # type: ignore[union-attr]
     listener.close()
+
+
+def test_wake_listener_pokes_blocked_accept():
+    listener = nmh._bind_listener("127.0.0.1", _free_port())
+    woken = threading.Event()
+
+    def blocked_accept():
+        try:
+            conn, _addr = listener.accept()
+            conn.close()
+        except OSError:
+            pass
+        woken.set()
+
+    t = threading.Thread(target=blocked_accept, daemon=True)
+    t.start()
+    nmh._wake_listener(listener)
+    assert woken.wait(5.0)
+    listener.close()
+
+
+def test_wake_listener_closes_listener_when_wake_connect_fails(monkeypatch):
+    # If the wake connection cannot be made, closing the listener is the
+    # fallback that unblocks accept — otherwise the host lingers forever
+    # after Chrome closed the extension pipe.
+    listener = nmh._bind_listener("127.0.0.1", _free_port())
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("wake connect refused")
+
+    monkeypatch.setattr(nmh.socket, "create_connection", refuse)
+    nmh._wake_listener(listener)
+    assert listener.fileno() == -1  # closed
 
 
 def _free_port() -> int:

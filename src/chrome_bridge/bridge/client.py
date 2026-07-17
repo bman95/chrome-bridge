@@ -96,7 +96,6 @@ Concurrency / failure model:
 from __future__ import annotations
 
 import itertools
-import json
 import logging
 import os
 import socket
@@ -107,6 +106,8 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from typing import Any, BinaryIO
 
+from . import page_primitives
+from .event_dispatch import EventCallback, EventDispatcher
 from .frames import FrameError, read_frame, write_frame
 
 log = logging.getLogger(__name__)
@@ -163,16 +164,6 @@ class DetachedError(BridgeError):
     """The debugger detached from the tab (target closed, DevTools opened, SW evicted)."""
 
 
-def _js_string(value: str) -> str:
-    """Embed ``value`` as a safe JS string literal inside a Runtime.evaluate expr.
-
-    ``json.dumps`` produces a valid double-quoted JS string literal with all
-    quotes/backslashes/control chars escaped, which keeps selectors and search
-    text from breaking out of the expression.
-    """
-    return json.dumps(value)
-
-
 def _endpoint() -> tuple[str, int]:
     host = os.getenv("CBR_BRIDGE_HOST", DEFAULT_HOST)
     try:
@@ -184,11 +175,12 @@ def _endpoint() -> tuple[str, int]:
 
 def _fire_listeners(
     lock: threading.Lock,
-    listeners_by_method: dict[str, list],
+    listeners_by_method: dict[str, list[EventCallback]],
+    dispatcher: EventDispatcher,
     method: str,
     params: dict[str, Any],
 ) -> None:
-    """Invoke every listener registered for ``method`` with ``params``.
+    """Queue every listener registered for ``method`` with ``params``.
 
     Shared by the connection-wide bus (:meth:`ChromeBridge.on_event`) and the
     per-tab buses (:meth:`Tab.on_event`). Listeners are snapshotted under
@@ -197,11 +189,7 @@ def _fire_listeners(
     """
     with lock:
         listeners = list(listeners_by_method.get(method, ()))
-    for cb in listeners:
-        try:
-            cb(params)
-        except Exception:  # noqa: BLE001 — a bad listener must not kill the reader
-            log.exception("chrome-bridge: event listener for %s raised", method)
+    dispatcher.submit(listeners, method, params)
 
 
 class _RWLock:
@@ -344,6 +332,10 @@ class ChromeBridge:
         ``CBR_BRIDGE_PORT`` environment variables are used; otherwise the
         module defaults (``127.0.0.1:8765``).
         """
+        if profile is not None and (host is not None or port is not None):
+            raise ValueError(
+                "profile cannot be combined with an explicit host or port"
+            )
         # Remembered for the auth handshake: a named profile maps straight to its
         # token file; a host/port-only client resolves the token by port instead.
         self._profile = profile
@@ -362,8 +354,8 @@ class ChromeBridge:
         self._op_timeout = op_timeout
 
         self._sock: socket.socket | None = None
-        self._rfile = None
-        self._wfile = None
+        self._rfile: BinaryIO | None = None
+        self._wfile: BinaryIO | None = None
 
         self._ids = itertools.count(1)
         self._pending: dict[int, Future[dict[str, Any]]] = {}
@@ -373,6 +365,7 @@ class ChromeBridge:
         # everything that iterates _pending keeps seeing bare futures. Guarded
         # by _lock; entries live and die with their _pending twin.
         self._pending_tab: dict[int, int | None] = {}
+        self._pending_by_tab: dict[int, set[int]] = {}
         self._lock = threading.Lock()        # guards _pending + the write side
         # Connection-level ordering lock. Ordinary per-tab op round-trips hold
         # its SHARED side (plus their own Tab._op_lock — see Tab), so ops on
@@ -395,7 +388,8 @@ class ChromeBridge:
         # Connection-wide event bus: raw CDP events keyed by method name. Each
         # callback gets the event params dict, for EVERY tab's events (per-tab
         # routing lives on Tab.on_event).
-        self._event_listeners: dict[str, list] = {}
+        self._event_listeners: dict[str, list[EventCallback]] = {}
+        self._event_dispatcher = EventDispatcher()
 
         # tabId -> reason for targeted "detached" events that matched no handle
         # when the reader processed them. The one legitimate producer is a
@@ -412,6 +406,7 @@ class ChromeBridge:
         # facade; new_tab() appends. Guarded by _lock.
         self._default_tab = Tab(self, is_default=True)
         self._tabs: list[Tab] = [self._default_tab]
+        self._tabs_by_id: dict[int, Tab] = {}
 
     # ------------------------------------------------------------------ #
     # Legacy single-tab introspection (delegates to the default tab).
@@ -444,6 +439,25 @@ class ChromeBridge:
     # ------------------------------------------------------------------ #
 
     def connect(self) -> None:
+        """Connect unless a live connection already exists.
+
+        A socket object left behind by a reader that observed peer EOF is not
+        a live connection. Tear that stale generation down before dialing.
+        """
+        with self._conn_lock.exclusive():
+            if self.is_alive():
+                return
+            if self._sock is not None:
+                # A peer-EOF socket may still have attached tab handles. Use
+                # the full recovery path so a direct public connect() cannot
+                # make the transport live while leaving those handles stale.
+                self._reconnect_locked()
+                return
+            if self._event_dispatcher.is_closed:
+                self._event_dispatcher = EventDispatcher()
+            self._connect_locked()
+
+    def _connect_locked(self) -> None:
         """Dial the bridge loopback socket, authenticate, and start the reader.
 
         Idempotent: a no-op if already connected. Safe to call again after a
@@ -465,8 +479,6 @@ class ChromeBridge:
         on the first op ("bridge reader stopped") — reconnecting re-reads the
         fresh token and heals it.
         """
-        if self._sock is not None:
-            return
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self._connect_timeout)
         try:
@@ -768,6 +780,7 @@ class ChromeBridge:
         ever opened/attached.
         """
         if self._sock is None:
+            self._stop_event_dispatcher()
             return
         # Session teardown is a tab-lifecycle op: the exclusive grip waits out
         # (and then excludes) every in-flight per-tab op, so the close ops and
@@ -796,12 +809,13 @@ class ChromeBridge:
                         )
                     except BridgeError as exc:
                         log.debug("chrome-bridge close op failed (ignored): %s", exc)
-                tab.tab_id = None
+                self._set_tab_id(tab, None)
                 tab._owned = False
                 tab.current_url = None
                 tab._dead_reason = None  # explicit teardown supersedes a dead mark
             self._retire_extra_tabs()
             self._teardown_socket()
+        self._stop_event_dispatcher()
 
     def detach(self) -> None:
         """End the session, always leaving the tabs open, then drop the socket.
@@ -815,6 +829,7 @@ class ChromeBridge:
         should be removed.
         """
         if self._sock is None:
+            self._stop_event_dispatcher()
             return
         # Same lifecycle-op exclusion, shared teardown budget, and id-snapshot
         # rationale as close().
@@ -833,12 +848,18 @@ class ChromeBridge:
                         )
                     except BridgeError as exc:
                         log.debug("chrome-bridge detach op failed (ignored): %s", exc)
-                tab.tab_id = None
+                self._set_tab_id(tab, None)
                 tab._owned = False
                 tab.current_url = None
                 tab._dead_reason = None  # explicit teardown supersedes a dead mark
             self._retire_extra_tabs()
             self._teardown_socket()
+        self._stop_event_dispatcher()
+
+    def _stop_event_dispatcher(self) -> None:
+        dispatcher = self._event_dispatcher
+        dispatcher.close()
+        dispatcher.join(timeout=min(self._op_timeout, 1.0))
 
     def _teardown_socket(self) -> None:
         """Drop the socket + reader without issuing a tab-close op.
@@ -958,6 +979,7 @@ class ChromeBridge:
             pending = list(self._pending.items())
             self._pending.clear()
             self._pending_tab.clear()
+            self._pending_by_tab.clear()
         exc = BridgeError("bridge reader stopped")
         for _id, fut in pending:
             if not fut.done():
@@ -978,7 +1000,7 @@ class ChromeBridge:
         with self._lock:
             fut = self._pending.pop(msg_id, None) if msg_id is not None else None
             if msg_id is not None:
-                self._pending_tab.pop(msg_id, None)
+                self._remove_pending_tab_index_locked(msg_id)
         if fut is None:
             log.debug("chrome-bridge: reply for unknown id %r (dropped)", msg_id)
             return
@@ -1012,7 +1034,8 @@ class ChromeBridge:
                 if tab_id is None:
                     targets = list(self._tabs)
                 else:
-                    targets = [t for t in self._tabs if t.tab_id == tab_id]
+                    target = self._tabs_by_id.get(tab_id)
+                    targets = [target] if target is not None else []
                     if not targets:
                         # No handle has published this tabId (yet): an
                         # open/attach reply may still be crossing the op
@@ -1054,9 +1077,11 @@ class ChromeBridge:
             with self._lock:
                 if generation != self._generation:
                     return  # stale reader: never route into the fresh connection
-                targets = [
-                    t for t in self._tabs if tab_id is None or t.tab_id == tab_id
-                ]
+                if tab_id is None:
+                    targets = list(self._tabs)
+                else:
+                    target = self._tabs_by_id.get(tab_id)
+                    targets = [target] if target is not None else []
             if tab_id is not None and not targets:
                 # A tabId no live handle has published: a late event from a
                 # tab that already detached (or a pre-eviction session whose
@@ -1083,7 +1108,13 @@ class ChromeBridge:
                 tab._fire(method, params)
 
     def _fire(self, method: str, params: dict[str, Any]) -> None:
-        _fire_listeners(self._lock, self._event_listeners, method, params)
+        _fire_listeners(
+            self._lock,
+            self._event_listeners,
+            self._event_dispatcher,
+            method,
+            params,
+        )
 
     def _fail_all_pending(self, exc: Exception) -> None:
         """Resolve every pending future with ``exc`` so blocked callers wake."""
@@ -1091,6 +1122,7 @@ class ChromeBridge:
             pending = list(self._pending.items())
             self._pending.clear()
             self._pending_tab.clear()
+            self._pending_by_tab.clear()
         for _id, fut in pending:
             if not fut.done():
                 fut.set_exception(exc)
@@ -1102,7 +1134,7 @@ class ChromeBridge:
         tabs (or tab-less ops) keep awaiting their replies.
         """
         with self._lock:
-            ids = [i for i, t in self._pending_tab.items() if t == tab_id]
+            ids = list(self._pending_by_tab.pop(tab_id, ()))
             pending = [
                 (i, self._pending.pop(i)) for i in ids if i in self._pending
             ]
@@ -1112,11 +1144,21 @@ class ChromeBridge:
             if not fut.done():
                 fut.set_exception(exc)
 
+    def _remove_pending_tab_index_locked(self, msg_id: int) -> None:
+        tab_id = self._pending_tab.pop(msg_id, None)
+        if tab_id is None:
+            return
+        ids = self._pending_by_tab.get(tab_id)
+        if ids is not None:
+            ids.discard(msg_id)
+            if not ids:
+                self._pending_by_tab.pop(tab_id, None)
+
     # ------------------------------------------------------------------ #
     # Event bus (public, connection-wide)
     # ------------------------------------------------------------------ #
 
-    def on_event(self, method: str, callback) -> None:
+    def on_event(self, method: str, callback: EventCallback) -> None:
         """Register ``callback(params)`` for a raw CDP event ``method``.
 
         Connection-wide: fires for the matching events of EVERY attached tab
@@ -1126,11 +1168,17 @@ class ChromeBridge:
         notes on stale events). Use ``"__detached__"`` to observe debugger
         detach (``params`` has ``reason``, plus ``tabId`` when the event was
         tagged with one).
+
+        Delivery is ASYNCHRONOUS: callbacks run on a dedicated dispatcher
+        thread, in wire order, decoupled from the reader — so a callback may
+        safely issue bridge ops, but it is NOT guaranteed to have run by the
+        time the op that triggered the event returns. Synchronize on state
+        the callback sets (an ``Event``, a queue), never on op completion.
         """
         with self._lock:
             self._event_listeners.setdefault(method, []).append(callback)
 
-    def off_event(self, method: str, callback) -> None:
+    def off_event(self, method: str, callback: EventCallback) -> None:
         with self._lock:
             listeners = self._event_listeners.get(method)
             if listeners and callback in listeners:
@@ -1182,11 +1230,13 @@ class ChromeBridge:
                     raise BridgeError("bridge is not connected")
                 self._pending[msg_id] = fut
                 self._pending_tab[msg_id] = tab_id
+                if tab_id is not None:
+                    self._pending_by_tab.setdefault(tab_id, set()).add(msg_id)
                 try:
                     write_frame(self._wfile, frame)
                 except (FrameError, OSError, ValueError) as exc:
                     self._pending.pop(msg_id, None)
-                    self._pending_tab.pop(msg_id, None)
+                    self._remove_pending_tab_index_locked(msg_id)
                     raise BridgeError(
                         f"failed to send op {payload.get('op')}: {exc}"
                     ) from exc
@@ -1195,7 +1245,7 @@ class ChromeBridge:
             except FutureTimeoutError as exc:
                 with self._lock:
                     self._pending.pop(msg_id, None)
-                    self._pending_tab.pop(msg_id, None)
+                    self._remove_pending_tab_index_locked(msg_id)
                 raise BridgeTimeoutError(
                     f"timed out after {timeout:.0f}s awaiting reply to "
                     f"{payload.get('op')} (id={msg_id})"
@@ -1256,6 +1306,7 @@ class ChromeBridge:
                         cleanup_exc,
                     )
             with self._lock:
+                self._set_tab_id_locked(tab, None)
                 if tab in self._tabs:
                     self._tabs.remove(tab)
             raise
@@ -1265,6 +1316,18 @@ class ChromeBridge:
         """True when any OTHER registered handle currently holds an attached tab."""
         with self._lock:
             return any(t is not tab and t.tab_id is not None for t in self._tabs)
+
+    def _set_tab_id(self, tab: Tab, tab_id: int | None) -> None:
+        with self._lock:
+            self._set_tab_id_locked(tab, tab_id)
+
+    def _set_tab_id_locked(self, tab: Tab, tab_id: int | None) -> None:
+        old_id = tab.tab_id
+        if old_id is not None and self._tabs_by_id.get(old_id) is tab:
+            self._tabs_by_id.pop(old_id, None)
+        tab.tab_id = tab_id
+        if tab_id is not None:
+            self._tabs_by_id[tab_id] = tab
 
     def _retire_extra_tabs(self) -> None:
         """Permanently retire every non-default handle and reset the registry.
@@ -1282,6 +1345,11 @@ class ChromeBridge:
                 if tab is not self._default_tab:
                     tab._handle_closed = True
             self._tabs = [self._default_tab]
+            self._tabs_by_id = (
+                {self._default_tab.tab_id: self._default_tab}
+                if self._default_tab.tab_id is not None
+                else {}
+            )
 
     def _mark_other_tabs_detached(self, keep: Tab) -> None:
         """Mark every handle except ``keep`` detached.
@@ -1495,7 +1563,7 @@ class Tab:
         self._op_lock = threading.RLock()
         # Per-tab event bus: raw CDP events routed to this tab by tabId, plus
         # "__detached__". Guarded by the bridge's _lock.
-        self._event_listeners: dict[str, list] = {}
+        self._event_listeners: dict[str, list[EventCallback]] = {}
 
     # ------------------------------------------------------------------ #
     # Handle lifecycle
@@ -1536,7 +1604,7 @@ class Tab:
                     )
                 except BridgeError as exc:
                     log.debug("chrome-bridge tab close op failed (ignored): %s", exc)
-            self.tab_id = None
+            bridge._set_tab_id(self, None)
             self._owned = False
             self.current_url = None
             # Unregister so events stop routing here and the handle can be GC'd.
@@ -1551,7 +1619,7 @@ class Tab:
     def _mark_detached(self) -> None:
         """Record that this tab's attachment is gone (its tab may be too)."""
         self._detached.set()
-        self.tab_id = None
+        self._bridge._set_tab_id(self, None)
         self._owned = False
 
     def _reopen_replace(self) -> bool | None:
@@ -1588,25 +1656,35 @@ class Tab:
     # Per-tab event bus
     # ------------------------------------------------------------------ #
 
-    def on_event(self, method: str, callback) -> None:
+    def on_event(self, method: str, callback: EventCallback) -> None:
         """Register ``callback(params)`` for THIS tab's raw CDP event ``method``.
 
         Fires for events the extension tagged with this tab's ``tabId`` (and,
         for compatibility with single-tab-era peers, untagged events, which
         are broadcast to every handle). Use ``"__detached__"`` to observe this
         tab's debugger detach (``params`` has ``reason``).
+
+        Delivery is ASYNCHRONOUS — see :meth:`ChromeBridge.on_event`:
+        callbacks run on the dispatcher thread in wire order, may issue
+        bridge ops, and may lag the op that triggered the event.
         """
         with self._bridge._lock:
             self._event_listeners.setdefault(method, []).append(callback)
 
-    def off_event(self, method: str, callback) -> None:
+    def off_event(self, method: str, callback: EventCallback) -> None:
         with self._bridge._lock:
             listeners = self._event_listeners.get(method)
             if listeners and callback in listeners:
                 listeners.remove(callback)
 
     def _fire(self, method: str, params: dict[str, Any]) -> None:
-        _fire_listeners(self._bridge._lock, self._event_listeners, method, params)
+        _fire_listeners(
+            self._bridge._lock,
+            self._event_listeners,
+            self._bridge._event_dispatcher,
+            method,
+            params,
+        )
 
     # ------------------------------------------------------------------ #
     # Low-level per-tab ops
@@ -1817,7 +1895,7 @@ class Tab:
         with bridge._lock:
             reason = bridge._undispatched_detaches.pop(tab_id, None)
             if reason is None:
-                self.tab_id = tab_id
+                bridge._set_tab_id_locked(self, tab_id)
         if reason is not None:
             self._detached.set()
             # The connection-wide bus already fired at event time; this tab's
@@ -1987,7 +2065,7 @@ class Tab:
         :class:`BridgeTimeoutError` if it never does within ``timeout``.
         Mirrors Playwright's ``page.wait_for_selector``.
         """
-        expr = f"document.querySelector({_js_string(selector)})!==null"
+        expr = page_primitives.selector_present(selector)
         deadline = time.monotonic() + timeout
 
         def _expired() -> bool:
@@ -2048,11 +2126,7 @@ class Tab:
         an empty string. Mirrors Playwright ``page.content()`` but scoped to
         whatever subtree the caller actually needs.
         """
-        sel = _js_string(container)
-        expr = (
-            f"(function(){{var e=document.querySelector({sel});"
-            "return e?e.outerHTML:document.documentElement.outerHTML;}})()"
-        )
+        expr = page_primitives.outer_html(container)
         self._ensure_attached()
         html = self._evaluate(expr, timeout=timeout)
         return html if isinstance(html, str) else ""
@@ -2125,64 +2199,16 @@ class Tab:
         deepest-match rule still applies, so the click lands on the innermost
         element containing the phrase, never an outer wrapper.
         """
-        wanted = _js_string(text)
-        tag_filter = _js_string(tag.lower()) if tag else "null"
-        match_fn = (
-            "function match(s){return norm(s).toLowerCase().indexOf(target)!==-1;}"
-            if contains
-            else "function match(s){return norm(s)===target;}"
-        )
-        # In substring mode target is lowercased once so each compare is cheap.
-        target_expr = (
-            "norm(wanted).toLowerCase()" if contains else "norm(wanted)"
-        )
-        expr = (
-            "(function(){"
-            f"var wanted={wanted};var tag={tag_filter};"
-            "function norm(s){return (s||'').replace(/\\s+/g,' ').trim();}"
-            f"{match_fn}"
-            f"var target={target_expr};"
-            "var els=document.querySelectorAll(tag?tag:'*');"
-            "var best=null;"
-            "for(var i=0;i<els.length;i++){var el=els[i];"
-            "if(!match(el.textContent))continue;"
-            "var inner=el.querySelectorAll(tag?tag:'*');var wrapper=false;"
-            "for(var j=0;j<inner.length;j++){"
-            "if(match(inner[j].textContent)){wrapper=true;break;}}"
-            "if(wrapper)continue;"
-            "best=el;break;}"
-            "if(!best)return null;return __cbCenter(best);})()"
-        )
-        return self._eval_center(self._center_helper() + expr, timeout=timeout)
+        expr = page_primitives.text_center(text, tag=tag, contains=contains)
+        return self._eval_center(expr, timeout=timeout)
 
     def _selector_center(
         self, selector: str, *, timeout: float | None
     ) -> tuple[float, float] | None:
         """Return the viewport-centre (x, y) of the first visible element
         matching ``selector``, or ``None`` if absent / not visible."""
-        sel = _js_string(selector)
-        expr = (
-            "(function(){"
-            f"var el=document.querySelector({sel});"
-            "if(!el)return null;return __cbCenter(el);})()"
-        )
-        return self._eval_center(self._center_helper() + expr, timeout=timeout)
-
-    @staticmethod
-    def _center_helper() -> str:
-        """JS prelude defining ``__cbCenter(el)`` -> visible centre or null.
-
-        Shared by text- and selector-based clicks so visibility and centring are
-        computed identically. Returns ``null`` for zero-area or
-        ``display:none``/``visibility:hidden`` elements.
-        """
-        return (
-            "var __cbCenter=function(el){"
-            "var r=el.getBoundingClientRect();"
-            "if(r.width===0||r.height===0)return null;"
-            "var s=window.getComputedStyle(el);"
-            "if(s.visibility==='hidden'||s.display==='none')return null;"
-            "return {x:r.left+r.width/2,y:r.top+r.height/2};};"
+        return self._eval_center(
+            page_primitives.selector_center(selector), timeout=timeout
         )
 
     def _eval_center(
@@ -2210,13 +2236,7 @@ class Tab:
         (with a ``textContent`` fallback) is used so it reflects the rendered
         text a user would actually see.
         """
-        sel = _js_string(selector)
-        expr = (
-            "(function(){"
-            f"var el=document.querySelector({sel});"
-            "if(!el)return null;"
-            "return (el.innerText||el.textContent||'').trim();})()"
-        )
+        expr = page_primitives.query_text(selector)
         self._ensure_attached()
         value = self._evaluate(expr, timeout=timeout)
         return value if isinstance(value, str) else None
@@ -2229,14 +2249,7 @@ class Tab:
 
         Mirrors Playwright ``locator(selector).get_attribute(name)``.
         """
-        sel = _js_string(selector)
-        attr = _js_string(name)
-        expr = (
-            "(function(){"
-            f"var el=document.querySelector({sel});"
-            "if(!el)return null;"
-            f"return el.getAttribute({attr});}})()"
-        )
+        expr = page_primitives.get_attribute(selector, name)
         self._ensure_attached()
         value = self._evaluate(expr, timeout=timeout)
         return value if isinstance(value, str) else None
@@ -2290,13 +2303,7 @@ class Tab:
 
         Mirrors Playwright ``locator(selector).input_value()``.
         """
-        sel = _js_string(selector)
-        expr = (
-            "(function(){"
-            f"var el=document.querySelector({sel});"
-            "if(!el)return null;"
-            "return el.value==null?'':String(el.value);})()"
-        )
+        expr = page_primitives.input_value(selector)
         self._ensure_attached()
         value = self._evaluate(expr, timeout=timeout)
         return value if isinstance(value, str) else None
@@ -2313,18 +2320,7 @@ class Tab:
         element, replaces its value, and dispatches the events most forms
         listen for before accepting the value.
         """
-        sel = _js_string(selector)
-        val = _js_string(text)
-        expr = (
-            "(function(){"
-            f"var el=document.querySelector({sel});"
-            "if(!el)return false;"
-            "el.focus();"
-            f"el.value={val};"
-            "el.dispatchEvent(new Event('input',{bubbles:true}));"
-            "el.dispatchEvent(new Event('change',{bubbles:true}));"
-            "return true;})()"
-        )
+        expr = page_primitives.fill(selector, text)
         self._ensure_attached()
         return bool(self._evaluate(expr, timeout=timeout))
 
@@ -2358,7 +2354,7 @@ class Tab:
         a confirmation/captcha banner or any other transient element. Mirrors a
         Playwright ``locator.count()>0`` style check.
         """
-        expr = f"!!document.querySelector({_js_string(selector)})"
+        expr = page_primitives.banner_present(selector)
         self._ensure_attached()
         return bool(self._evaluate(expr, timeout=timeout))
 

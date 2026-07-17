@@ -182,13 +182,17 @@
 
 const NATIVE_HOST_PREFIX = "com.chromebridge.bridge";
 const CDP_PROTOCOL_VERSION = "1.3";
-const KEEPALIVE_ALARM = "ka";
-// One-shot alarm to re-dial soon after the port drops while idle. Alarms are
-// the ONLY timer that survives a service-worker eviction (a setTimeout dies
-// with the worker), and chrome.alarms clamps packed extensions to a 1-minute
-// minimum — so this cannot beat the ~30 s idle eviction, but it shortens the
-// gap before the next reconnect attempt versus waiting on the periodic alarm
-// alone. The client side (ChromeBridge.reconnect) re-dials the loopback and
+// One-shot alarm with two jobs: re-dial soon after the port drops, and act as
+// the standing EVICTION NET while the port is healthy. Alarms are the ONLY
+// timer that survives a service-worker eviction (a setTimeout dies with the
+// worker), and an eviction that happens while the port is CONNECTED fires no
+// onDisconnect (the worker is already gone) — so a pending alarm must exist at
+// all times while configured, or nothing ever re-spins the worker unattended.
+// dial() arms it on success and the alarm handler re-arms it while the port is
+// up; the chain dies only on the unconfigured stand-down, so an extension that
+// was never configured is never woken. chrome.alarms clamps packed extensions
+// to a 1-minute minimum, so recovery is "within about a minute", not instant.
+// The client side (ChromeBridge.reconnect) re-dials the loopback and
 // re-attaches the moment this brings the host back, so resume needs no human.
 const RECONNECT_ALARM = "reconnect";
 const RELAY_SESSION_ID_MARKER = "chrome-bridge-session";
@@ -333,8 +337,7 @@ async function dial() {
     p = chrome.runtime.connectNative(hostName);
   } catch (e) {
     // Host not registered / not launchable; nothing to relay to. Schedule a
-    // retry so a transient launch failure (e.g. uv still warming the venv)
-    // self-heals rather than wedging until the periodic keepalive alarm.
+    // retry so a transient launch failure self-heals instead of wedging.
     scheduleReconnect();
     return;
   }
@@ -365,11 +368,15 @@ async function dial() {
       enqueueGlobal(run);
     }
   });
+  // Arm the eviction net (see RECONNECT_ALARM): from here on the worker can
+  // be evicted with a healthy port and no onDisconnect will ever run, so a
+  // pending one-shot alarm is the only unattended path back.
+  scheduleReconnect();
   p.onDisconnect.addListener(() => {
     // chrome.runtime.lastError is set here when the host died/was missing
     // (e.g. the worker was evicted and the native host Chrome spawned exited).
     // Drop the reference and schedule a near-term re-dial so the bridge comes
-    // back without waiting for the next periodic keepalive tick. Only this
+    // back unattended. Only this
     // port's owner may clear the global: if `port` already points elsewhere
     // (we were deliberately replaced, e.g. profile rename), leave it alone.
     if (port === p) {
@@ -773,20 +780,18 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // connected, message traffic on it resets the idle timer, so an active job
 // (Python <-> extension chatter) keeps the worker alive on its own.
 //
-// The alarm is only a coarse RECONNECT poke for when the port has dropped while
-// idle. NOTE: chrome.alarms enforces a 1-minute minimum period for packed
-// extensions (values < 1 are clamped up; unpacked/dev builds allow shorter but
-// warn), so this fires at most ~once a minute — it cannot by itself beat the
-// ~30 s idle eviction. That is fine: the port (not the alarm) is what holds the
-// worker during work; the alarm just re-establishes the port after an idle gap.
-chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  // Both the periodic keepalive and the one-shot post-drop reconnect just
-  // re-dial if the port is down (connect() no-ops when it is already up). The
-  // alarm handler firing is also what re-spins an evicted worker, so this is
-  // the path that brings the bridge back unattended after eviction.
-  if (alarm.name === KEEPALIVE_ALARM || alarm.name === RECONNECT_ALARM) {
-    connect();
+  // The one-shot alarm exists only for a CONFIGURED extension: dial() arms it
+  // on success (the eviction net) and the failure/disconnect paths arm it as
+  // the retry. Re-arm here while the port is up so a pending alarm exists at
+  // all times once configured — if the worker is later evicted with a healthy
+  // port (no onDisconnect ever fires), this alarm is what re-spins it. When
+  // the port is down after connect(), dial()'s own paths decide: host-missing
+  // schedules the retry, the unconfigured stand-down deliberately does not.
+  if (alarm.name === RECONNECT_ALARM) {
+    connect().then(() => {
+      if (port) scheduleReconnect();
+    });
   }
 });
 

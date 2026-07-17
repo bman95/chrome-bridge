@@ -77,6 +77,15 @@ def test_read_frame_invalid_json_raises():
         read_frame(io.BytesIO(frame))
 
 
+@pytest.mark.parametrize("value", [None, [], "text", 42, True])
+def test_read_frame_rejects_json_values_that_are_not_objects(value):
+    body = json.dumps(value).encode("utf-8")
+    frame = struct.pack("<I", len(body)) + body
+
+    with pytest.raises(FrameError, match="JSON object"):
+        read_frame(io.BytesIO(frame))
+
+
 def test_read_frame_allows_frame_over_chrome_cap_but_under_read_guard():
     # A frame between the 1 MB Chrome cap and the read guard is read normally;
     # the write side, not the read side, enforces the Chrome cap.
@@ -105,6 +114,24 @@ def test_write_frame_oversize_does_not_emit_partial():
     with pytest.raises(FrameError):
         write_frame(buf, {"html": "x" * (MAX_MESSAGE_BYTES + 1)})
     assert buf.getvalue() == b""  # nothing written -> stream stays aligned
+
+
+def test_write_frame_streams_prefix_and_body_without_combining_them():
+    class RecordingStream(io.BytesIO):
+        def __init__(self):
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data):
+            self.writes.append(data)
+            return super().write(data)
+
+    stream = RecordingStream()
+    write_frame(stream, {"ok": True})
+
+    assert len(stream.writes) == 2
+    assert len(stream.writes[0]) == 4
+    assert json.loads(stream.writes[1]) == {"ok": True}
 
 
 def test_encode_frame_uncapped_allows_body_over_chrome_cap():

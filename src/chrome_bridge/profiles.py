@@ -14,9 +14,15 @@ records where to find an already-running profile's bridge.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
+import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 DEFAULT_BASE_PORT = 8765
 MAX_PORT = 65535
@@ -24,7 +30,7 @@ MAX_PORT = 65535
 # Matches the same rule extension/options.js enforces client-side: the name
 # becomes part of a native-messaging host name and of generated filenames,
 # both picky about characters.
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 
 
 class ProfileError(ValueError):
@@ -46,10 +52,10 @@ class _Registry:
 
 
 def validate_profile_name(name: str) -> None:
-    if not _NAME_RE.match(name):
+    if not _NAME_RE.fullmatch(name):
         raise ProfileError(
             f"invalid profile name {name!r}: use lowercase letters, digits, "
-            "hyphens, or underscores, starting with a letter or digit"
+            "or underscores, starting with a letter or digit"
         )
 
 
@@ -136,6 +142,13 @@ def load_registry(path: Path | None = None) -> _Registry:
     raises :class:`ProfileError`, never a raw ``json``/``TypeError``/
     ``AttributeError``: callers that must degrade gracefully (the token-path
     resolution in the host and client) catch one well-known error type.
+
+    Entries whose NAME fails today's validation (e.g. hyphenated names written
+    by an older version — Chrome rejects hyphens in native-messaging host
+    names, so they never worked) are SKIPPED with a warning rather than
+    raised: raising would brick every profiles command, including the
+    ``remove`` a user needs to clean the entry up. A skipped entry is dropped
+    from the file by the next successful save.
     """
     p = path or default_registry_path()
     if not p.exists():
@@ -146,17 +159,86 @@ def load_registry(path: Path | None = None) -> _Registry:
         # persisted now-removed fields such as ``chrome_user_data_dir``) still
         # loads.
         known = {f.name for f in fields(ProfileConfig)} - {"name"}
-        profiles = {
-            name: ProfileConfig(name=name, **{k: v for k, v in cfg.items() if k in known})
-            for name, cfg in data.get("profiles", {}).items()
-        }
+        profiles = {}
+        for name, cfg in data.get("profiles", {}).items():
+            if not _NAME_RE.fullmatch(name):
+                log.warning(
+                    "chrome-bridge: skipping registry profile %r: the name is "
+                    "not registrable with Chrome (use lowercase letters, "
+                    "digits, or underscores); re-run `chrome-bridge init` "
+                    "with a valid name — the entry is dropped on the next "
+                    "registry write",
+                    name,
+                )
+                continue
+            profiles[name] = ProfileConfig(
+                name=name,
+                **{k: v for k, v in cfg.items() if k in known},
+            )
     except (ValueError, TypeError, AttributeError) as exc:
         raise ProfileError(f"corrupt profile registry at {p}: {exc}") from exc
     return _Registry(profiles=profiles)
 
 
-def save_registry(registry: _Registry, path: Path | None = None) -> None:
-    p = path or default_registry_path()
+@contextmanager
+def _registry_lock(path: Path):
+    """Hold the cross-process lock protecting a registry read/modify/write."""
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    acquired = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if lock_file.seek(0, os.SEEK_END) == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK gives up after ~10 s of internal retries and raises;
+            # loop so contention BLOCKS like POSIX flock instead of failing a
+            # registry write. A dead holder cannot wedge this: the OS releases
+            # its region lock when the process's handle goes away.
+            while True:
+                try:
+                    msvcrt.locking(  # type: ignore[attr-defined]
+                        lock_file.fileno(),
+                        msvcrt.LK_LOCK,  # type: ignore[attr-defined]
+                        1,
+                    )
+                    break
+                except OSError:
+                    continue
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        acquired = True
+        yield
+    finally:
+        try:
+            # Unlock only what was locked: unlocking after a failed acquire
+            # raises on Windows and would mask the original error.
+            if acquired:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock_file.seek(0)
+                    msvcrt.locking(  # type: ignore[attr-defined]
+                        lock_file.fileno(),
+                        msvcrt.LK_UNLCK,  # type: ignore[attr-defined]
+                        1,
+                    )
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+
+def _save_registry_unlocked(registry: _Registry, path: Path) -> None:
+    p = path
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "profiles": {
@@ -164,7 +246,38 @@ def save_registry(registry: _Registry, path: Path | None = None) -> None:
             for name, cfg in registry.profiles.items()
         }
     }
-    p.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=p.parent,
+            prefix=f".{p.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp:
+            temp_name = temp.name
+            temp.write(serialized)
+            temp.flush()
+            os.fsync(temp.fileno())
+        os.replace(temp_name, p)
+        temp_name = None
+        if os.name != "nt":
+            directory_fd = os.open(p.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temp_name is not None:
+            Path(temp_name).unlink(missing_ok=True)
+
+
+def save_registry(registry: _Registry, path: Path | None = None) -> None:
+    p = path or default_registry_path()
+    with _registry_lock(p):
+        _save_registry_unlocked(registry, p)
 
 
 def list_profiles(path: Path | None = None) -> dict[str, ProfileConfig]:
@@ -214,27 +327,31 @@ def add_profile(
     """Add or overwrite a profile entry and persist the registry."""
     validate_profile_name(name)
     validate_port(port)
-    registry = load_registry(path)
-    conflict = find_port_conflict(name, port, registry.profiles)
-    if conflict is not None:
-        raise ProfileError(f"port {port} is already used by profile {conflict!r}")
-    cfg = ProfileConfig(
-        name=name,
-        port=port,
-        chrome_profile_directory=chrome_profile_directory,
-        extension_id=extension_id,
-        registered_at=registered_at,
-    )
-    registry.profiles[name] = cfg
-    save_registry(registry, path)
+    p = path or default_registry_path()
+    with _registry_lock(p):
+        registry = load_registry(p)
+        conflict = find_port_conflict(name, port, registry.profiles)
+        if conflict is not None:
+            raise ProfileError(f"port {port} is already used by profile {conflict!r}")
+        cfg = ProfileConfig(
+            name=name,
+            port=port,
+            chrome_profile_directory=chrome_profile_directory,
+            extension_id=extension_id,
+            registered_at=registered_at,
+        )
+        registry.profiles[name] = cfg
+        _save_registry_unlocked(registry, p)
     return cfg
 
 
 def remove_profile(name: str, path: Path | None = None) -> bool:
     """Remove a profile entry; returns True if it existed."""
-    registry = load_registry(path)
-    if name not in registry.profiles:
-        return False
-    del registry.profiles[name]
-    save_registry(registry, path)
-    return True
+    p = path or default_registry_path()
+    with _registry_lock(p):
+        registry = load_registry(p)
+        if name not in registry.profiles:
+            return False
+        del registry.profiles[name]
+        _save_registry_unlocked(registry, p)
+        return True
