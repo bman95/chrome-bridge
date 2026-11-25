@@ -5,6 +5,13 @@ fresh untrusted profile, no per-connection permission dialog. Supports
 scripting **multiple Chrome profiles** (e.g. personal vs. work accounts)
 independently of one another.
 
+```mermaid
+flowchart LR
+    script["Your Python script<br/>navigate · wait_selector<br/>outer_html · click · fill"] -- "loopback TCP<br/>127.0.0.1:port" --> host["Native host<br/>nmh.py"]
+    host -- "Native Messaging<br/>length-prefixed JSON" --> ext["MV3 extension<br/>chrome.debugger"]
+    ext -- "raw CDP" --> tab["Tab in your real<br/>Chrome profile<br/>(cookies · logins · trust)"]
+```
+
 See [`docs/design.md`](docs/design.md) for why this exists and how it works,
 [`docs/multi-profile.md`](docs/multi-profile.md) for the multi-profile
 design, and [`docs/multi-tab.md`](docs/multi-tab.md) for driving several
